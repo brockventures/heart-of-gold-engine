@@ -1,0 +1,6 @@
+aiohttp==3.9.5
+aiosqlite==0.20.0
+discord.py==2.3.2
+numpy==1.26.4
+fastembed==0.3.6
+schedule==1.2.2

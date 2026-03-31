@@ -1,0 +1,109 @@
+# Quick Start
+
+Get Karakos running in under 30 minutes.
+
+## Prerequisites
+
+- A machine running Ubuntu 22.04+ or Debian 12+ (Raspberry Pi 4/5, mini PC, VM, etc.)
+- Docker Engine 24+ with Compose v2 (`docker compose version`)
+- `jq` installed (`sudo apt install jq`)
+- An Anthropic API key ([console.anthropic.com](https://console.anthropic.com/settings/keys))
+- A Discord bot token (see [DISCORD_SETUP.md](DISCORD_SETUP.md))
+
+## Install
+
+```bash
+git clone <repository-url>
+cd karakos
+chmod +x setup.sh
+./setup.sh
+```
+
+The setup wizard walks you through:
+
+1. **System name** — What you want to call your installation
+2. **Owner name** — How the system addresses you
+3. **Primary agent name** — Your main agent's name (defaults to system name)
+4. **Anthropic API key** — Validated against the API before continuing
+5. **Discord bot** — Token, bot user ID, server ID (see [DISCORD_SETUP.md](DISCORD_SETUP.md))
+6. **Discord channels** — Channel IDs for general, signals, and optionally staff-comms
+7. **Your Discord user ID** — So the system knows who the owner is
+8. **Cost limits** — Daily and monthly spend caps
+
+The wizard saves progress, so you can quit and resume with `./setup.sh`.
+
+## Start
+
+```bash
+docker compose up -d
+```
+
+First build takes 5-10 minutes (downloads base images, installs dependencies, builds dashboard).
+
+**Expected image size:** ~1.2GB (multi-stage build with slim base images)
+
+## Verify
+
+1. **Dashboard**: Open `http://localhost:3000` — login with `admin` and the password shown during setup
+2. **Discord**: Your primary agent should respond in #general within a minute
+3. **Logs**: `docker compose logs -f` to watch startup
+
+## What's Running
+
+Inside the container:
+
+| Process | Description |
+|---------|-------------|
+| `agent-server.py` | Core — manages Claude subprocesses, message queue, API |
+| `relay.py` | Routes Discord messages to agents |
+| `scheduler.py` | Periodic tasks (heartbeats, memory, health checks) |
+| `dashboard` | Next.js web interface on port 3000 |
+
+## First Steps
+
+1. Say hello to your agent in Discord — it should respond
+2. Check the dashboard agents page to see agent status
+3. Try the chat page to talk to your agent directly through the browser
+4. Check #signals for system health updates
+
+## Adding the Coding Stack
+
+To add builder and reviewer agents:
+
+```bash
+docker exec -it karakos-karakos-1 bash
+cd /workspace
+bin/create-agent.sh --template builder --model sonnet builder
+bin/create-agent.sh --template reviewer --model sonnet reviewer
+```
+
+The builder can then receive specs in its inbox and create pull requests. The reviewer provides adversarial code review.
+
+## Stopping
+
+```bash
+docker compose down
+```
+
+The system shuts down gracefully — agents finalize their sessions before exiting (up to 45 seconds).
+
+## Troubleshooting
+
+**Agent not responding in Discord:**
+- Check `docker compose logs agent-server` for errors
+- Verify your bot token and channel IDs in `config/.env`
+- Make sure your bot has been invited to the server with message permissions
+
+**Dashboard won't load:**
+- Check port 3000 isn't in use: `lsof -i :3000`
+- Check `docker compose logs dashboard` for build errors
+
+**High API costs:**
+- Adjust `COST_DAILY_LIMIT` in `config/.env`
+- Consider using `haiku` model for the relay agent (already default)
+
+## Next Steps
+
+- [DISCORD_SETUP.md](DISCORD_SETUP.md) — Detailed Discord bot creation
+- [ARCHITECTURE.md](ARCHITECTURE.md) — How the system works
+- [EXTENDING.md](EXTENDING.md) — Adding skills and custom agents

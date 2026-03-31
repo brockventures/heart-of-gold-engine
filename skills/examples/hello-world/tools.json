@@ -1,0 +1,21 @@
+{
+  "skill_name": "hello-world",
+  "version": "1.0.0",
+  "description": "Minimal example skill — returns a greeting",
+  "tools": [
+    {
+      "name": "hello_world",
+      "description": "Returns a greeting message. Use this as a template for building your own skills.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name to greet (default: World)"
+          }
+        },
+        "required": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "tier1_protected": [
+    "system/",
+    "config/",
+    "bin/agent-server.py",
+    "bin/relay.py",
+    "bin/entrypoint.sh",
+    "bin/scheduler.py",
+    ".karakos/",
+    "Dockerfile",
+    "config/protected-paths.json"
+  ],
+  "tier2_review_required": [
+    "bin/",
+    "agents/templates/",
+    "mcp/tools-server.py"
+  ],
+  "unprotected_overrides": [
+    "agents/*/persona/",
+    "agents/*/journal/",
+    "agents/*/inbox/"
+  ]
+}
