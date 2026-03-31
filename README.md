@@ -6,16 +6,19 @@
 
 A self-contained, installable multi-agent household assistant system powered by Claude.
 
-## Quick Start
+## Install
 
+**Linux / macOS** — one command:
 ```bash
-git clone <repository-url>
-cd karakos
-./setup.sh
-docker compose up -d
+curl -fsSL https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.sh | bash
 ```
 
-Open http://localhost:3000 in your browser.
+**Windows** — one command (PowerShell as admin):
+```powershell
+irm https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.ps1 | iex
+```
+
+The installer handles prerequisites (Docker, Git, jq), clones the repo, runs the setup wizard, and starts the system. Open http://localhost:3000 when it's done.
 
 ## What is Karakos?
 
@@ -30,7 +33,7 @@ Karakos is a multi-agent system that provides:
 ## System Requirements
 
 - **Hardware**: 4GB RAM minimum (8GB recommended), 2+ CPU cores, 10GB disk space
-- **OS**: Ubuntu 22.04+ or Debian 12+
+- **OS**: Windows 10/11, Ubuntu 22.04+, Debian 12+, macOS 12+
 - **Software**: Docker Engine 24+ with Compose v2
 - **Network**: Stable internet for Anthropic API calls
 - **Runtime**: 24/7 recommended
