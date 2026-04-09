@@ -387,19 +387,12 @@ func runShell(command string) error {
 }
 
 func findBash() string {
-	// Check PATH first, but exclude WSL shim (C:\Windows\System32\bash.exe)
-	if path, err := exec.LookPath("bash"); err == nil {
-		// Exclude WSL shim
-		if !strings.Contains(strings.ToLower(path), "system32") {
-			return path
-		}
-	}
-
-	// Windows: check Git Bash locations
 	if runtime.GOOS == "windows" {
+		// Windows: check known Git Bash locations FIRST to avoid WSL shim
 		candidates := []string{
 			filepath.Join(os.Getenv("ProgramFiles"), "Git", "bin", "bash.exe"),
 			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Git", "bin", "bash.exe"),
+			filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Git", "bin", "bash.exe"),
 			`C:\Program Files\Git\bin\bash.exe`,
 		}
 		for _, c := range candidates {
@@ -407,6 +400,21 @@ func findBash() string {
 				return c
 			}
 		}
+
+		// Fall back to PATH but reject WSL shim (System32 or WindowsApps)
+		if path, err := exec.LookPath("bash"); err == nil {
+			lower := strings.ToLower(path)
+			if !strings.Contains(lower, "system32") && !strings.Contains(lower, "windowsapps") {
+				return path
+			}
+		}
+
+		return ""
+	}
+
+	// Non-Windows: just use PATH
+	if path, err := exec.LookPath("bash"); err == nil {
+		return path
 	}
 
 	return ""

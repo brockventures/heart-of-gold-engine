@@ -209,24 +209,19 @@ main() {
     fi
 
     # Step 4: Anthropic API key
-    if [ -z "$(get_state api_key)" ]; then
-        echo
-        log "Step 4: Anthropic API Key"
-        echo "Get your API key from: https://console.anthropic.com/settings/keys"
+    # Always prompt for API key on resume — never persist secrets to state file
+    echo
+    log "Step 4: Anthropic API Key"
+    echo "Get your API key from: https://console.anthropic.com/settings/keys"
 
-        while true; do
-            prompt "Enter your Anthropic API key" API_KEY "" true
-            if validate_api_key "$API_KEY"; then
-                save_state api_key "$API_KEY"
-                break
-            else
-                error "Invalid API key. Please try again."
-            fi
-        done
-    else
-        API_KEY=$(get_state api_key)
-        log "API key configured"
-    fi
+    while true; do
+        prompt "Enter your Anthropic API key" API_KEY "" true
+        if validate_api_key "$API_KEY"; then
+            break
+        else
+            error "Invalid API key. Please try again."
+        fi
+    done
 
     # Step 5: Discord setup
     if [ -z "$(get_state discord_bot_token)" ]; then
@@ -431,28 +426,8 @@ EOF
             "$template" > "agents/${agent}/SYSTEM_PROMPT.md"
     done
 
-    # Create docker-compose.yml if it doesn't exist
-    if [ ! -f "$DOCKER_COMPOSE" ]; then
-        cat > "$DOCKER_COMPOSE" <<EOF
-services:
-  karakos:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    env_file: config/.env
-    volumes:
-      - .:/workspace
-      - karakos-data:/workspace/data
-    ports:
-      - "3000:3000"
-      - "127.0.0.1:18791:18791"
-    restart: unless-stopped
-    stop_grace_period: 45s
-
-volumes:
-  karakos-data:
-EOF
-    fi
+    # docker-compose.yml lives in config/ (shipped with the repo).
+    # No generation needed — install.sh runs docker compose from config/.
 
     # Update .gitignore
     if ! grep -q "config/.env" .gitignore 2>/dev/null; then
