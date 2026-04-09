@@ -14,7 +14,7 @@ services:
     environment:
       - TZ=${TZ:-UTC}
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:18791/health"]
+      test: ["CMD", "curl", "-sf", "-H", "Authorization: Bearer ${AGENT_SERVER_TOKEN}", "http://localhost:18791/health"]
       interval: 30s
       timeout: 10s
       retries: 3

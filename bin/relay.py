@@ -14,11 +14,50 @@ import json
 import logging
 import os
 import subprocess
+import textwrap
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
 from logging.handlers import RotatingFileHandler
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+def split_discord_message(text: str, max_length: int = 2000) -> List[str]:
+    """Split text into Discord-compatible chunks (max 2000 chars per message)"""
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    # Try to split on paragraph boundaries first
+    paragraphs = text.split('\n\n')
+    current_chunk = ""
+
+    for paragraph in paragraphs:
+        # If single paragraph is too long, split on newlines
+        if len(paragraph) > max_length:
+            lines = paragraph.split('\n')
+            for line in lines:
+                if len(current_chunk) + len(line) + 2 > max_length:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = line
+                else:
+                    current_chunk += ('\n' if current_chunk else '') + line
+        else:
+            if len(current_chunk) + len(paragraph) + 2 > max_length:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = paragraph
+            else:
+                current_chunk += ('\n\n' if current_chunk else '') + paragraph
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks if chunks else [text]
 
 # =============================================================================
 # Configuration
@@ -308,7 +347,7 @@ class DispatchAdapter:
 
                 # Try to acquire semaphore (non-blocking)
                 semaphore = dispatch_semaphores.get(agent_type)
-                if semaphore and not semaphore.locked():
+                if semaphore and semaphore._value > 0:
                     # Dispatch
                     task = asyncio.create_task(self.dispatch(agent_type, brief_file))
                     active_dispatches[brief_file.stem] = task

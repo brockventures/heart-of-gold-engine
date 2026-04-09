@@ -241,7 +241,7 @@ def consolidate_episodes(conn: sqlite3.Connection) -> int:
     # Find episodes with short summaries that haven't been consolidated
     rows = conn.execute(
         "SELECT id, summary FROM episodes "
-        "WHERE consolidated = 0 AND LENGTH(summary) < 200 "
+        "WHERE consolidated_at IS NULL AND LENGTH(summary) < 200 "
         "ORDER BY created_at DESC LIMIT ?",
         (MAX_EPISODES,)
     ).fetchall()

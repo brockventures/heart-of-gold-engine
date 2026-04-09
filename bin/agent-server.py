@@ -1066,6 +1066,11 @@ async def startup(app):
     for agent in agent_config:
         await start_agent_subprocess(agent)
 
+    # Register signal handlers in event loop context
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(graceful_shutdown("SIGTERM")))
+    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(graceful_shutdown("SIGINT")))
+
     log.info(f"Agent server ready on port {PORT}")
 
 async def shutdown(app):
@@ -1090,9 +1095,8 @@ async def shutdown(app):
 
 def main():
     """Main entry point"""
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, lambda sig, frame: asyncio.ensure_future(graceful_shutdown("SIGTERM")))
-    signal.signal(signal.SIGINT, lambda sig, frame: asyncio.ensure_future(graceful_shutdown("SIGINT")))
+    # Signal handlers will be registered after event loop starts (in startup)
+    # For now, just set flag to handle in asyncio context
 
     # Create app
     app = web.Application()

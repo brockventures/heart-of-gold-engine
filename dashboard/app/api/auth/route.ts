@@ -1,7 +1,52 @@
 import { NextRequest, NextResponse } from "next/server";
+import * as crypto from "crypto";
 
 const DASHBOARD_USER = process.env.DASHBOARD_USER || "admin";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+
+// Generate a signed session token (HMAC-SHA256)
+function generateSessionToken(username: string): string {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const data = `${username}:${timestamp}`;
+  const signature = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(data)
+    .digest('hex');
+  return Buffer.from(`${data}:${signature}`).toString('base64');
+}
+
+// Verify and decode a session token
+function verifySessionToken(token: string): { username: string; timestamp: number } | null {
+  try {
+    const decoded = Buffer.from(token, 'base64').toString('utf-8');
+    const [username, timestamp, signature] = decoded.split(':');
+
+    if (!username || !timestamp || !signature) {
+      return null;
+    }
+
+    const data = `${username}:${timestamp}`;
+    const expectedSignature = crypto
+      .createHmac('sha256', SESSION_SECRET)
+      .update(data)
+      .digest('hex');
+
+    if (signature !== expectedSignature) {
+      return null;
+    }
+
+    const ts = parseInt(timestamp, 10);
+    // Check token age (24 hours)
+    if (Math.floor(Date.now() / 1000) - ts > 86400) {
+      return null;
+    }
+
+    return { username, timestamp: ts };
+  } catch {
+    return null;
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -18,8 +63,11 @@ export async function POST(request: NextRequest) {
     if (username === DASHBOARD_USER && password === DASHBOARD_PASSWORD) {
       const response = NextResponse.json({ success: true });
 
-      // Set session cookie (24h, httpOnly)
-      response.cookies.set("karakos_session", "authenticated", {
+      // Generate signed session token
+      const sessionToken = generateSessionToken(username);
+
+      // Set session cookie with signed token (24h, httpOnly)
+      response.cookies.set("karakos_session", sessionToken, {
         httpOnly: true,
         secure: process.env.NODE_ENV === "production",
         sameSite: "strict",
@@ -41,3 +89,6 @@ export async function POST(request: NextRequest) {
     );
   }
 }
+
+// Export session verification for use in middleware
+export { verifySessionToken };

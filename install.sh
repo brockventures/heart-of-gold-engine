@@ -142,9 +142,11 @@ echo -e "${CYAN}  Launching setup wizard...${NC}"
 echo -e "${CYAN}================================${NC}"
 echo ""
 
-./setup.sh
+# Run setup with error handling
+setup_exit=0
+./setup.sh || setup_exit=$?
 
-if [ $? -eq 0 ]; then
+if [ "$setup_exit" -eq 0 ]; then
     echo ""
     log "Setup complete! Starting Karakos..."
     echo ""
@@ -159,7 +161,7 @@ if [ $? -eq 0 ]; then
     echo -e "  Logs:       docker compose logs -f  (from $INSTALL_DIR/config)"
     echo ""
 else
-    err "Setup wizard failed or was cancelled."
+    err "Setup wizard failed or was cancelled (exit code $setup_exit)."
     err "Re-run with: cd $INSTALL_DIR && ./setup.sh"
-    exit 1
+    exit "$setup_exit"
 fi
