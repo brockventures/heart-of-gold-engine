@@ -124,7 +124,7 @@ prompt() {
         value="$default"
     fi
 
-    declare "$var_name=$value"
+    printf -v "$var_name" '%s' "$value"
 }
 
 # Validate Anthropic API key
