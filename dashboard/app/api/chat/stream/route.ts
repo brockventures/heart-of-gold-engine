@@ -27,7 +27,7 @@ export async function GET(request: NextRequest) {
       const pollInterval = setInterval(async () => {
         try {
           // Check message queue database for response
-          const dbPath = join(WORKSPACE_ROOT, "data/message-queue.db");
+          const dbPath = join(WORKSPACE_ROOT, "data/memory/agent-server.db");
           const sqlite3 = await import("sqlite3").then((m) => m.default);
           const { open } = await import("sqlite");
 

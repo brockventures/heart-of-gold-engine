@@ -3,6 +3,20 @@ set -euo pipefail
 
 export WORKSPACE_ROOT=/workspace
 
+# Validate required environment variables
+required_vars=("ANTHROPIC_API_KEY" "DASHBOARD_PORT" "AGENT_SERVER_TOKEN")
+missing_vars=()
+for var in "${required_vars[@]}"; do
+    if [ -z "${!var:-}" ]; then
+        missing_vars+=("$var")
+    fi
+done
+
+if [ ${#missing_vars[@]} -gt 0 ]; then
+    echo "ERROR: Required environment variables not set: ${missing_vars[*]}"
+    exit 1
+fi
+
 # Ensure data directories exist
 mkdir -p \
     "$WORKSPACE_ROOT/data/messages" \

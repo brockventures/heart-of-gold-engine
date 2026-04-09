@@ -387,9 +387,12 @@ func runShell(command string) error {
 }
 
 func findBash() string {
-	// Check PATH first
+	// Check PATH first, but exclude WSL shim (C:\Windows\System32\bash.exe)
 	if path, err := exec.LookPath("bash"); err == nil {
-		return path
+		// Exclude WSL shim
+		if !strings.Contains(strings.ToLower(path), "system32") {
+			return path
+		}
 	}
 
 	// Windows: check Git Bash locations

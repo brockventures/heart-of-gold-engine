@@ -16,7 +16,7 @@ STATE_FILE="${SCRIPT_DIR}/.setup-state.json"
 ENV_FILE="${SCRIPT_DIR}/config/.env"
 AGENTS_CONFIG="${SCRIPT_DIR}/config/agents.json"
 CHANNELS_CONFIG="${SCRIPT_DIR}/config/channels.json"
-DOCKER_COMPOSE="${SCRIPT_DIR}/docker-compose.yml"
+DOCKER_COMPOSE="${SCRIPT_DIR}/config/docker-compose.yml"
 KARAKOS_CONFIG="${SCRIPT_DIR}/.karakos/config.json"
 
 # State management

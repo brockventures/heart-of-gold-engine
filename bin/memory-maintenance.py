@@ -253,7 +253,7 @@ def consolidate_episodes(conn: sqlite3.Connection) -> int:
     consolidated = 0
     for row in rows:
         conn.execute(
-            "UPDATE episodes SET consolidated = 1 WHERE id = ?",
+            "UPDATE episodes SET consolidated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (row["id"],)
         )
         consolidated += 1

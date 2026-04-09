@@ -1,49 +1,31 @@
 #!/usr/bin/env bash
-# Check for Karakos updates against GitHub releases.
-# Called weekly by scheduler. Posts to #signals if update available.
+# Karakos Update Checker — Weekly task to check for new releases
+# Runs automatically via scheduler on Monday at 05:00 UTC
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE="${WORKSPACE_ROOT:-$(dirname "$SCRIPT_DIR")}"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-.}"
+REPO_URL="https://api.github.com/repos/mcarmody/karakos-package/releases/latest"
+CURRENT_VERSION=$(cat "$WORKSPACE_ROOT/package.json" | grep '"version"' | head -1 | sed 's/.*"version": "\([^"]*\)".*/\1/')
 
-# Load current version
-CONFIG_FILE="$WORKSPACE/.karakos/config.json"
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Config not found: $CONFIG_FILE" >&2
-    exit 1
-fi
+log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"; }
 
-CURRENT_VERSION=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('version', '0.0.0'))")
+log "Checking for Karakos updates (current: v$CURRENT_VERSION)..."
 
-# Check GitHub for latest release
-REPO="mcarmody/karakos"
-LATEST=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | \
-    python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name','').lstrip('v'))" 2>/dev/null || echo "")
+# Fetch latest release from GitHub
+response=$(curl -s "$REPO_URL" 2>/dev/null || echo '{}')
+latest_version=$(echo "$response" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "v\?\([^"]*\)".*/\1/')
 
-if [ -z "$LATEST" ]; then
-    echo "Could not fetch latest version from GitHub" >&2
-    exit 0  # Don't fail — network issues are expected
-fi
-
-# Compare versions (simple string comparison — works for semver)
-if [ "$LATEST" = "$CURRENT_VERSION" ]; then
-    echo "Up to date: v$CURRENT_VERSION"
+if [ -z "$latest_version" ]; then
+    log "Could not fetch latest version from GitHub"
     exit 0
 fi
 
-# Check if latest is newer (using sort -V for version comparison)
-NEWER=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$LATEST" | sort -V | tail -n1)
-
-if [ "$NEWER" = "$LATEST" ] && [ "$NEWER" != "$CURRENT_VERSION" ]; then
-    MESSAGE="Karakos v${LATEST} available (you're on v${CURRENT_VERSION}). See upgrade instructions: \`docs/UPGRADING.md\`"
-    echo "$MESSAGE"
-
-    # Post to signals channel if poke.sh is available
-    POKE="$WORKSPACE/bin/poke.sh"
-    if [ -x "$POKE" ]; then
-        "$POKE" --reply-channel signals "$MESSAGE"
-    fi
+if [ "$latest_version" != "$CURRENT_VERSION" ]; then
+    log "New version available: v$latest_version (current: v$CURRENT_VERSION)"
+    log "To update, run: git -C $WORKSPACE_ROOT pull origin main"
 else
-    echo "Up to date: v$CURRENT_VERSION (latest: v$LATEST)"
+    log "Already on latest version (v$CURRENT_VERSION)"
 fi
+
+exit 0

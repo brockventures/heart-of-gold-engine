@@ -491,8 +491,43 @@ async def check_cost_limits(author_id: str) -> Dict[str, Any]:
 # Discord Integration
 # =============================================================================
 
+MAX_DISCORD_MSG_LEN = 2000
+
+def split_discord_message(text: str, max_length: int = MAX_DISCORD_MSG_LEN) -> List[str]:
+    """Split text into Discord-compatible chunks (max 2000 chars per message)"""
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    paragraphs = text.split('\n\n')
+    current_chunk = ""
+
+    for paragraph in paragraphs:
+        if len(paragraph) > max_length:
+            # Split oversized paragraphs on newlines
+            lines = paragraph.split('\n')
+            for line in lines:
+                if len(current_chunk) + len(line) + 2 > max_length:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = line
+                else:
+                    current_chunk += ('\n' if current_chunk else '') + line
+        else:
+            if len(current_chunk) + len(paragraph) + 2 > max_length:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = paragraph
+            else:
+                current_chunk += ('\n\n' if current_chunk else '') + paragraph
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks if chunks else [text]
+
 async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: Optional[str] = None) -> Optional[str]:
-    """Post message to Discord as agent"""
+    """Post message to Discord as agent, splitting if over 2000 chars"""
     global http_session
 
     # Skip posting if channel_id is "0" (silent mode)
@@ -516,27 +551,35 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
         "Content-Type": "application/json"
     }
 
-    payload = {"content": content}
-    if reply_to:
-        payload["message_reference"] = {"message_id": reply_to}
+    chunks = split_discord_message(content)
+    last_msg_id = None
 
-    try:
-        async with http_session.post(url, headers=headers, json=payload) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("id")
-            elif resp.status == 429:
-                # Rate limited
-                retry_after = (await resp.json()).get("retry_after", 1)
-                log.warning(f"Rate limited posting to {channel_id}, retry after {retry_after}s")
-                await asyncio.sleep(retry_after)
-                return await post_to_discord(agent, channel_id, content, reply_to)
-            else:
-                log.error(f"Discord API error {resp.status}: {await resp.text()}")
-                return None
-    except Exception as e:
-        log.error(f"Error posting to Discord: {e}")
-        return None
+    for chunk in chunks:
+        payload = {"content": chunk}
+        # Only reply-reference the first chunk
+        if reply_to and last_msg_id is None:
+            payload["message_reference"] = {"message_id": reply_to}
+
+        try:
+            async with http_session.post(url, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    last_msg_id = data.get("id")
+                elif resp.status == 429:
+                    retry_after = (await resp.json()).get("retry_after", 1)
+                    log.warning(f"Rate limited posting to {channel_id}, retry after {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    # Retry this chunk
+                    async with http_session.post(url, headers=headers, json=payload) as retry_resp:
+                        if retry_resp.status == 200:
+                            data = await retry_resp.json()
+                            last_msg_id = data.get("id")
+                else:
+                    log.error(f"Discord API error {resp.status}: {await resp.text()}")
+        except Exception as e:
+            log.error(f"Error posting to Discord: {e}")
+
+    return last_msg_id
 
 async def start_typing(agent: str, channel_id: str):
     """Start typing indicator in Discord channel"""
