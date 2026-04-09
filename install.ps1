@@ -130,21 +130,73 @@ if (Test-Path $InstallDir) {
 Set-Location $InstallDir
 
 # --- Run setup wizard via Git Bash ---
-$gitBash = "${env:ProgramFiles}\Git\bin\bash.exe"
-if (-not (Test-Path $gitBash)) {
-    $gitBash = "${env:ProgramFiles(x86)}\Git\bin\bash.exe"
-}
-if (-not (Test-Path $gitBash)) {
-    # Try PATH
-    $gitBash = (Get-Command bash -ErrorAction SilentlyContinue).Source
+function Find-GitBash {
+    # 1. Check common filesystem locations
+    $searchPaths = @(
+        "${env:ProgramFiles}\Git\bin\bash.exe",
+        "${env:ProgramFiles(x86)}\Git\bin\bash.exe",
+        "${env:LOCALAPPDATA}\Programs\Git\bin\bash.exe",
+        "${env:ProgramFiles}\Git for Windows\bin\bash.exe"
+    )
+
+    foreach ($path in $searchPaths) {
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+
+    # 2. Check Windows Registry for Git install location
+    $regPaths = @(
+        "HKLM:\SOFTWARE\GitForWindows",
+        "HKCU:\SOFTWARE\GitForWindows",
+        "HKLM:\SOFTWARE\WOW6432Node\GitForWindows"
+    )
+    foreach ($regPath in $regPaths) {
+        try {
+            $gitDir = (Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue).InstallPath
+            if ($gitDir) {
+                $candidate = Join-Path $gitDir "bin\bash.exe"
+                if (Test-Path $candidate) {
+                    return $candidate
+                }
+            }
+        } catch {}
+    }
+
+    # 3. Search PATH, but reject WSL shim (System32\bash.exe or WindowsApps\bash.exe)
+    $bashInPath = (Get-Command bash -ErrorAction SilentlyContinue).Source
+    if ($bashInPath -and -not ($bashInPath -like "*System32*") -and -not ($bashInPath -like "*WindowsApps*")) {
+        return $bashInPath
+    }
+
+    return $null
 }
 
-if (-not $gitBash -or -not (Test-Path $gitBash)) {
-    Write-Err "Cannot find bash. Please run setup manually from Git Bash:"
-    Write-Err "  cd $InstallDir"
-    Write-Err "  bash setup.sh"
+$gitBash = Find-GitBash
+
+if (-not $gitBash) {
+    Write-Err "Git Bash not found."
+    Write-Err ""
+    Write-Err "Karakos requires Git for Windows (which includes Git Bash)."
+    Write-Err "The WSL bash shim is not supported — Git Bash is required."
+    Write-Err ""
+    Write-Err "Install Git for Windows:"
+    Write-Err "  winget install --id Git.Git"
+    Write-Err "  (or download from https://git-scm.com/download/win)"
+    Write-Err ""
+    Write-Err "Then restart your terminal and run this script again."
     exit 1
 }
+
+Write-Step "Using bash: $gitBash"
+
+# Convert Windows path to Git Bash (MSYS) path for the setup script
+# C:\Users\foo\karakos -> /c/Users/foo/karakos
+$setupPath = $InstallDir -replace '\\', '/'
+if ($setupPath -match '^([A-Za-z]):(.*)') {
+    $setupPath = '/' + $Matches[1].ToLower() + $Matches[2]
+}
+$setupCmd = "cd '$setupPath' && bash ./setup.sh"
 
 Write-Host ""
 Write-Host "================================" -ForegroundColor Cyan
@@ -153,7 +205,7 @@ Write-Host "  Launching setup wizard..." -ForegroundColor Cyan
 Write-Host "================================" -ForegroundColor Cyan
 Write-Host ""
 
-& $gitBash -c "./setup.sh"
+& $gitBash --login -c $setupCmd
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host ""
