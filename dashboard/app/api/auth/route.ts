@@ -16,38 +16,6 @@ function generateSessionToken(username: string): string {
   return Buffer.from(`${data}:${signature}`).toString('base64');
 }
 
-// Verify and decode a session token
-function verifySessionToken(token: string): { username: string; timestamp: number } | null {
-  try {
-    const decoded = Buffer.from(token, 'base64').toString('utf-8');
-    const [username, timestamp, signature] = decoded.split(':');
-
-    if (!username || !timestamp || !signature) {
-      return null;
-    }
-
-    const data = `${username}:${timestamp}`;
-    const expectedSignature = crypto
-      .createHmac('sha256', SESSION_SECRET)
-      .update(data)
-      .digest('hex');
-
-    if (signature !== expectedSignature) {
-      return null;
-    }
-
-    const ts = parseInt(timestamp, 10);
-    // Check token age (24 hours)
-    if (Math.floor(Date.now() / 1000) - ts > 86400) {
-      return null;
-    }
-
-    return { username, timestamp: ts };
-  } catch {
-    return null;
-  }
-}
-
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -90,5 +58,3 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Export session verification for use in middleware
-export { verifySessionToken };
