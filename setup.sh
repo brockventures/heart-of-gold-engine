@@ -114,8 +114,7 @@ prompt() {
     fi
 
     if [ "$secret" = "true" ]; then
-        # Disable echo manually — read -s is unreliable across terminal emulators
-        echo -ne "${BLUE}${prompt_text}:${NC} "
+        echo -e "${BLUE}${prompt_text}: ${YELLOW}(typing is hidden)${NC}"
         stty -echo 2>/dev/null
         read value < /dev/tty
         stty echo 2>/dev/null
