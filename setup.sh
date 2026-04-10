@@ -113,15 +113,7 @@ prompt() {
         prompt_text="$prompt_text [$default]"
     fi
 
-    if [ "$secret" = "true" ]; then
-        echo -e "${BLUE}${prompt_text}: ${YELLOW}(typing is hidden)${NC}"
-        stty -echo 2>/dev/null
-        read value < /dev/tty
-        stty echo 2>/dev/null
-        echo
-    else
-        read -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value < /dev/tty
-    fi
+    read -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value < /dev/tty
 
     if [ -z "$value" ] && [ -n "$default" ]; then
         value="$default"
