@@ -148,17 +148,8 @@ setup_exit=0
 
 if [ "$setup_exit" -eq 0 ]; then
     echo ""
-    log "Setup complete! Starting Karakos..."
-    echo ""
-
-    cd "$INSTALL_DIR/config"
-    docker compose up -d
-
-    echo ""
-    log "Karakos is starting up. First build takes 5-10 minutes."
-    echo ""
-    echo -e "  ${CYAN}Dashboard:${NC}  http://localhost:3000"
-    echo -e "  Logs:       docker compose logs -f  (from $INSTALL_DIR/config)"
+    log "Installation complete."
+    echo -e "  Logs:  docker compose -f $INSTALL_DIR/config/docker-compose.yml logs -f"
     echo ""
 else
     err "Setup wizard failed or was cancelled (exit code $setup_exit)."

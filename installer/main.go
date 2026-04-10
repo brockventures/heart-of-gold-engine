@@ -38,7 +38,6 @@ func main() {
 		{"Installing missing dependencies", installDeps},
 		{"Cloning repository", func() error { return cloneRepo(installDir) }},
 		{"Running setup wizard", func() error { return runSetup(installDir) }},
-		{"Starting Karakos", func() error { return startSystem(installDir) }},
 	}
 
 	for _, step := range steps {
@@ -66,14 +65,11 @@ func printBanner() {
 
 func printSuccess(dir string) {
 	fmt.Printf("%s╔══════════════════════════════════════════════╗%s\n", green, reset)
-	fmt.Printf("%s║  Karakos is starting up!                     ║%s\n", green, reset)
-	fmt.Printf("%s║                                              ║%s\n", green, reset)
-	fmt.Printf("%s║  Dashboard:  http://localhost:3000            ║%s\n", green, reset)
-	fmt.Printf("%s║  First build takes 5-10 minutes.             ║%s\n", green, reset)
+	fmt.Printf("%s║  Installation complete!                       ║%s\n", green, reset)
 	fmt.Printf("%s╚══════════════════════════════════════════════╝%s\n", green, reset)
 	fmt.Println()
 	fmt.Printf("  Install directory: %s\n", dir)
-	fmt.Printf("  Logs: cd %s/config && docker compose logs -f\n", dir)
+	fmt.Printf("  Logs: docker compose -f %s/config/docker-compose.yml logs -f\n", dir)
 	fmt.Println()
 }
 
