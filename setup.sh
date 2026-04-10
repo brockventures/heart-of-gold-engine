@@ -114,10 +114,10 @@ prompt() {
     fi
 
     if [ "$secret" = "true" ]; then
-        read -s -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value
+        read -s -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value < /dev/tty
         echo
     else
-        read -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value
+        read -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value < /dev/tty
     fi
 
     if [ -z "$value" ] && [ -n "$default" ]; then
