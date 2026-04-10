@@ -114,7 +114,11 @@ prompt() {
     fi
 
     if [ "$secret" = "true" ]; then
-        read -s -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value < /dev/tty
+        # Disable echo manually — read -s is unreliable across terminal emulators
+        echo -ne "${BLUE}${prompt_text}:${NC} "
+        stty -echo 2>/dev/null
+        read value < /dev/tty
+        stty echo 2>/dev/null
         echo
     else
         read -p "$(echo -e ${BLUE}${prompt_text}:${NC} )" value < /dev/tty
