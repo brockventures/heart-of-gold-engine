@@ -3,6 +3,17 @@
 
 set -euo pipefail
 
+# On any error, pause so the user can read the message before the window closes
+pause_on_exit() {
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo
+        echo -e "\033[0;31mSetup failed (exit code $rc). Press any key to close.\033[0m"
+        read -n 1 -s -r < /dev/tty 2>/dev/null || true
+    fi
+}
+trap pause_on_exit EXIT
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
