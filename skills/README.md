@@ -260,7 +260,7 @@ Scripts have access to environment variables and the workspace root.
 |----------|-------------|
 | `TOOL_ARGS` | JSON string of input parameters |
 | `WORKSPACE_ROOT` | Absolute path to workspace (e.g., `/workspace`) |
-| `ANTHROPIC_API_KEY` | Anthropic API key (if needed for Claude calls) |
+| N/A | Anthropic auth handled by `claude login` — no API key in env |
 
 ### Accessing Workspace Files
 

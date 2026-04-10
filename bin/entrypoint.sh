@@ -4,7 +4,7 @@ set -euo pipefail
 export WORKSPACE_ROOT=/workspace
 
 # Validate required environment variables
-required_vars=("ANTHROPIC_API_KEY" "DASHBOARD_PORT" "AGENT_SERVER_TOKEN")
+required_vars=("DASHBOARD_PORT" "AGENT_SERVER_TOKEN")
 missing_vars=()
 for var in "${required_vars[@]}"; do
     if [ -z "${!var:-}" ]; then

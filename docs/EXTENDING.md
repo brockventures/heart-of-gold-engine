@@ -203,7 +203,7 @@ All configuration lives in `config/.env`. Key variables:
 
 | Variable | Description |
 |----------|-------------|
-| `ANTHROPIC_API_KEY` | Your API key (required) |
+| *(Anthropic auth)* | Handled by `claude login` — no API key in env |
 | `AGENT_SERVER_TOKEN` | Bearer token for API auth |
 | `COST_DAILY_LIMIT` | Daily spend cap in USD |
 | `COST_MONTHLY_LIMIT` | Monthly spend cap in USD |
