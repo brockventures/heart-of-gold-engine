@@ -74,15 +74,53 @@ check_prerequisites() {
 
     # Node.js / npm (for Claude CLI)
     if ! command -v npm &> /dev/null; then
-        error "npm not found. Install Node.js 18+:"
-        error "  https://nodejs.org/en/download"
-        exit 1
+        log "Node.js/npm not found — installing..."
+        if command -v apt-get &> /dev/null; then
+            # Debian/Ubuntu — use NodeSource LTS
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+        elif command -v brew &> /dev/null; then
+            brew install node
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y nodejs npm
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S --noconfirm nodejs npm
+        else
+            error "Could not auto-install Node.js. Install manually:"
+            error "  https://nodejs.org/en/download"
+            exit 1
+        fi
+
+        if ! command -v npm &> /dev/null; then
+            error "Node.js installation failed. Install manually:"
+            error "  https://nodejs.org/en/download"
+            exit 1
+        fi
+        log "Node.js $(node --version) installed"
     fi
 
     # jq
     if ! command -v jq &> /dev/null; then
-        error "jq not found. Install with: sudo apt install jq"
-        exit 1
+        log "jq not found — installing..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get install -y jq
+        elif command -v brew &> /dev/null; then
+            brew install jq
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y jq
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S --noconfirm jq
+        else
+            error "Could not auto-install jq. Install manually:"
+            error "  https://stedolan.github.io/jq/download/"
+            exit 1
+        fi
+
+        if ! command -v jq &> /dev/null; then
+            error "jq installation failed."
+            exit 1
+        fi
+        log "jq installed"
     fi
 
     # Check ports
