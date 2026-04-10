@@ -489,14 +489,22 @@ EOF
     warn "Save this password! It's stored in config/.env"
     warn "NEVER commit config/.env to git!"
     echo
-    log "Next steps:"
-    echo "  1. docker compose up -d"
-    echo "  2. Open http://localhost:3000 (login: admin / password above)"
-    echo "  3. Check #signals in Discord for system startup"
-    echo
 
     # Clean up state file
     rm -f "$STATE_FILE"
+
+    # Launch
+    echo
+    read -p "$(echo -e ${GREEN}Ready to launch ${SYSTEM_NAME}? Press Enter to start...${NC})" < /dev/tty
+    echo
+    log "Starting services..."
+    docker compose -f "$DOCKER_COMPOSE" --env-file "$ENV_FILE" up -d
+
+    echo
+    log "Services are starting up"
+    echo "  Dashboard: http://localhost:3000 (login: admin / password above)"
+    echo "  Check #signals in Discord for system startup"
+    echo
 }
 
 # Handle --clean flag
