@@ -6,7 +6,28 @@ import * as crypto from "crypto";
 
 const AGENT_SERVER_URL = process.env.AGENT_SERVER_URL || "http://localhost:18791";
 const AGENT_SERVER_TOKEN = process.env.AGENT_SERVER_TOKEN || "";
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+
+if (!SESSION_SECRET) {
+  console.warn(
+    "WARNING: SESSION_SECRET is not set. Dashboard auth will not work. " +
+    "Run setup.sh or add SESSION_SECRET to your .env file."
+  );
+}
+
+/**
+ * Generate a signed session token (HMAC-SHA256).
+ * Token format: base64(username:timestamp:hmac_signature)
+ */
+export function generateSessionToken(username: string): string {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const data = `${username}:${timestamp}`;
+  const signature = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(data)
+    .digest('hex');
+  return Buffer.from(`${data}:${signature}`).toString('base64');
+}
 
 /**
  * Fetch from the agent server with bearer token auth.

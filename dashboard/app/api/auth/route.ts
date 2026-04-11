@@ -1,20 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import * as crypto from "crypto";
+import { generateSessionToken } from "@/lib/api";
 
 const DASHBOARD_USER = process.env.DASHBOARD_USER || "admin";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-
-// Generate a signed session token (HMAC-SHA256)
-function generateSessionToken(username: string): string {
-  const timestamp = Math.floor(Date.now() / 1000);
-  const data = `${username}:${timestamp}`;
-  const signature = crypto
-    .createHmac('sha256', SESSION_SECRET)
-    .update(data)
-    .digest('hex');
-  return Buffer.from(`${data}:${signature}`).toString('base64');
-}
 
 export async function POST(request: NextRequest) {
   try {

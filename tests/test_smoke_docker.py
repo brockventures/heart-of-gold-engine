@@ -244,4 +244,61 @@ class TestNextjsRouteExports:
         )
 
 
+class TestSessionSecretConsistency:
+    """Verify SESSION_SECRET is handled correctly across the codebase.
+
+    Catches the split-secret bug where route.ts and lib/api.ts each
+    generated their own random SESSION_SECRET, making auth permanently
+    broken without the env var set.
+    """
+
+    def test_no_duplicate_session_secret_definitions(self):
+        """Only lib/api.ts should define SESSION_SECRET."""
+        import re
+
+        auth_route = PACKAGE_ROOT / "dashboard" / "app" / "api" / "auth" / "route.ts"
+        content = auth_route.read_text()
+
+        # Should NOT have its own SESSION_SECRET definition
+        assert "SESSION_SECRET" not in content, (
+            "auth/route.ts should not define SESSION_SECRET. "
+            "Import generateSessionToken from @/lib/api instead."
+        )
+
+    def test_auth_route_imports_from_shared_lib(self):
+        """Auth route should import token generation from shared lib."""
+        auth_route = PACKAGE_ROOT / "dashboard" / "app" / "api" / "auth" / "route.ts"
+        content = auth_route.read_text()
+
+        assert "from \"@/lib/api\"" in content or "from '@/lib/api'" in content, (
+            "auth/route.ts should import from @/lib/api for shared session handling"
+        )
+
+    def test_setup_generates_session_secret(self):
+        """setup.sh must generate SESSION_SECRET in the .env file."""
+        setup = (PACKAGE_ROOT / "setup.sh").read_text()
+
+        assert "SESSION_SECRET" in setup, (
+            "setup.sh does not generate SESSION_SECRET. "
+            "Dashboard sessions will break on every container restart."
+        )
+
+    def test_env_template_has_session_secret(self):
+        """The .env template should document SESSION_SECRET."""
+        template = (PACKAGE_ROOT / "config" / ".env.template").read_text()
+        assert "SESSION_SECRET" in template, (
+            "SESSION_SECRET missing from .env.template"
+        )
+
+    def test_no_random_fallback_in_auth_route(self):
+        """Auth route must not have crypto.randomBytes fallback for secrets."""
+        auth_route = PACKAGE_ROOT / "dashboard" / "app" / "api" / "auth" / "route.ts"
+        content = auth_route.read_text()
+
+        assert "randomBytes" not in content, (
+            "auth/route.ts should not generate random secrets. "
+            "SESSION_SECRET should come from the environment via lib/api.ts."
+        )
+
+
 import os

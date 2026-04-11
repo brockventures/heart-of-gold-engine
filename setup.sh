@@ -343,6 +343,7 @@ main() {
 
     # Generate tokens
     AGENT_SERVER_TOKEN=$(generate_token "krkos")
+    SESSION_SECRET=$(openssl rand -hex 32)
     DASHBOARD_PASSWORD=$(openssl rand -base64 16)
 
     # Create .env file
@@ -359,6 +360,9 @@ main() {
 
 # Agent server authentication
 AGENT_SERVER_TOKEN=$AGENT_SERVER_TOKEN
+
+# Dashboard session signing (shared between auth and verification)
+SESSION_SECRET=$SESSION_SECRET
 
 # Dashboard authentication
 DASHBOARD_PASSWORD=$DASHBOARD_PASSWORD
