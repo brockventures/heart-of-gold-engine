@@ -166,6 +166,36 @@ class TestDockerCompose:
                 env_path.unlink()
 
 
+class TestDockerfileCopyTargets:
+    """Verify that paths referenced in Dockerfile COPY commands exist.
+
+    Prevents build failures like #33 where COPY --from=dashboard-build
+    referenced /app/public but no public/ directory existed.
+    """
+
+    def test_dashboard_copy_sources_exist(self):
+        """Directories copied from dashboard into the image must exist."""
+        import re
+        dockerfile = (PACKAGE_ROOT / "Dockerfile").read_text()
+
+        # Find COPY --from=dashboard-build /app/<path> dashboard/<path>
+        pattern = re.compile(r'COPY\s+--from=dashboard-build\s+/app/(\S+)\s+dashboard/(\S+)')
+        for match in pattern.finditer(dockerfile):
+            src_path = match.group(1)
+            dest_ref = match.group(2)
+
+            # .next and node_modules are build artifacts — skip
+            if src_path in (".next", "node_modules"):
+                continue
+
+            # For source files/dirs, verify they exist in dashboard/
+            local_path = PACKAGE_ROOT / "dashboard" / src_path
+            assert local_path.exists(), (
+                f"Dockerfile copies dashboard/{src_path} but it doesn't exist. "
+                f"Create it or remove the COPY line. (Fixes #33)"
+            )
+
+
 class TestNextjsRouteExports:
     """Verify Next.js route files only export valid handlers.
 
