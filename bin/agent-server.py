@@ -1059,7 +1059,22 @@ async def graceful_shutdown(sig):
 
     # Generate summaries for active agents
     log.info("Finalizing sessions...")
-    # TODO: Call summarize-session.py for each agent
+    for agent in agent_config:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "python3", str(Path(__file__).parent / "summarize-session.py"), agent,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25)
+            if proc.returncode == 0:
+                log.info(f"Session summary generated for {agent}")
+            else:
+                log.warning(f"Session summary failed for {agent}: {stderr.decode()[:200]}")
+        except asyncio.TimeoutError:
+            log.warning(f"Session summary timed out for {agent}")
+        except Exception as e:
+            log.warning(f"Session summary error for {agent}: {e}")
 
     # Kill subprocesses
     log.info("Terminating agent subprocesses...")
