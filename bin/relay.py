@@ -69,7 +69,8 @@ CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 MESSAGES_DIR = WORKSPACE_ROOT / "data" / "messages"
 HEALTH_FILE = WORKSPACE_ROOT / "data" / "health" / "relay.json"
 
-AGENT_SERVER_URL = "http://localhost:18791"
+AGENT_SERVER_PORT = os.environ.get("AGENT_SERVER_PORT", "18791")
+AGENT_SERVER_URL = os.environ.get("AGENT_SERVER_URL", f"http://localhost:{AGENT_SERVER_PORT}")
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = int(os.environ.get("OWNER_DISCORD_ID", "0"))
 

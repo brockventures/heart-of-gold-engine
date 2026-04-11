@@ -55,7 +55,7 @@ def init_db() -> sqlite3.Connection:
             tags TEXT,
             agents TEXT,
             created_at TIMESTAMP,
-            consolidated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            consolidated_at TIMESTAMP DEFAULT NULL,
             embedding BLOB
         );
 
@@ -156,7 +156,7 @@ def segment_messages_into_episodes(messages: list) -> list:
     for msg in messages:
         try:
             ts = datetime.fromisoformat(msg["ts"].replace("Z", "+00:00"))
-        except:
+        except (KeyError, ValueError, TypeError):
             continue
 
         if last_ts and (ts - last_ts).total_seconds() > 300:  # 5 min gap
