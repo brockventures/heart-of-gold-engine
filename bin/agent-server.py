@@ -317,10 +317,18 @@ async def start_agent_subprocess(agent: str):
         return
 
     session_id = await get_or_create_session(agent)
-    system_prompt = WORKSPACE_ROOT / config.get("system_prompt", "")
+    system_prompt_path = WORKSPACE_ROOT / config.get("system_prompt", "")
 
-    if not system_prompt.exists():
-        log.error(f"System prompt not found for {agent}: {system_prompt}")
+    if not system_prompt_path.exists():
+        log.error(f"System prompt not found for {agent}: {system_prompt_path}")
+        return
+
+    # The CLI's --system-prompt flag takes the prompt string, not a file
+    # path. Read the file contents here.
+    try:
+        system_prompt_text = system_prompt_path.read_text()
+    except Exception as e:
+        log.error(f"Failed to read system prompt for {agent}: {e}")
         return
 
     # Load persona
@@ -342,7 +350,7 @@ async def start_agent_subprocess(agent: str):
         "--verbose",
         "--dangerously-skip-permissions",
         "--session-id", session_id,
-        "--system-prompt", str(system_prompt),
+        "--system-prompt", system_prompt_text,
     ]
 
     if persona_content:
@@ -628,8 +636,13 @@ async def send_to_agent(agent: str, content: str, message_ids: List[str]):
     agent_states[agent] = "PROCESSING"
     response_buffers[agent] = ""
 
-    # Send message
-    msg = json.dumps({"type": "user", "content": content}) + "\n"
+    # Send message — Claude Code stream-json input envelope.
+    # Format: {"type": "user", "message": {"role": "user", "content": <str>}}
+    # The bare {"type":"user","content":...} form is rejected by the SDK.
+    msg = json.dumps({
+        "type": "user",
+        "message": {"role": "user", "content": content},
+    }) + "\n"
     try:
         proc.stdin.write(msg.encode())
         await proc.stdin.drain()
@@ -665,41 +678,53 @@ async def read_agent_response(agent: str, channel_id: str) -> tuple[str, Dict]:
 
             event_type = event.get("type")
 
-            if event_type == "text":
-                # Accumulate text
-                text = event.get("text", "")
-                final_text += text
-                response_buffers[agent] = final_text
-
-                # Stream to channel if enabled
-                if stream_to_channel and channel_id != "0":
-                    # TODO: Implement chunked streaming
-                    pass
-
-            elif event_type == "tool_use":
-                # Log tool call
-                tool_name = event.get("name", "unknown")
-                log.info(f"{agent} called tool: {tool_name}")
-
-                if tool_streaming and channel_id != "0":
-                    # Post tool use notification
-                    await post_to_discord(agent, channel_id, f"🔧 {tool_name}")
+            # Claude Code stream-json output: each turn emits one or more
+            # `assistant` events with content blocks (thinking/text/tool_use),
+            # then a single `result` event closes the turn.
+            if event_type == "assistant":
+                message = event.get("message", {}) or {}
+                for block in message.get("content", []) or []:
+                    btype = block.get("type")
+                    if btype == "text":
+                        text = block.get("text", "")
+                        if text:
+                            final_text += text
+                            response_buffers[agent] = final_text
+                            if stream_to_channel and channel_id != "0":
+                                # TODO: Implement chunked streaming
+                                pass
+                    elif btype == "tool_use":
+                        tool_name = block.get("name", "unknown")
+                        log.info(f"{agent} called tool: {tool_name}")
+                        if tool_streaming and channel_id != "0":
+                            await post_to_discord(agent, channel_id, f"🔧 {tool_name}")
+                    # `thinking` blocks are intentionally ignored here — they
+                    # are stripped from the final text below as a belt-and-
+                    # braces measure for any inline <thinking> tags.
 
             elif event_type == "result":
-                # Extract metadata
+                # Extract metadata. Token counts live under `usage`,
+                # cost/duration are top-level. Final text is in `result`
+                # for success, or `error` field for failures.
+                usage = event.get("usage", {}) or {}
                 metadata = {
                     "session_id": event.get("session_id"),
-                    "input_tokens": event.get("input_tokens", 0),
-                    "output_tokens": event.get("output_tokens", 0),
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
                     "total_cost_usd": event.get("total_cost_usd", 0.0),
-                    "duration_ms": event.get("duration_ms", 0)
+                    "duration_ms": event.get("duration_ms", 0),
+                    "is_error": event.get("is_error", False),
                 }
+                # If the assistant stream produced nothing, fall back to
+                # the result's flat `result` string (success) or `error`.
+                if not final_text:
+                    final_text = event.get("result", "") or event.get("error", "")
                 break
 
     except Exception as e:
         log.error(f"Error reading response from {agent}: {e}")
 
-    # Strip thinking blocks
+    # Strip any inline thinking blocks (defense in depth)
     final_text = THINKING_BLOCK_RE.sub("", final_text).strip()
 
     agent_states[agent] = "IDLE"

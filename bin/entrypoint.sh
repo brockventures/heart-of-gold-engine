@@ -35,12 +35,15 @@ if [ -f "$WORKSPACE_ROOT/config/agents.json" ]; then
     done
 fi
 
-# Initialize git if not already
+# Initialize git if not already (used by the protected-paths pre-commit hook
+# which logs/blocks edits to system files made by builder/reviewer agents).
+# We bound the index to bin/ + agents/ so we don't try to track the
+# bind-mounted node_modules tree, which would take minutes on first boot.
 if [ ! -d "$WORKSPACE_ROOT/.git" ]; then
     cd "$WORKSPACE_ROOT"
-    git init
-    git add -A
-    git commit -m "Initial commit" --allow-empty
+    git -c init.defaultBranch=main init -q
+    git -c user.email=karakos@local -c user.name=karakos \
+        commit --allow-empty -q -m "Initial commit"
 fi
 
 # Install protected paths git hook
