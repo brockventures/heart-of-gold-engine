@@ -7,7 +7,7 @@ Get Karakos running in under 30 minutes.
 - A machine running Ubuntu 22.04+ or Debian 12+ (Raspberry Pi 4/5, mini PC, VM, etc.)
 - Docker Engine 24+ with Compose v2 (`docker compose version`)
 - `jq` installed (`sudo apt install jq`)
-- An Anthropic API key ([console.anthropic.com](https://console.anthropic.com/settings/keys))
+- An Anthropic account — login is handled by the Claude Code CLI (`claude login`), no API key required
 - A Discord bot token (see [DISCORD_SETUP.md](DISCORD_SETUP.md))
 
 ## Install
@@ -24,11 +24,15 @@ The setup wizard walks you through:
 1. **System name** — What you want to call your installation
 2. **Owner name** — How the system addresses you
 3. **Primary agent name** — Your main agent's name (defaults to system name)
-4. **Anthropic API key** — Validated against the API before continuing
+4. **Anthropic login** — Opens your browser for `claude login` (OAuth, no API key)
 5. **Discord bot** — Token, bot user ID, server ID (see [DISCORD_SETUP.md](DISCORD_SETUP.md))
 6. **Discord channels** — Channel IDs for general, signals, and optionally staff-comms
 7. **Your Discord user ID** — So the system knows who the owner is
 8. **Cost limits** — Daily and monthly spend caps
+
+The credentials produced by `claude login` live in `~/.claude/` on the host
+and are bind-mounted into the container at runtime, so the in-container
+`claude` CLI inherits the same auth.
 
 The wizard saves progress, so you can quit and resume with `./setup.sh`.
 

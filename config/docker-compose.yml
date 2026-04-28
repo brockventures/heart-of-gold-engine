@@ -5,16 +5,37 @@ services:
       dockerfile: Dockerfile
     env_file: .env
     volumes:
-      - ..:/workspace
+      # Bind-mount config + agents from the host so setup.sh's output (the
+      # generated agents.json, channels.json, SYSTEM_PROMPT.md files, etc.)
+      # is visible to the container and survives image rebuilds. The rest of
+      # /workspace stays baked into the image — bind-mounting the entire tree
+      # would shadow the prebuilt dashboard/.next and node_modules.
+      - ../config:/workspace/config
+      - ../agents:/workspace/agents
+      - ../.karakos:/workspace/.karakos
+      # Persist runtime data (sqlite, logs, JSONL message archive, inbox
+      # dispatches) across container restarts.
       - karakos-data:/workspace/data
+      - karakos-logs:/workspace/logs
+      - karakos-inbox:/workspace/inbox
+      # Bind-mount the host's claude credentials so the in-container `claude`
+      # CLI inherits the auth from `claude login` run on the host during
+      # setup. Two paths matter — `~/.claude/` for credentials/state and
+      # `~/.claude.json` for the account profile. Mounted rw so OAuth token
+      # refreshes can persist.
+      - ${HOME}/.claude:/home/karakos/.claude
+      - ${HOME}/.claude.json:/home/karakos/.claude.json
     ports:
-      - "${DASHBOARD_PORT:-3000}:3000"
-      - "127.0.0.1:${AGENT_SERVER_PORT:-18791}:18791"
+      # Map host:port -> container:port using the same env-defined value on
+      # both sides. The agent-server and dashboard read these env vars to
+      # decide what port to bind, so inside and outside must agree.
+      - "${DASHBOARD_PORT:-3000}:${DASHBOARD_PORT:-3000}"
+      - "127.0.0.1:${AGENT_SERVER_PORT:-18791}:${AGENT_SERVER_PORT:-18791}"
     restart: unless-stopped
     environment:
       - TZ=${TZ:-UTC}
     healthcheck:
-      test: ["CMD", "curl", "-sf", "-H", "Authorization: Bearer ${AGENT_SERVER_TOKEN}", "http://localhost:18791/health"]
+      test: ["CMD-SHELL", "curl -sf -H \"Authorization: Bearer $$AGENT_SERVER_TOKEN\" http://localhost:$${AGENT_SERVER_PORT:-18791}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -24,3 +45,5 @@ services:
 
 volumes:
   karakos-data:
+  karakos-logs:
+  karakos-inbox:
