@@ -2,10 +2,15 @@
 # Karakos Installer for Linux/macOS
 # Run: curl -fsSL https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.sh | bash
 # Or:  bash install.sh
+#
+# Override the upstream source via env vars (useful for forks):
+#   KARAKOS_REPO=user/repo  bash install.sh
 
 set -euo pipefail
 
 INSTALL_DIR="${KARAKOS_DIR:-$HOME/karakos}"
+KARAKOS_REPO="${KARAKOS_REPO:-mcarmody/karakos-package}"
+KARAKOS_REPO_URL="${KARAKOS_REPO_URL:-https://github.com/${KARAKOS_REPO}.git}"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -123,13 +128,13 @@ if [ -d "$INSTALL_DIR" ]; then
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$INSTALL_DIR"
         log "Cloning karakos into $INSTALL_DIR..."
-        git clone https://github.com/mcarmody/karakos-package.git "$INSTALL_DIR"
+        git clone "$KARAKOS_REPO_URL" "$INSTALL_DIR"
     else
         log "Keeping existing installation."
     fi
 else
     log "Cloning karakos into $INSTALL_DIR..."
-    git clone https://github.com/mcarmody/karakos-package.git "$INSTALL_DIR"
+    git clone "$KARAKOS_REPO_URL" "$INSTALL_DIR"
 fi
 
 cd "$INSTALL_DIR"

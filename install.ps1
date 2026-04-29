@@ -1,10 +1,16 @@
 # Karakos Installer for Windows
 # Run: irm https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.ps1 | iex
 # Or:  powershell -ExecutionPolicy Bypass -File install.ps1
+#
+# Override upstream source via env vars (useful for forks):
+#   $env:KARAKOS_REPO = "user/repo"; .\install.ps1
 
 param(
     [string]$InstallDir = "$env:USERPROFILE\karakos"
 )
+
+$KarakosRepo = if ($env:KARAKOS_REPO) { $env:KARAKOS_REPO } else { "mcarmody/karakos-package" }
+$KarakosRepoUrl = if ($env:KARAKOS_REPO_URL) { $env:KARAKOS_REPO_URL } else { "https://github.com/$KarakosRepo.git" }
 
 $ErrorActionPreference = "Stop"
 
@@ -120,11 +126,11 @@ if (Test-Path $InstallDir) {
     } else {
         Remove-Item -Recurse -Force $InstallDir
         Write-Step "Cloning karakos into $InstallDir..."
-        git clone https://github.com/mcarmody/karakos-package.git $InstallDir
+        git clone $KarakosRepoUrl $InstallDir
     }
 } else {
     Write-Step "Cloning karakos into $InstallDir..."
-    git clone https://github.com/mcarmody/karakos-package.git $InstallDir
+    git clone $KarakosRepoUrl $InstallDir
 }
 
 Set-Location $InstallDir

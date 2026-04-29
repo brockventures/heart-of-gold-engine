@@ -11,10 +11,22 @@ import (
 )
 
 const (
-	repoURL    = "https://github.com/mcarmody/karakos-package.git"
-	defaultDir = "karakos"
-	version    = "1.0.0"
+	defaultRepoURL = "https://github.com/mcarmody/karakos-package.git"
+	defaultDir     = "karakos"
+	version        = "1.0.0"
 )
+
+// repoURL returns the canonical install source, overridable for forks via
+// KARAKOS_REPO_URL or KARAKOS_REPO=user/repo.
+func repoURL() string {
+	if u := os.Getenv("KARAKOS_REPO_URL"); u != "" {
+		return u
+	}
+	if r := os.Getenv("KARAKOS_REPO"); r != "" {
+		return "https://github.com/" + r + ".git"
+	}
+	return defaultRepoURL
+}
 
 // ANSI colors
 const (
@@ -307,7 +319,7 @@ func cloneRepo(dir string) error {
 		os.RemoveAll(dir)
 	}
 
-	return runCmd("git", "clone", repoURL, dir)
+	return runCmd("git", "clone", repoURL(), dir)
 }
 
 // --- Setup Wizard ---

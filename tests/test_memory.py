@@ -121,14 +121,14 @@ class TestEpisodeStorage:
 
         conn.execute(
             "INSERT INTO facts (subject, content, confidence, domain) VALUES (?, ?, ?, ?)",
-            ("Mike", "Lives in Southern California", 0.95, "personal"),
+            ("OwnerName", "Lives in a region", 0.95, "personal"),
         )
         conn.commit()
 
-        cursor = conn.execute("SELECT * FROM facts WHERE subject = 'Mike'")
+        cursor = conn.execute("SELECT * FROM facts WHERE subject = 'OwnerName'")
         row = cursor.fetchone()
         assert row is not None
-        assert "Southern California" in row[2]
+        assert "region" in row[2]
         conn.close()
 
     def test_patterns_table(self, memory_db):

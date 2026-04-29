@@ -5,7 +5,8 @@
 set -euo pipefail
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-.}"
-REPO_URL="https://api.github.com/repos/mcarmody/karakos-package/releases/latest"
+KARAKOS_REPO="${KARAKOS_REPO:-mcarmody/karakos-package}"
+REPO_URL="${KARAKOS_RELEASES_URL:-https://api.github.com/repos/${KARAKOS_REPO}/releases/latest}"
 CURRENT_VERSION=$(cat "$WORKSPACE_ROOT/package.json" | grep '"version"' | head -1 | sed 's/.*"version": "\([^"]*\)".*/\1/')
 
 log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"; }
