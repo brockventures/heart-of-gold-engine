@@ -73,14 +73,13 @@ export default function ChatPage() {
           eventSource.close();
           setStreaming(false);
         } else if (payload.chunk) {
-          setMessages((prev) => {
-            const updated = [...prev];
-            const lastMsg = updated[updated.length - 1];
-            if (lastMsg && lastMsg.role === "assistant") {
-              lastMsg.content += payload.chunk;
-            }
-            return updated;
-          });
+          setMessages((prev) =>
+            prev.map((m, i) =>
+              i === prev.length - 1 && m.role === "assistant"
+                ? { ...m, content: m.content + payload.chunk }
+                : m
+            )
+          );
         }
       };
 
