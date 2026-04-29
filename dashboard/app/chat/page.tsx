@@ -1,6 +1,8 @@
 "use client";
 
-import { useState, useEffect, useRef, FormEvent } from "react";
+import { useState, useEffect, useRef, FormEvent, KeyboardEvent } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { usePoll } from "@/lib/hooks";
 
 interface AgentList {
@@ -13,6 +15,8 @@ interface ChatMessage {
   ts: string;
 }
 
+const MAX_TEXTAREA_ROWS = 8;
+
 export default function ChatPage() {
   const { data: agentData } = usePoll<AgentList>("/api/agents", 30000);
   const [agent, setAgent] = useState("");
@@ -22,6 +26,7 @@ export default function ChatPage() {
   const [reloading, setReloading] = useState(false);
   const [reloadMsg, setReloadMsg] = useState<string | null>(null);
   const messagesEnd = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const agents = agentData?.agents ? Object.keys(agentData.agents) : [];
 
@@ -89,6 +94,29 @@ export default function ChatPage() {
     };
   }, [agent]);
 
+  // Auto-resize textarea up to MAX_TEXTAREA_ROWS lines.
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 24;
+    const padding =
+      parseFloat(getComputedStyle(ta).paddingTop) +
+      parseFloat(getComputedStyle(ta).paddingBottom);
+    const max = lineHeight * MAX_TEXTAREA_ROWS + padding;
+    ta.style.height = Math.min(ta.scrollHeight, max) + "px";
+  }, [input]);
+
+  function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    // Enter sends, Shift-Enter inserts newline. Respect IME composition so
+    // multi-keystroke input methods (Japanese, Chinese, Korean) don't fire
+    // a send while a candidate is being chosen.
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      handleSend(e as unknown as FormEvent);
+    }
+  }
+
   async function handleSend(e: FormEvent) {
     e.preventDefault();
     if (!input.trim() || !agent || streaming) return;
@@ -154,7 +182,7 @@ export default function ChatPage() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex items-center gap-4 mb-4">
+      <div className="flex items-center gap-4 mb-4 flex-shrink-0">
         <h1 className="text-2xl font-semibold">Chat</h1>
         <select
           value={agent}
@@ -179,40 +207,135 @@ export default function ChatPage() {
         )}
       </div>
 
-      <div className="flex-1 overflow-auto py-2 mb-4">
-        {messages.map((msg, i) => (
-          <div
-            key={i}
-            className={`p-3 mb-2 rounded-lg ${
-              msg.role === "assistant"
-                ? "bg-gray-900 border border-gray-800"
-                : "bg-gray-950"
-            }`}
-          >
-            <strong className={`text-xs block mb-1 ${
-              msg.role === "user" ? "text-gray-100" : "text-blue-400"
-            }`}>
-              {msg.role === "user" ? "You" : agent}
-            </strong>
-            <p className="text-sm whitespace-pre-wrap text-gray-300">
-              {msg.content}
-              {streaming && i === messages.length - 1 && msg.role === "assistant" && (
-                <span className="opacity-50">▌</span>
+      <div className="flex-1 overflow-auto py-2 mb-4 min-h-0">
+        {messages.map((msg, i) => {
+          const isLastStreaming =
+            streaming && i === messages.length - 1 && msg.role === "assistant";
+          return (
+            <div
+              key={i}
+              className={`p-3 mb-2 rounded-lg ${
+                msg.role === "assistant"
+                  ? "bg-gray-900 border border-gray-800"
+                  : "bg-gray-950"
+              }`}
+            >
+              <strong
+                className={`text-xs block mb-1 ${
+                  msg.role === "user" ? "text-gray-100" : "text-blue-400"
+                }`}
+              >
+                {msg.role === "user" ? "You" : agent}
+              </strong>
+              {msg.role === "user" ? (
+                <p className="text-sm whitespace-pre-wrap text-gray-300">
+                  {msg.content}
+                </p>
+              ) : (
+                <div className="text-sm text-gray-300 chat-markdown">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      a: (props) => (
+                        <a
+                          {...props}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-400 underline hover:text-blue-300"
+                        />
+                      ),
+                      code: ({ className, children, ...props }) => {
+                        const isBlock = /\n/.test(String(children ?? ""));
+                        if (isBlock) {
+                          return (
+                            <code
+                              className={`block bg-gray-950 border border-gray-800 rounded px-3 py-2 my-2 overflow-x-auto font-mono text-xs ${className ?? ""}`}
+                              {...props}
+                            >
+                              {children}
+                            </code>
+                          );
+                        }
+                        return (
+                          <code
+                            className="bg-gray-950 border border-gray-800 rounded px-1 py-0.5 font-mono text-xs"
+                            {...props}
+                          >
+                            {children}
+                          </code>
+                        );
+                      },
+                      pre: ({ children }) => <>{children}</>,
+                      ul: (props) => (
+                        <ul className="list-disc pl-5 my-3 space-y-1" {...props} />
+                      ),
+                      ol: (props) => (
+                        <ol className="list-decimal pl-5 my-3 space-y-1" {...props} />
+                      ),
+                      h1: (props) => (
+                        <h1 className="text-lg font-semibold mt-4 mb-2" {...props} />
+                      ),
+                      h2: (props) => (
+                        <h2 className="text-base font-semibold mt-4 mb-2" {...props} />
+                      ),
+                      h3: (props) => (
+                        <h3 className="text-sm font-semibold mt-3 mb-2" {...props} />
+                      ),
+                      p: (props) => (
+                        <p className="my-3 leading-relaxed" {...props} />
+                      ),
+                      blockquote: (props) => (
+                        <blockquote
+                          className="border-l-2 border-gray-700 pl-3 my-2 text-gray-400"
+                          {...props}
+                        />
+                      ),
+                      table: (props) => (
+                        <table
+                          className="my-2 border-collapse border border-gray-800 text-xs"
+                          {...props}
+                        />
+                      ),
+                      th: (props) => (
+                        <th
+                          className="border border-gray-800 px-2 py-1 bg-gray-950 font-semibold text-left"
+                          {...props}
+                        />
+                      ),
+                      td: (props) => (
+                        <td className="border border-gray-800 px-2 py-1" {...props} />
+                      ),
+                      hr: (props) => (
+                        <hr className="border-gray-800 my-3" {...props} />
+                      ),
+                    }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
+                  {isLastStreaming && (
+                    <span className="opacity-50 inline-block">▌</span>
+                  )}
+                </div>
               )}
-            </p>
-          </div>
-        ))}
+            </div>
+          );
+        })}
         <div ref={messagesEnd} />
       </div>
 
-      <form onSubmit={handleSend} className="flex gap-2 pt-2 border-t border-gray-800">
-        <input
-          type="text"
+      <form
+        onSubmit={handleSend}
+        className="flex gap-2 pt-2 border-t border-gray-800 items-end flex-shrink-0"
+      >
+        <textarea
+          ref={textareaRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder={`Message ${agent || "agent"}...`}
+          onKeyDown={handleKeyDown}
+          placeholder={`Message ${agent || "agent"}...  (Shift-Enter for newline)`}
           disabled={streaming}
-          className="flex-1 px-3 py-2 bg-gray-900 border border-gray-800 rounded text-gray-100 text-sm focus:outline-none focus:border-gray-600 disabled:opacity-50"
+          rows={1}
+          className="flex-1 px-3 py-2 bg-gray-900 border border-gray-800 rounded text-gray-100 text-sm leading-6 resize-none focus:outline-none focus:border-gray-600 disabled:opacity-50"
         />
         <button
           type="submit"
