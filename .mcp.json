@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "karakos-admin": {
+      "command": "python3",
+      "args": ["mcp/admin-server.py"],
+      "env": {}
+    }
+  }
+}
