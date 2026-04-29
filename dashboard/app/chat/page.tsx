@@ -25,6 +25,7 @@ export default function ChatPage() {
   const [streaming, setStreaming] = useState(false);
   const [reloading, setReloading] = useState(false);
   const [reloadMsg, setReloadMsg] = useState<string | null>(null);
+  const [openingTerminal, setOpeningTerminal] = useState(false);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -40,6 +41,28 @@ export default function ChatPage() {
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  async function handleOpenTerminal() {
+    if (!agent || openingTerminal) return;
+    setOpeningTerminal(true);
+    setReloadMsg(`Opening ${agent} in Terminal…`);
+    try {
+      const res = await fetch(`/api/agents/${encodeURIComponent(agent)}/open-terminal`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Request failed" }));
+        setReloadMsg(`Terminal failed: ${err.error || res.statusText}`);
+      } else {
+        setReloadMsg(`${agent} opened in Terminal.`);
+        setTimeout(() => setReloadMsg(null), 4000);
+      }
+    } catch (err) {
+      setReloadMsg(`Terminal error: ${err instanceof Error ? err.message : "unknown"}`);
+    } finally {
+      setOpeningTerminal(false);
+    }
+  }
 
   async function handleReload() {
     if (!agent || reloading || streaming) return;
@@ -201,6 +224,15 @@ export default function ChatPage() {
           className="px-3 py-2 bg-gray-900 hover:bg-gray-800 disabled:opacity-50 border border-gray-800 rounded text-gray-300 text-sm transition-colors"
         >
           {reloading ? "Reloading…" : "↻ Reload"}
+        </button>
+        <button
+          type="button"
+          onClick={handleOpenTerminal}
+          disabled={openingTerminal || !agent}
+          title="Open this agent in a Terminal window (macOS only) — REPL with slash commands, mirrors into this chat log"
+          className="px-3 py-2 bg-gray-900 hover:bg-gray-800 disabled:opacity-50 border border-gray-800 rounded text-gray-300 text-sm transition-colors"
+        >
+          {openingTerminal ? "Opening…" : "⌘ Terminal"}
         </button>
         {reloadMsg && (
           <span className="text-xs text-gray-400">{reloadMsg}</span>
