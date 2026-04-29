@@ -427,6 +427,18 @@ async def restart_agent(agent: str):
     response_buffers[agent] = ""
     await start_agent_subprocess(agent)
 
+
+async def reload_agent(agent: str):
+    """Bounce the subprocess but keep the session — used to pick up new
+    SYSTEM_PROMPT / persona / MCP config without dropping conversation
+    context. The respawn calls --resume on the existing session_id.
+    """
+    log.info(f"Reloading {agent} (preserving session)")
+    await kill_agent_subprocess(agent)
+    agent_last_cost.pop(agent, None)
+    response_buffers[agent] = ""
+    await start_agent_subprocess(agent)
+
 # =============================================================================
 # Cost Tracking
 # =============================================================================
@@ -996,6 +1008,21 @@ async def handle_agent_reset(request):
     await restart_agent(agent)
     return web.json_response({"status": "reset"})
 
+
+async def handle_agent_reload(request):
+    """POST /agents/{name}/reload - Bounce subprocess, preserve session."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if agent not in agent_config:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    await reload_agent(agent)
+    return web.json_response({"status": "reloaded"})
+
+
 async def handle_cost(request):
     """POST /cost - Record external cost event"""
     # Check bearer token
@@ -1189,6 +1216,7 @@ def main():
     app.router.add_get("/health", handle_health)
     app.router.add_get("/agents", handle_agents)
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
+    app.router.add_post("/agents/{name}/reload", handle_agent_reload)
     app.router.add_post("/cost", handle_cost)
     app.router.add_get("/cost/{agent}", handle_cost_get)
 

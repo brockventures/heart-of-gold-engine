@@ -19,6 +19,8 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [reloading, setReloading] = useState(false);
+  const [reloadMsg, setReloadMsg] = useState<string | null>(null);
   const messagesEnd = useRef<HTMLDivElement>(null);
 
   const agents = agentData?.agents ? Object.keys(agentData.agents) : [];
@@ -33,6 +35,28 @@ export default function ChatPage() {
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  async function handleReload() {
+    if (!agent || reloading || streaming) return;
+    setReloading(true);
+    setReloadMsg(`Reloading ${agent}…`);
+    try {
+      const res = await fetch(`/api/agents/${encodeURIComponent(agent)}/reload`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Request failed" }));
+        setReloadMsg(`Reload failed: ${err.error || res.statusText}`);
+      } else {
+        setReloadMsg(`${agent} reloaded — session preserved.`);
+        setTimeout(() => setReloadMsg(null), 4000);
+      }
+    } catch (err) {
+      setReloadMsg(`Reload error: ${err instanceof Error ? err.message : "unknown"}`);
+    } finally {
+      setReloading(false);
+    }
+  }
 
   async function handleSend(e: FormEvent) {
     e.preventDefault();
@@ -110,6 +134,18 @@ export default function ChatPage() {
             <option key={a} value={a}>{a}</option>
           ))}
         </select>
+        <button
+          type="button"
+          onClick={handleReload}
+          disabled={reloading || streaming || !agent}
+          title="Bounce subprocess, preserve session — picks up SYSTEM_PROMPT / persona / MCP changes"
+          className="px-3 py-2 bg-gray-900 hover:bg-gray-800 disabled:opacity-50 border border-gray-800 rounded text-gray-300 text-sm transition-colors"
+        >
+          {reloading ? "Reloading…" : "↻ Reload"}
+        </button>
+        {reloadMsg && (
+          <span className="text-xs text-gray-400">{reloadMsg}</span>
+        )}
       </div>
 
       <div className="flex-1 overflow-auto py-2 mb-4">

@@ -12,14 +12,19 @@ export async function POST(
   }
 
   try {
-    const response = await agentFetch("/restart-session", {
+    const response = await agentFetch(`/agents/${name}/reload`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent: name }),
     });
 
+    if (!response.ok) {
+      return NextResponse.json(
+        { error: `Failed to reload agent: ${response.statusText}` },
+        { status: response.status }
+      );
+    }
+
     const data = await response.json();
-    return NextResponse.json(data, { status: response.status });
+    return NextResponse.json(data);
   } catch (error) {
     return NextResponse.json(
       { error: "Failed to reload agent" },
