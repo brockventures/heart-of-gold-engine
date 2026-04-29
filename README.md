@@ -44,6 +44,28 @@ Karakos is a multi-agent system that provides:
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for detailed installation instructions.
 
+## CLI access
+
+`bin/kara` is a Python CLI that talks to the agent-server's `/message`
+endpoint and tails the response from `message_queue` — same transport as
+the dashboard chat.
+
+```bash
+# one-shot
+./bin/kara "what's on my calendar?"
+echo "summarize this" | ./bin/kara
+
+# REPL (interactive, slash commands)
+./bin/kara
+```
+
+Slash commands inside the REPL: `/health`, `/agents`, `/agent <name>`,
+`/cost`, `/reset`, `/reload`, `/restart` (macOS), `/help`, `/quit`.
+
+Env vars: `AGENT_SERVER_TOKEN` (required), `AGENT_SERVER_URL`
+(default `http://127.0.0.1:18791`), `KARA_AGENT`, `KARA_CHANNEL`
+(default `cli`), `KARA_TIMEOUT` (default `300`s).
+
 ## Documentation
 
 - [QUICKSTART.md](docs/QUICKSTART.md) — Installation and first steps

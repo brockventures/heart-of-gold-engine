@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+kara — CLI client for the Karakos agent-server.
+
+Two modes:
+  - One-shot: `kara "what's on my calendar?"` or `echo ... | kara`
+  - REPL:     `kara` with no args (interactive, slash commands)
+
+Talks to the agent-server's /message endpoint and tails the message_queue
+table for streaming response. Same transport as the dashboard chat — a CLI
+message and a dashboard message are indistinguishable to the agent.
+
+Env vars:
+  AGENT_SERVER_URL    http://127.0.0.1:18791  (where to POST)
+  AGENT_SERVER_TOKEN  required (Bearer token)
+  KARA_AGENT          first agent in agents.json by default
+  KARA_CHANNEL        cli (override to mirror into another surface)
+  KARA_TIMEOUT        300  (seconds for one-shot)
+  KARA_HISTORY        ~/.karakos/kara_history (REPL history file)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
+
+# ---------------------------------------------------------------------------
+# self-exec under repo .venv when available so the user doesn't need to
+# remember to activate it. Stdlib-only imports above this line.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python"
+if _VENV_PY.exists() and Path(sys.executable).resolve() != _VENV_PY.resolve():
+    os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
+
+
+SERVER_URL = os.environ.get("AGENT_SERVER_URL", "http://127.0.0.1:18791").rstrip("/")
+TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
+DEFAULT_CHANNEL = os.environ.get("KARA_CHANNEL", "cli")
+DEFAULT_TIMEOUT = int(os.environ.get("KARA_TIMEOUT", "300"))
+HISTORY_PATH = Path(os.environ.get("KARA_HISTORY", str(Path.home() / ".karakos" / "kara_history")))
+DB_PATH = _REPO_ROOT / "data" / "memory" / "agent-server.db"
+
+POLL_INTERVAL = 0.3  # seconds
+STATUS_COMPLETE = 2
+STATUS_CRASHED = 3
+
+
+# ---------------------------------------------------------------------------
+# transport
+# ---------------------------------------------------------------------------
+
+class ServerError(RuntimeError):
+    pass
+
+
+def _http(method: str, path: str, body: dict | None = None) -> dict:
+    if not TOKEN:
+        raise ServerError("AGENT_SERVER_TOKEN not set")
+    url = f"{SERVER_URL}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urlrequest.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urlrequest.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw else {}
+    except urlerror.HTTPError as exc:
+        try:
+            err = json.loads(exc.read().decode())
+        except Exception:
+            err = {"error": exc.reason}
+        raise ServerError(f"{exc.code}: {err.get('error', err)}") from exc
+    except urlerror.URLError as exc:
+        raise ServerError(f"cannot reach {url}: {exc.reason}") from exc
+
+
+def _list_agents() -> list[str]:
+    data = _http("GET", "/agents")
+    agents = data.get("agents") or []
+    if isinstance(agents, dict):
+        return sorted(agents.keys())
+    if isinstance(agents, list):
+        return [a if isinstance(a, str) else a.get("name", "") for a in agents]
+    return []
+
+
+def _default_agent() -> str:
+    explicit = os.environ.get("KARA_AGENT")
+    if explicit:
+        return explicit
+    cfg = _REPO_ROOT / "config" / "agents.json"
+    if cfg.exists():
+        try:
+            data = json.loads(cfg.read_text())
+            agents = data.get("agents") or {}
+            if agents:
+                return next(iter(agents.keys()))
+        except Exception:
+            pass
+    try:
+        agents = _list_agents()
+        if agents:
+            return agents[0]
+    except ServerError:
+        pass
+    raise ServerError("no agent configured (set KARA_AGENT or run agent-server)")
+
+
+# ---------------------------------------------------------------------------
+# message send + tail
+# ---------------------------------------------------------------------------
+
+def _enqueue(agent: str, content: str, channel: str) -> str:
+    message_id = f"cli-{uuid.uuid4()}"
+    payload = {
+        "agent": agent,
+        "channel": channel,
+        "channel_id": "0",
+        "server": "local",
+        "author": os.environ.get("USER", "cli"),
+        "content": content,
+        "message_id": message_id,
+        "mentions_agent": True,
+    }
+    resp = _http("POST", "/message", payload)
+    if resp.get("status") != "queued":
+        raise ServerError(f"unexpected enqueue response: {resp}")
+    return message_id
+
+
+def _open_db_ro() -> sqlite3.Connection:
+    if not DB_PATH.exists():
+        raise ServerError(f"agent-server DB not found at {DB_PATH}")
+    uri = f"file:{DB_PATH}?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=5)
+
+
+def _tail(message_id: str, timeout: int, on_chunk):
+    """Poll message_queue.response until processed != 0/1, streaming deltas."""
+    deadline = time.monotonic() + timeout
+    last_len = 0
+    last_status = 0
+    db = _open_db_ro()
+    try:
+        while time.monotonic() < deadline:
+            row = db.execute(
+                "SELECT processed, response FROM message_queue WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is not None:
+                processed, response = row
+                response = response or ""
+                if len(response) > last_len:
+                    on_chunk(response[last_len:])
+                    last_len = len(response)
+                last_status = processed
+                if processed == STATUS_COMPLETE:
+                    return "complete"
+                if processed == STATUS_CRASHED:
+                    return "crashed"
+            time.sleep(POLL_INTERVAL)
+        return "timeout"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# slash commands
+# ---------------------------------------------------------------------------
+
+def _cmd_health(_args, agent, _set_agent):
+    data = _http("GET", "/health")
+    return json.dumps(data, indent=2)
+
+
+def _cmd_agents(_args, agent, _set_agent):
+    agents = _list_agents()
+    return "\n".join(f"  {a}{' *' if a == agent else ''}" for a in agents) or "(none)"
+
+
+def _cmd_cost(args, agent, _set_agent):
+    target = args[0] if args else agent
+    data = _http("GET", f"/cost/{target}")
+    return json.dumps(data, indent=2)
+
+
+def _cmd_reset(args, agent, _set_agent):
+    target = args[0] if args else agent
+    data = _http("POST", f"/agents/{target}/reset")
+    return json.dumps(data, indent=2)
+
+
+def _cmd_reload(args, agent, _set_agent):
+    target = args[0] if args else agent
+    data = _http("POST", f"/agents/{target}/reload")
+    return json.dumps(data, indent=2)
+
+
+def _cmd_restart(_args, _agent, _set_agent):
+    if sys.platform != "darwin":
+        return "not supported on this platform (macOS-only)"
+    import subprocess
+    uid = os.getuid()
+    label = os.environ.get("KARA_LAUNCHD_LABEL", "com.karakos.agent-server")
+    proc = subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+        capture_output=True, text=True,
+    )
+    return proc.stdout + proc.stderr
+
+
+def _cmd_agent(args, _agent, set_agent):
+    if not args:
+        return "usage: /agent <name>"
+    set_agent(args[0])
+    return f"active agent: {args[0]}"
+
+
+def _cmd_help(_args, _agent, _set_agent):
+    return (
+        "/health           — server + agent status\n"
+        "/agents           — list agents (* = active)\n"
+        "/agent <name>     — switch active agent\n"
+        "/cost [agent]     — cost summary\n"
+        "/reset [agent]    — reset session (destructive)\n"
+        "/reload [agent]   — bounce subprocess, preserve session\n"
+        "/restart          — kickstart agent-server (macOS only)\n"
+        "/quit             — exit"
+    )
+
+
+SLASH = {
+    "/health": _cmd_health,
+    "/agents": _cmd_agents,
+    "/agent": _cmd_agent,
+    "/cost": _cmd_cost,
+    "/reset": _cmd_reset,
+    "/reload": _cmd_reload,
+    "/restart": _cmd_restart,
+    "/help": _cmd_help,
+    "/?": _cmd_help,
+}
+
+
+# ---------------------------------------------------------------------------
+# one-shot
+# ---------------------------------------------------------------------------
+
+def run_oneshot(content: str, agent: str, channel: str, timeout: int) -> int:
+    message_id = _enqueue(agent, content, channel)
+
+    def on_chunk(delta: str):
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+
+    status = _tail(message_id, timeout, on_chunk)
+    if not sys.stdout.isatty() or True:
+        sys.stdout.write("\n")
+    if status == "complete":
+        return 0
+    sys.stderr.write(f"[kara: {status}]\n")
+    return 1 if status == "crashed" else 2
+
+
+# ---------------------------------------------------------------------------
+# REPL
+# ---------------------------------------------------------------------------
+
+def run_repl(agent: str, channel: str, timeout: int) -> int:
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import FileHistory
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.live import Live
+    except ImportError:
+        sys.stderr.write(
+            "kara REPL requires prompt_toolkit + rich.\n"
+            "  pip install prompt-toolkit rich\n"
+            "Or use one-shot mode: kara \"<message>\"\n"
+        )
+        return 1
+
+    console = Console()
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    session = PromptSession(history=FileHistory(str(HISTORY_PATH)))
+
+    state = {"agent": agent}
+
+    def set_agent(name: str):
+        state["agent"] = name
+
+    console.print(f"[dim]kara → {state['agent']} (channel={channel})  /help for commands, /quit to exit[/dim]")
+
+    while True:
+        try:
+            line = session.prompt(f"[{state['agent']}] ❯ ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return 0
+
+        if not line:
+            continue
+
+        if line in ("/quit", "/exit", "/q"):
+            return 0
+
+        if line.startswith("/"):
+            parts = line.split()
+            cmd = SLASH.get(parts[0])
+            if not cmd:
+                console.print(f"[red]unknown command: {parts[0]}[/red] (try /help)")
+                continue
+            try:
+                out = cmd(parts[1:], state["agent"], set_agent)
+            except ServerError as exc:
+                console.print(f"[red]error:[/red] {exc}")
+                continue
+            console.print(out)
+            continue
+
+        try:
+            message_id = _enqueue(state["agent"], line, channel)
+        except ServerError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            continue
+
+        buffer: list[str] = []
+        with Live(Markdown(""), console=console, refresh_per_second=8, vertical_overflow="visible") as live:
+            def on_chunk(delta: str):
+                buffer.append(delta)
+                live.update(Markdown("".join(buffer)))
+            status = _tail(message_id, timeout, on_chunk)
+
+        if status == "crashed":
+            console.print("[red][kara: agent crashed][/red]")
+        elif status == "timeout":
+            console.print(f"[yellow][kara: timeout after {timeout}s][/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# entry
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    args = sys.argv[1:]
+    channel = DEFAULT_CHANNEL
+    timeout = DEFAULT_TIMEOUT
+    explicit_agent = None
+    positional: list[str] = []
+
+    it = iter(args)
+    for a in it:
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if a in ("-a", "--agent"):
+            explicit_agent = next(it, None)
+        elif a in ("-c", "--channel"):
+            channel = next(it, channel) or channel
+        elif a in ("-t", "--timeout"):
+            try:
+                timeout = int(next(it, str(timeout)) or timeout)
+            except ValueError:
+                sys.stderr.write("--timeout requires an integer\n")
+                return 2
+        elif a == "--":
+            positional.extend(it)
+            break
+        elif a.startswith("-"):
+            sys.stderr.write(f"unknown flag: {a}\n")
+            return 2
+        else:
+            positional.append(a)
+
+    try:
+        agent = explicit_agent or _default_agent()
+    except ServerError as exc:
+        sys.stderr.write(f"kara: {exc}\n")
+        return 1
+
+    # Stdin pipe?
+    piped = None
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+
+    if positional or piped:
+        content = " ".join(positional)
+        if piped:
+            content = (content + "\n\n" + piped).strip() if content else piped
+        try:
+            return run_oneshot(content, agent, channel, timeout)
+        except ServerError as exc:
+            sys.stderr.write(f"kara: {exc}\n")
+            return 1
+
+    return run_repl(agent, channel, timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
