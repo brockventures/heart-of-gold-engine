@@ -58,6 +58,37 @@ export default function ChatPage() {
     }
   }
 
+  // Seed messages from server-side history when an agent is selected. The
+  // chat page kept no record across reloads even though message_queue stored
+  // every turn — pulling the last N entries restores continuity.
+  useEffect(() => {
+    if (!agent) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(
+          `/api/chat/history?agent=${encodeURIComponent(agent)}&limit=50`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const seeded: ChatMessage[] = (data.messages || []).map(
+          (m: { role: "user" | "assistant"; content: string; ts: string }) => ({
+            role: m.role,
+            content: m.content,
+            ts: m.ts,
+          })
+        );
+        setMessages(seeded);
+      } catch {
+        // ignore — empty chat is acceptable failure mode
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agent]);
+
   async function handleSend(e: FormEvent) {
     e.preventDefault();
     if (!input.trim() || !agent || streaming) return;
