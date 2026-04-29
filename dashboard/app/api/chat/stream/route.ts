@@ -64,7 +64,7 @@ export async function GET(request: NextRequest) {
           clearInterval(pollInterval);
           controller.error(error);
         }
-      }, 500); // Poll every 500ms
+      }, 200); // Poll every 200ms — fast enough to feel like real streaming
 
       // Timeout after 5 minutes
       setTimeout(() => {

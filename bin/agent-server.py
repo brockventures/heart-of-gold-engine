@@ -663,7 +663,29 @@ async def send_to_agent(agent: str, content: str, message_ids: List[str]):
         log.error(f"Error sending to {agent}: {e}")
         agent_states[agent] = "ERROR_RECOVERY"
 
-async def read_agent_response(agent: str, channel_id: str) -> tuple[str, Dict]:
+async def write_streaming_response(message_ids: List[str], text: str) -> None:
+    """Push partial response text into message_queue so SSE polling sees it.
+
+    The /api/chat/stream SSE route reads message_queue.response and forwards
+    deltas to the dashboard. Without these incremental writes, the dashboard
+    only sees text on the post-loop UPDATE — i.e., never until the turn ends.
+    """
+    if not message_ids or db is None:
+        return
+    placeholders = ",".join("?" * len(message_ids))
+    try:
+        await db.execute(
+            f"UPDATE message_queue SET response = ? WHERE message_id IN ({placeholders})",
+            (text, *message_ids),
+        )
+        await db.commit()
+    except Exception as e:
+        log.warning(f"streaming response write failed: {e}")
+
+
+async def read_agent_response(
+    agent: str, channel_id: str, message_ids: Optional[List[str]] = None
+) -> tuple[str, Dict]:
     """Read and process agent response stream"""
     proc = agent_processes.get(agent)
     if not proc or not proc.stdout:
@@ -672,6 +694,7 @@ async def read_agent_response(agent: str, channel_id: str) -> tuple[str, Dict]:
     config = agent_config.get(agent, {})
     tool_streaming = config.get("tool_streaming", False)
     stream_to_channel = config.get("stream_to_channel", False)
+    msg_ids = message_ids or []
 
     final_text = ""
     metadata = {}
@@ -695,6 +718,7 @@ async def read_agent_response(agent: str, channel_id: str) -> tuple[str, Dict]:
             # then a single `result` event closes the turn.
             if event_type == "assistant":
                 message = event.get("message", {}) or {}
+                got_text = False
                 for block in message.get("content", []) or []:
                     btype = block.get("type")
                     if btype == "text":
@@ -702,6 +726,7 @@ async def read_agent_response(agent: str, channel_id: str) -> tuple[str, Dict]:
                         if text:
                             final_text += text
                             response_buffers[agent] = final_text
+                            got_text = True
                             if stream_to_channel and channel_id != "0":
                                 # TODO: Implement chunked streaming
                                 pass
@@ -713,6 +738,10 @@ async def read_agent_response(agent: str, channel_id: str) -> tuple[str, Dict]:
                     # `thinking` blocks are intentionally ignored here — they
                     # are stripped from the final text below as a belt-and-
                     # braces measure for any inline <thinking> tags.
+
+                if got_text:
+                    cleaned = THINKING_BLOCK_RE.sub("", final_text)
+                    await write_streaming_response(msg_ids, cleaned)
 
             elif event_type == "result":
                 # Extract metadata. Token counts live under `usage`,
@@ -797,7 +826,7 @@ async def process_agent_queue(agent: str):
         await send_to_agent(agent, formatted_content, message_ids)
 
         # Read response
-        response_text, metadata = await read_agent_response(agent, channel_id)
+        response_text, metadata = await read_agent_response(agent, channel_id, message_ids)
 
         # Stop typing
         await stop_typing(channel_id)
