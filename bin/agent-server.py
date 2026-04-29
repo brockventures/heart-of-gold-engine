@@ -309,6 +309,36 @@ def load_persona_files(agent: str) -> str:
 
     return "\n\n".join(persona_parts)
 
+
+def load_onboarding_prompt(agent: str) -> str:
+    """Return the onboarding prompt iff persona is empty.
+
+    Gated on persona content (not session-resume state) so wiping the DB
+    doesn't retrigger onboarding once the user has given the agent its
+    identity. Substitutes a small set of placeholders so the file can be
+    shared across agent renames.
+    """
+    persona_dir = WORKSPACE_ROOT / "agents" / agent / "persona"
+    if persona_dir.exists() and any(
+        f.read_text().strip() for f in persona_dir.glob("*.md") if f.is_file()
+    ):
+        return ""
+
+    onboarding_path = WORKSPACE_ROOT / "agents" / agent / "onboarding.md"
+    if not onboarding_path.exists():
+        return ""
+
+    text = onboarding_path.read_text()
+    substitutions = {
+        "{{AGENT_NAME}}": agent,
+        "{{OWNER_NAME}}": os.environ.get("OWNER_NAME", "User"),
+        "{{SYSTEM_NAME}}": os.environ.get("SYSTEM_NAME", "karakos"),
+    }
+    for placeholder, value in substitutions.items():
+        text = text.replace(placeholder, value)
+    return text.strip()
+
+
 async def start_agent_subprocess(agent: str):
     """Start persistent Claude subprocess for agent"""
     config = agent_config.get(agent, {})
@@ -333,6 +363,14 @@ async def start_agent_subprocess(agent: str):
 
     # Load persona
     persona_content = load_persona_files(agent)
+
+    # First-boot gate: if no persona has been written yet, prepend the
+    # onboarding prompt so the agent asks the user for guidance instead
+    # of arriving fully-formed.
+    onboarding = load_onboarding_prompt(agent)
+    if onboarding:
+        log.info(f"Injecting onboarding prompt for {agent} (persona is empty)")
+        persona_content = onboarding + ("\n\n" + persona_content if persona_content else "")
 
     # Load last session summary if available
     last_session = await load_last_session(agent)

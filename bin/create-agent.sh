@@ -129,6 +129,18 @@ sed \
 # Create empty voice.md for user customization
 touch "$AGENT_DIR/persona/voice.md"
 
+# Drop in a templated onboarding.md so the very first turn asks the user
+# for guidance instead of behaving as a fully-formed assistant. Removed
+# automatically (well — ignored) once the persona dir has any content.
+ONBOARDING_TEMPLATE="$WORKSPACE_ROOT/agents/templates/onboarding.md"
+if [[ -f "$ONBOARDING_TEMPLATE" ]]; then
+    sed \
+        -e "s/{{AGENT_NAME}}/$AGENT_NAME/g" \
+        -e "s/{{SYSTEM_NAME}}/$SYSTEM_NAME/g" \
+        -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
+        "$ONBOARDING_TEMPLATE" > "$AGENT_DIR/onboarding.md"
+fi
+
 # Create inbox directory for dispatch adapter
 mkdir -p "$WORKSPACE_ROOT/inbox/$AGENT_NAME"
 
