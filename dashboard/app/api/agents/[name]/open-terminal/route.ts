@@ -33,9 +33,21 @@ export async function POST(
   // Repo root: dashboard/ lives one directory below the package root.
   const repoRoot = resolve(process.cwd(), "..");
 
-  // Use KARA_CHANNEL=dashboard so the CLI shares the dashboard's chat log
-  // (the history view filters channel='dashboard').
-  const cmd = `cd '${repoRoot}' && KARA_AGENT='${name}' KARA_CHANNEL=dashboard ./bin/kara`;
+  // Defense-in-depth: repoRoot comes from process.cwd() so it shouldn't
+  // contain quotes/backslashes/$ in practice, but we escape both layers
+  // anyway because the value flows through (a) bash single-quoted strings
+  // and (b) AppleScript double-quoted strings.
+  //
+  // Bash single-quote: ' becomes '\''
+  const shellEscape = (s: string) => s.replace(/'/g, `'\\''`);
+  // AppleScript double-quote: \ -> \\, " -> \"
+  const applescriptEscape = (s: string) =>
+    s.replace(/\\/g, `\\\\`).replace(/"/g, `\\"`);
+
+  const safeRepoRoot = shellEscape(repoRoot);
+  // Agent name already passes NAME_RE — no shell metachars possible.
+  const innerCmd = `cd '${safeRepoRoot}' && KARA_AGENT='${name}' KARA_CHANNEL=dashboard ./bin/kara`;
+  const cmd = applescriptEscape(innerCmd);
 
   // Each AppleScript line is a separate -e arg. Embedding newlines in a
   // single quoted arg breaks AppleScript parsing.

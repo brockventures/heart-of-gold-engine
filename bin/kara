@@ -152,6 +152,27 @@ def _tail(message_id: str, timeout: int, on_chunk):
     last_len = 0
     last_status = 0
     db = _open_db_ro()
+
+    def _flush_final():
+        """One last read after a terminal status — picks up any response
+        delta the server wrote concurrently with (or just after) the
+        status update so the user sees the full output before exit."""
+        nonlocal last_len
+        time.sleep(POLL_INTERVAL)
+        try:
+            row = db.execute(
+                "SELECT response FROM message_queue WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+        except Exception:
+            return
+        if row is None:
+            return
+        response = (row[0] or "")
+        if len(response) > last_len:
+            on_chunk(response[last_len:])
+            last_len = len(response)
+
     try:
         while time.monotonic() < deadline:
             row = db.execute(
@@ -166,8 +187,10 @@ def _tail(message_id: str, timeout: int, on_chunk):
                     last_len = len(response)
                 last_status = processed
                 if processed == STATUS_COMPLETE:
+                    _flush_final()
                     return "complete"
                 if processed == STATUS_CRASHED:
+                    _flush_final()
                     return "crashed"
             time.sleep(POLL_INTERVAL)
         return "timeout"

@@ -121,9 +121,24 @@ if ! command -v curl &>/dev/null; then
 fi
 
 # --- Clone ---
+# Verify that $INSTALL_DIR actually looks like a karakos checkout before
+# we offer to nuke it. Without this guard, a user who points
+# KARAKOS_DIR at $HOME (or any pre-existing dir) and answers "y" loses
+# everything in that directory.
+is_karakos_dir() {
+    local d="$1"
+    [ -f "$d/setup.sh" ] && [ -d "$d/bin" ] && [ -d "$d/agents" ] && [ -f "$d/README.md" ]
+}
+
 if [ -d "$INSTALL_DIR" ]; then
     log "Directory $INSTALL_DIR already exists."
-    read -p "  Overwrite? (y/N) " -n 1 -r
+    if ! is_karakos_dir "$INSTALL_DIR"; then
+        echo "  Refusing to overwrite: $INSTALL_DIR does not look like a karakos checkout"
+        echo "  (missing setup.sh / bin/ / agents/ / README.md)."
+        echo "  Move or remove it manually, or set KARAKOS_DIR to a different path."
+        exit 1
+    fi
+    read -p "  Overwrite existing karakos install? (y/N) " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$INSTALL_DIR"

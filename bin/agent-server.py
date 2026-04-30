@@ -1090,6 +1090,68 @@ async def handle_agent_reload(request):
     return web.json_response({"status": "reloaded"})
 
 
+# Agent name validator — same surface as bin/create-agent.sh's check, used
+# to reject path traversal / shell metachars before we touch disk.
+_AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+async def handle_agent_register(request):
+    """POST /agents/{name}/register - Hot-load a newly-created agent.
+
+    bin/create-agent.sh writes the new agent into config/agents.json and
+    then POSTs here so the running server picks it up without a full
+    restart. This endpoint:
+      1. re-reads agents.json (and channels.json) via load_config()
+      2. confirms the new agent now appears in agent_config
+      3. starts its subprocess (the same code path startup() uses)
+
+    Returns 200 once the subprocess is launched, 404 if the new agent
+    didn't show up in the reloaded config (typo / wrong file), and 409
+    if the agent is already running.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if not agent or not _AGENT_NAME_RE.match(agent):
+        return web.json_response({"error": "Invalid agent name"}, status=400)
+
+    if agent in agent_processes:
+        return web.json_response(
+            {"error": "Agent already running", "agent": agent},
+            status=409,
+        )
+
+    # Re-read agents.json + channels.json so the new entry, its Discord
+    # token mapping, and any new channel routing all become visible to
+    # the running server.
+    await load_config()
+
+    if agent not in agent_config:
+        return web.json_response(
+            {
+                "error": (
+                    f"Agent '{agent}' not found in config after reload — "
+                    "verify it was written to config/agents.json"
+                )
+            },
+            status=404,
+        )
+
+    log.info(f"Hot-registering new agent: {agent}")
+    await start_agent_subprocess(agent)
+
+    discord_bound = agent in AGENT_TOKENS
+    return web.json_response(
+        {
+            "status": "registered",
+            "agent": agent,
+            "discord_bound": discord_bound,
+        }
+    )
+
+
 async def handle_cost(request):
     """POST /cost - Record external cost event"""
     # Check bearer token
@@ -1284,6 +1346,7 @@ def main():
     app.router.add_get("/agents", handle_agents)
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
     app.router.add_post("/agents/{name}/reload", handle_agent_reload)
+    app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/cost", handle_cost)
     app.router.add_get("/cost/{agent}", handle_cost_get)
 

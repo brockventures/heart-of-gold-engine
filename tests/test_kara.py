@@ -78,3 +78,21 @@ def test_message_id_prefix():
     """Outgoing messages are tagged cli-<uuid> so the server can spot them."""
     src = KARA.read_text()
     assert '"cli-{uuid.uuid4()}"' in src or 'f"cli-{uuid.uuid4()}"' in src
+
+
+def test_tail_flushes_final_delta_on_terminal_status():
+    """_tail must do one last read after detecting a terminal status so a
+    response delta written concurrently with the status update isn't
+    dropped on the floor.
+
+    Source-level check: the body of _tail must call _flush_final()
+    before returning 'complete' or 'crashed'.
+    """
+    src = KARA.read_text()
+    # Body of _tail
+    start = src.index("def _tail(")
+    end = src.index("\ndef ", start + 1)
+    body = src[start:end]
+    assert "_flush_final()" in body
+    # Both terminal-status branches must call it
+    assert body.count("_flush_final()") >= 2
