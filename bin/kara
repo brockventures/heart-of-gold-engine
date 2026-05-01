@@ -288,8 +288,7 @@ def run_oneshot(content: str, agent: str, channel: str, timeout: int) -> int:
         sys.stdout.flush()
 
     status = _tail(message_id, timeout, on_chunk)
-    if not sys.stdout.isatty() or True:
-        sys.stdout.write("\n")
+    sys.stdout.write("\n")
     if status == "complete":
         return 0
     sys.stderr.write(f"[kara: {status}]\n")
