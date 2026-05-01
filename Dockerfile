@@ -62,5 +62,12 @@ RUN install -d -o karakos -g karakos \
         logs logs/agent-streams logs/session-summaries \
         inbox
 
+# Strip CRLF line endings from shell scripts. Belt-and-suspenders for Windows
+# checkouts where git's autocrlf may have rewritten LF -> CRLF, which breaks
+# shebangs inside the Linux container (env: 'bash\r': No such file, exit 127).
+# .gitattributes also forces LF on these files at the repo level.
+RUN find /workspace/bin -type f \( -name '*.sh' -o -name 'kara' \) \
+        -exec sed -i 's/\r$//' {} +
+
 USER karakos
 ENTRYPOINT ["/usr/bin/tini", "--", "/workspace/bin/entrypoint.sh"]

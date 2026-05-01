@@ -1,0 +1,8 @@
+# Force LF line endings for shell scripts and Docker files. Without this,
+# Windows clones with `core.autocrlf=true` rewrite shebangs to `#!/bin/bash\r`
+# which fails inside the Linux container with `env: 'bash\r': No such file or
+# directory` (exit 127).
+*.sh         text eol=lf
+bin/kara     text eol=lf
+Dockerfile   text eol=lf
+*.dockerfile text eol=lf
