@@ -70,12 +70,12 @@ fi
 # Check for name conflict
 AGENTS_JSON="$WORKSPACE_ROOT/config/agents.json"
 if [[ -f "$AGENTS_JSON" ]]; then
-    EXISTING=$(python3 -c "
-import json
-cfg = json.load(open('$AGENTS_JSON'))
-agents = list(cfg.get('agents', {}).keys())
-print(' '.join(agents))
-" 2>/dev/null || echo "")
+    EXISTING=$(AGENTS_JSON="$AGENTS_JSON" python3 - <<'PY' 2>/dev/null || echo ""
+import json, os
+cfg = json.load(open(os.environ['AGENTS_JSON']))
+print(' '.join(cfg.get('agents', {}).keys()))
+PY
+)
     if echo "$EXISTING" | grep -qw "$AGENT_NAME"; then
         echo "Error: agent '$AGENT_NAME' already exists" >&2
         exit 1
@@ -94,27 +94,31 @@ OWNER_NAME="${OWNER_NAME:-User}"
 
 # Build channel list
 CHANNELS=""
-if [[ -f "$WORKSPACE_ROOT/config/channels.json" ]]; then
-    CHANNELS=$(python3 -c "
-import json
-cfg = json.load(open('$WORKSPACE_ROOT/config/channels.json'))
+CHANNELS_JSON="$WORKSPACE_ROOT/config/channels.json"
+if [[ -f "$CHANNELS_JSON" ]]; then
+    CHANNELS=$(CHANNELS_JSON="$CHANNELS_JSON" python3 - <<'PY' 2>/dev/null || echo "- #general"
+import json, os
+cfg = json.load(open(os.environ['CHANNELS_JSON']))
 for name, info in cfg.get('channels', {}).items():
     default = info.get('default_agent', '')
     print(f'- #{name}' + (f' (default: {default})' if default else ''))
-" 2>/dev/null || echo "- #general")
+PY
+)
 fi
 
 # Build other agents list
 OTHER_AGENTS=""
 if [[ -f "$AGENTS_JSON" ]]; then
-    OTHER_AGENTS=$(python3 -c "
-import json
-cfg = json.load(open('$AGENTS_JSON'))
+    OTHER_AGENTS=$(AGENTS_JSON="$AGENTS_JSON" AGENT_NAME="$AGENT_NAME" python3 - <<'PY' 2>/dev/null || echo ""
+import json, os
+cfg = json.load(open(os.environ['AGENTS_JSON']))
+self_name = os.environ['AGENT_NAME']
 for name, info in cfg.get('agents', {}).items():
-    if name != '$AGENT_NAME':
+    if name != self_name:
         model = info.get('model', 'sonnet')
         print(f'- **{name.title()}** ({model})')
-" 2>/dev/null || echo "")
+PY
+)
 fi
 
 # Generate system prompt from template
@@ -149,33 +153,42 @@ echo "  System prompt generated from $TEMPLATE template"
 
 # Register in agents.json (unless ephemeral)
 if [[ "$EPHEMERAL" == "false" && -f "$AGENTS_JSON" ]]; then
-    python3 -c "
+    AGENTS_JSON="$AGENTS_JSON" \
+    AGENT_NAME="$AGENT_NAME" \
+    MODEL="$MODEL" \
+    MAX_TURNS="$MAX_TURNS" \
+    DISCORD_TOKEN="$DISCORD_TOKEN" \
+    python3 - <<'PY'
 import json
+import os
 
-with open('$AGENTS_JSON') as f:
+agents_json = os.environ['AGENTS_JSON']
+agent_name = os.environ['AGENT_NAME']
+model = os.environ['MODEL']
+max_turns = int(os.environ['MAX_TURNS'])
+discord_token = os.environ.get('DISCORD_TOKEN', '')
+
+with open(agents_json) as f:
     cfg = json.load(f)
 
 agents = cfg.setdefault('agents', {})
 entry = {
-    'model': '$MODEL',
-    'max_turns': $MAX_TURNS,
-    'system_prompt': 'agents/$AGENT_NAME/SYSTEM_PROMPT.md',
+    'model': model,
+    'max_turns': max_turns,
+    'system_prompt': f'agents/{agent_name}/SYSTEM_PROMPT.md',
 }
 
-# Add Discord token env var if provided
-token = '$DISCORD_TOKEN'
-if token:
-    import os
-    env_var = 'DISCORD_BOT_TOKEN_' + '$AGENT_NAME'.upper().replace('-', '_')
+if discord_token:
+    env_var = 'DISCORD_BOT_TOKEN_' + agent_name.upper().replace('-', '_')
     entry['discord_bot_token_env'] = env_var
     # Note: user must add the actual token to .env
 
-agents['$AGENT_NAME'] = entry
+agents[agent_name] = entry
 
-with open('$AGENTS_JSON', 'w') as f:
+with open(agents_json, 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')
-"
+PY
     echo "  Registered in agents.json"
 fi
 
