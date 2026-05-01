@@ -103,3 +103,6 @@ jobs:
 
       - name: Validate docker-compose.yml
         run: docker compose -f config/docker-compose.yml config --quiet
+
+      - name: Validate docker-compose.dev.yml overlay
+        run: docker compose -f config/docker-compose.yml -f config/docker-compose.dev.yml config --quiet

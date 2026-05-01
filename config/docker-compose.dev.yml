@@ -1,0 +1,15 @@
+# Development override — builds the image locally instead of pulling from GHCR.
+#
+# Usage:
+#   docker compose -f config/docker-compose.yml -f config/docker-compose.dev.yml up
+#
+# This is only needed if you are actively modifying the Dockerfile or
+# Python/Node dependencies and want to test changes before publishing a release.
+# Regular users should use docker-compose.yml on its own (docker compose pull).
+
+services:
+  karakos:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: karakos-dev:local

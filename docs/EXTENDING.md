@@ -195,7 +195,32 @@ The system can modify itself through the builder agent:
 | `skills/*/` | Agent session reset | Dashboard → Reset |
 | `config/agents.json` | Agent server restart | POST `/restart/server` |
 | `bin/agent-server.py` | Agent server restart | POST `/restart/server` |
-| `Dockerfile` | Container rebuild | `docker compose up --build` |
+| `Dockerfile` | Container rebuild | see [Local development build](#local-development-build) |
+
+## Local Development Build
+
+Production installs pull a prebuilt image from GHCR (`docker compose pull`).
+If you are modifying the `Dockerfile` or Python/Node dependencies and need to
+test those changes before a release, use the dev compose override:
+
+```bash
+docker compose \
+  -f config/docker-compose.yml \
+  -f config/docker-compose.dev.yml \
+  up --build -d
+```
+
+`config/docker-compose.dev.yml` overlays `build: .` back onto the service so
+your local changes are compiled into an image named `karakos-dev:local`.
+Bring the stack back down and return to the prebuilt image at any time with:
+
+```bash
+docker compose down
+docker compose -f config/docker-compose.yml up -d
+```
+
+The dev override is intentionally not committed to production flows — it is
+only for contributors iterating on the image itself.
 
 ## Environment Variables
 

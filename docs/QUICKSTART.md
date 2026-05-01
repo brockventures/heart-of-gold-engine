@@ -39,12 +39,21 @@ The wizard saves progress, so you can quit and resume with `./setup.sh`.
 ## Start
 
 ```bash
+docker compose pull
 docker compose up -d
 ```
 
-First build takes 5-10 minutes (downloads base images, installs dependencies, builds dashboard).
+`docker compose pull` downloads the prebuilt multi-arch image from GHCR (~1.2 GB).
+No local build step — startup is fast once the image is on disk.
 
-**Expected image size:** ~1.2GB (multi-stage build with slim base images)
+**Version pinning:** To stay on a specific release and control when you upgrade, set
+`KARAKOS_VERSION` in `config/.env`:
+
+```bash
+KARAKOS_VERSION=v1.3
+```
+
+Then `docker compose up -d` will use that version instead of `latest`.
 
 ## Verify
 

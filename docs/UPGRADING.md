@@ -2,6 +2,13 @@
 
 Manual upgrade instructions. Karakos does not auto-update.
 
+Karakos ships prebuilt multi-arch images to GHCR. The upgrade path is
+`docker compose pull && docker compose up -d` — no local build required.
+
+`latest` always tracks the newest release. To control when you upgrade, pin
+`KARAKOS_VERSION` in `config/.env` (e.g. `KARAKOS_VERSION=v1.3`). Remove the
+pin or update it when you are ready to move to a newer release.
+
 ## Version Check
 
 The system checks for updates weekly and posts to #signals if a newer version is available. You can also check manually:
@@ -48,13 +55,15 @@ git stash pop
 
 Read the release notes for your version jump. Breaking changes are documented in the GitHub release.
 
-### 5. Rebuild and Start
+### 5. Pull and Start
 
 ```bash
-docker compose up --build -d
+docker compose pull
+docker compose up -d
 ```
 
-The `--build` flag rebuilds the container with any new dependencies or dashboard changes.
+`docker compose pull` downloads the prebuilt image for the new release from GHCR.
+No local build step required.
 
 ### 6. Verify
 
@@ -89,8 +98,9 @@ cp config/.env.backup config/.env
 # Check out previous version
 git checkout v1.0.0  # or whatever version you were on
 
-# Rebuild
-docker compose up --build -d
+# Pull that version's image and start
+docker compose pull
+docker compose up -d
 ```
 
 ## Version History

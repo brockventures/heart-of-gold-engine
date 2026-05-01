@@ -1,8 +1,6 @@
 services:
   karakos:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    image: ghcr.io/mcarmody/karakos:${KARAKOS_VERSION:-latest}
     env_file: .env
     volumes:
       # Bind-mount config + agents from the host so setup.sh's output (the

@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/mcarmody/karakos-package/main/insta
 irm https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.ps1 | iex
 ```
 
-The installer handles prerequisites (Docker, Git, jq), clones the repo, runs the setup wizard, and starts the system. Open http://localhost:3000 when it's done.
+The installer handles prerequisites (Docker, Git, jq), clones the repo, runs the setup wizard, pulls the prebuilt image from GHCR, and starts the system. Open http://localhost:3000 when it's done.
 
 ## What is Karakos?
 
