@@ -501,6 +501,23 @@ EOF
     echo
     read -p "$(echo -e ${GREEN}Ready to launch ${SYSTEM_NAME}? Press Enter to start...${NC})" < /dev/tty
     echo
+    log "Pulling karakos image from GHCR (this can take a few minutes on first install)..."
+    if ! docker compose -f "$DOCKER_COMPOSE" --env-file "$ENV_FILE" pull; then
+        echo
+        error "Failed to pull the karakos image from GHCR."
+        error ""
+        error "Common causes:"
+        error "  1. The package is not yet published (a new release.yml run has not"
+        error "     completed) — check https://github.com/mcarmody/karakos-package/pkgs/container/karakos"
+        error "  2. The GHCR package is set to private. Public visibility must be"
+        error "     enabled at github.com/mcarmody/karakos-package/pkgs/container/karakos"
+        error "     → Package settings → Change package visibility → Public"
+        error "  3. Network or DNS issue reaching ghcr.io."
+        error ""
+        error "Once the image is pullable, run this to finish setup:"
+        error "  docker compose -f $DOCKER_COMPOSE --env-file $ENV_FILE up -d"
+        exit 1
+    fi
     log "Starting services..."
     docker compose -f "$DOCKER_COMPOSE" --env-file "$ENV_FILE" up -d
 

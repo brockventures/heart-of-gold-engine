@@ -55,6 +55,14 @@ KARAKOS_VERSION=v1.3
 
 Then `docker compose up -d` will use that version instead of `latest`.
 
+> **First-time package publish (maintainers only):** GHCR packages default to
+> private when first created by a `docker push`. After the first `release.yml`
+> run, the package owner must visit
+> [github.com/mcarmody/karakos-package/pkgs/container/karakos](https://github.com/mcarmody/karakos-package/pkgs/container/karakos)
+> → **Package settings** → **Change package visibility** → **Public**, so
+> end-users can pull without authentication. This is a one-time step per
+> package.
+
 ## Verify
 
 1. **Dashboard**: Open `http://localhost:3000` — login with `admin` and the password shown during setup
