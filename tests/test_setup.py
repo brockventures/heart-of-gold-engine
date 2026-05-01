@@ -116,6 +116,7 @@ class TestShellSyntax:
         "bin/poke.sh",
         "bin/heartbeat.sh",
         "bin/create-agent.sh",
+        "bin/preflight.sh",
     ])
     def test_shell_syntax_valid(self, script):
         """bash -n checks syntax without executing."""

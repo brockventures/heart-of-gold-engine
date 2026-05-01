@@ -38,10 +38,22 @@ The wizard saves progress, so you can quit and resume with `./setup.sh`.
 
 ## Start
 
+Run the preflight check first to catch Docker/WSL issues before they surface
+deep inside the install:
+
 ```bash
-docker compose pull
-docker compose up -d
+./bin/preflight.sh && docker compose pull && docker compose up -d
 ```
+
+Or use the convenience target:
+
+```bash
+make install
+```
+
+`make install` runs preflight, pulls the prebuilt image, and starts the
+containers. If preflight fails it halts with a clear error — fix the issue
+flagged and re-run.
 
 `docker compose pull` downloads the prebuilt multi-arch image from GHCR (~1.2 GB).
 No local build step — startup is fast once the image is on disk.

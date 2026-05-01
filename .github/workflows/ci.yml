@@ -83,6 +83,26 @@ jobs:
       - name: Verify Node.js installed
         run: docker run --rm --entrypoint node karakos-test:smoke --version
 
+  # Preflight script — tests bin/preflight.sh check logic via Python test suite
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Verify preflight.sh syntax
+        run: bash -n bin/preflight.sh
+
+      - name: Run preflight test suite
+        run: pytest tests/test_preflight.py -v -m "not slow" --tb=short
+
   # Docker Compose validation
   compose-check:
     runs-on: ubuntu-latest
