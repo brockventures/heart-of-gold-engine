@@ -10,11 +10,13 @@ Adapters:
 
 import asyncio
 import discord
+import fcntl
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import textwrap
 import time
 from datetime import datetime
@@ -115,6 +117,43 @@ log.addHandler(handler)
 console = logging.StreamHandler()
 console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 log.addHandler(console)
+
+# Singleton-instance guard (2026-08-07) — added after the 08:02-08:05
+# duplicate-process incident: a rogue duplicate supervisord launched a
+# second copy of this process alongside the real one. relay.py doesn't
+# bind a listening port, so nothing about a normal double-launch failed
+# loudly the way agent-server's port conflict did — the second copy just
+# ran, undetected, with its own Discord connection and its own 30s
+# retry-spool loop, racing the real one on every message. See
+# agents/Marvin/memory/facts/agent-server-duplicate-process-incident.md
+# for what that actually caused (alternating 401/500s, duplicate
+# spool entries). Kept as a module-level reference so the flock isn't
+# released by garbage collection; the OS releases it automatically the
+# instant this process exits for ANY reason, including a hard kill —
+# deliberately not a PID file, which would need its own stale-cleanup
+# logic that could itself get skipped the same way the duplicate
+# supervisord's children were.
+_SINGLETON_LOCK_FD = None
+
+def _acquire_singleton_lock(name: str) -> None:
+    global _SINGLETON_LOCK_FD
+    lock_path = WORKSPACE_ROOT / "data" / f"{name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.critical(
+            f"Another {name} instance already holds {lock_path} — refusing "
+            "to start as a duplicate. If this is unexpected (e.g. a stale "
+            "lock after a hard crash), the OS should already have released "
+            "it on process exit — check for a genuinely live process before "
+            "assuming the lock file itself needs manual cleanup."
+        )
+        sys.exit(1)
+    fd.write(str(os.getpid()))
+    fd.flush()
+    _SINGLETON_LOCK_FD = fd
 
 # Global state
 agent_config: Dict = {}
@@ -904,6 +943,7 @@ class DispatchAdapter:
 
 async def main():
     """Main relay service"""
+    _acquire_singleton_lock("relay")
     log.info("Karakos relay starting")
 
     # Load config

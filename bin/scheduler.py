@@ -6,10 +6,12 @@ Runs scheduled tasks with full environment variable access.
 Health heartbeat confirms liveness.
 """
 
+import fcntl
 import schedule
 import subprocess
 import os
 import json
+import sys
 import time
 import logging
 from pathlib import Path
@@ -34,6 +36,36 @@ log.addHandler(handler)
 console = logging.StreamHandler()
 console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 log.addHandler(console)
+
+# Singleton-instance guard (2026-08-07) — see the matching guard in
+# relay.py for the full incident writeup (agent-server-duplicate-process-
+# incident.md). scheduler.py was one of the two process types that
+# silently duplicated during that incident — it doesn't bind a listening
+# port either, so a rogue duplicate supervisord's copy just ran
+# undetected alongside the real one. flock rather than a PID file: the OS
+# releases it automatically on any process exit, including a hard kill,
+# so there's no stale-lock cleanup step to itself get skipped.
+_SINGLETON_LOCK_FD = None
+
+def _acquire_singleton_lock(name: str) -> None:
+    global _SINGLETON_LOCK_FD
+    lock_path = WORKSPACE_ROOT / "data" / f"{name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.critical(
+            f"Another {name} instance already holds {lock_path} — refusing "
+            "to start as a duplicate. If this is unexpected (e.g. a stale "
+            "lock after a hard crash), the OS should already have released "
+            "it on process exit — check for a genuinely live process before "
+            "assuming the lock file itself needs manual cleanup."
+        )
+        sys.exit(1)
+    fd.write(str(os.getpid()))
+    fd.flush()
+    _SINGLETON_LOCK_FD = fd
 
 def write_health_timestamp():
     """Write health heartbeat timestamp"""
@@ -128,6 +160,7 @@ def purge_old_data():
 
 def main():
     """Main scheduler loop"""
+    _acquire_singleton_lock("scheduler")
     log.info("Scheduler starting")
 
     # Load agents config to get agent names

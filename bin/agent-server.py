@@ -9,6 +9,7 @@ Port: 18791 (configurable via AGENT_SERVER_PORT env var)
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -133,6 +134,32 @@ TOPIC_CHECK_GAP_SEC = 30 * 60
 # restart for no real benefit.
 TOPIC_CHECK_MIN_TOKENS = 20_000
 
+# Rate-limit circuit breaker (2026-08-07) — added after a real incident:
+# both agents sat at 99% utilization / overageInUse=true from ~08:19 to
+# 12:39, and the only "fix" was Ian manually telling Marvin to go quiet
+# until the five-hour window reset, because nothing here actually gated
+# on the rate_limit_event data already being recorded. Deliberately
+# keyed off Anthropic's own "allowed_warning" status (their
+# surpassedThreshold, typically 90%) rather than us picking our own
+# utilization cutoff — see is_rate_limit_paused(). Since the cost-model
+# migration removed the $/day cap, there's no other backstop against
+# burning overage dollars.
+RATE_LIMIT_PAUSE_STATUS = "allowed_warning"
+# Heartbeats (poke.sh --source heartbeat, see heartbeat.sh) are exempted
+# from the pause below (2026-08-07, per Ian/Moon Problem): the pause trips
+# at Anthropic's own warning threshold, well short of 100%, so there's
+# always enough headroom left in the window to cover a heartbeat's small
+# cost — even with overages disabled. Must match heartbeat.sh's --source
+# value exactly; that value becomes message_queue.author via handle_message.
+RATE_LIMIT_HEARTBEAT_AUTHOR = "heartbeat"
+# How often rate_limit_gate_sweep_loop retries a paused agent's queue.
+# process_agent_queue() is otherwise only triggered reactively (a new
+# message arrives, or another channel is left queued after a drain) —
+# nothing re-triggers it just because a five-hour window happened to
+# reset, so a paused agent needs its own clock, same reasoning as
+# QUEUED_ACK_SWEEP_INTERVAL_SEC above.
+RATE_LIMIT_GATE_SWEEP_INTERVAL_SEC = 60
+
 # Processing states
 STATUS_QUEUED = 0
 STATUS_IN_PROGRESS = 1
@@ -164,6 +191,37 @@ log.addHandler(console)
 # Regex patterns
 THINKING_BLOCK_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
 
+# Singleton-instance guard (2026-08-07) — see the matching guard in
+# relay.py / scheduler.py for the full incident writeup
+# (agent-server-duplicate-process-incident.md). agent-server.py already
+# failed loudly when duplicated during that incident (port 18791 already
+# bound), so this isn't covering a silent-duplication gap the way the
+# relay/scheduler guards are — it's here so that failure is an explicit,
+# clear log line instead of an aiohttp bind traceback, and as a backstop
+# against any future config change (different port per env, SO_REUSEPORT,
+# etc.) that could make a port conflict stop being a reliable guard.
+_SINGLETON_LOCK_FD = None
+
+def _acquire_singleton_lock(name: str) -> None:
+    global _SINGLETON_LOCK_FD
+    lock_path = WORKSPACE_ROOT / "data" / f"{name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.critical(
+            f"Another {name} instance already holds {lock_path} — refusing "
+            "to start as a duplicate. If this is unexpected (e.g. a stale "
+            "lock after a hard crash), the OS should already have released "
+            "it on process exit — check for a genuinely live process before "
+            "assuming the lock file itself needs manual cleanup."
+        )
+        sys.exit(1)
+    fd.write(str(os.getpid()))
+    fd.flush()
+    _SINGLETON_LOCK_FD = fd
+
 # =============================================================================
 # Global State
 # =============================================================================
@@ -187,6 +245,11 @@ agent_todo_lists: Dict[str, List[Dict]] = {}
 # in-memory for cheap access alongside the persisted copy in the
 # rate_limits DB table (see init_db / _record_rate_limit_event).
 agent_rate_limits: Dict[str, Dict[str, Any]] = {}
+# Tracks whether we've already posted the #signals pause/resume notice
+# for the agent's *current* pause episode, so rate_limit_gate_sweep_loop
+# retrying every 60s doesn't spam a notice on every retry while still
+# paused. See is_rate_limit_paused() / process_agent_queue().
+agent_rate_limit_pause_notified: Dict[str, bool] = {}
 # Context-window fill estimate, same inputs as maybe_compact_session() but
 # purely observational — 2026-08-07, Ian's ask, tracked separately from the
 # (still deliberately disabled) auto-compaction trigger so visibility
@@ -481,6 +544,79 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
         await db.commit()
     except Exception as e:
         log.warning(f"Failed to persist rate_limit_event for {agent}: {e}")
+
+async def _load_rate_limits_from_db() -> None:
+    """Preload the last-known rate-limit status per agent at startup, so
+    a restart mid-warning doesn't silently resume message processing —
+    agent_rate_limits is otherwise empty until the next turn completes
+    and a fresh rate_limit_event arrives, which is exactly the gap a
+    compaction-triggered restart (or a /sys reload) would fall into
+    while still over the threshold. Skips rows whose window has already
+    expired (resets_at in the past) rather than trusting stale data from
+    a prior window — a live rate_limit_event replaces this on the very
+    next turn either way, this is only a bridge for the gap between
+    restart and then."""
+    if db is None:
+        return
+    try:
+        now = time.time()
+        async with db.execute(
+            "SELECT agent, status, resets_at FROM rate_limits"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            resets_at = row["resets_at"]
+            if resets_at and resets_at <= now:
+                continue  # stale — window already over, let a live event set this
+            agent_rate_limits[row["agent"]] = {
+                "status": row["status"],
+                "resetsAt": resets_at,
+            }
+            if row["status"] == RATE_LIMIT_PAUSE_STATUS:
+                log.warning(
+                    f"{row['agent']} restored rate-limit warning state from DB "
+                    "on startup — staying paused until it clears"
+                )
+    except Exception as e:
+        log.warning(f"Failed to preload rate_limits from DB (non-fatal): {e}")
+
+def is_rate_limit_paused(agent: str) -> bool:
+    """True if this agent's most recent known rate-limit status is
+    Anthropic's own 'warning' state for the current five-hour window —
+    see RATE_LIMIT_PAUSE_STATUS above for why this is keyed off their
+    status field rather than a locally-chosen utilization cutoff. Empty/
+    missing info (e.g. right after a startup with nothing yet loaded
+    from the DB and no turn completed) is NOT paused by default —
+    _load_rate_limits_from_db() is what covers the restart-mid-warning
+    case, this function just reads whatever's currently known."""
+    return agent_rate_limits.get(agent, {}).get("status") == RATE_LIMIT_PAUSE_STATUS
+
+async def _notify_rate_limit_pause(agent: str, paused: bool) -> None:
+    """Best-effort #signals notice on entering/leaving a rate-limit
+    pause. Fire-and-forget from process_agent_queue (never awaited
+    while holding agent_locks[agent]) and must never raise — same
+    pattern as the startup notice / critical-context notice."""
+    try:
+        signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+        if not signals_channel:
+            return
+        if paused:
+            resets = agent_rate_limits.get(agent, {}).get("resetsAt")
+            resets_str = (
+                datetime.fromtimestamp(resets).strftime("%H:%M UTC")
+                if isinstance(resets, (int, float)) else "an unknown time"
+            )
+            msg = (
+                f"-# ⏸️ {agent} paused — five-hour rate limit hit its warning "
+                f"threshold, holding new messages to avoid overage spend. "
+                f"Resumes automatically around {resets_str}, or sooner if the "
+                f"status clears early."
+            )
+        else:
+            msg = f"-# ▶️ {agent} resumed — rate limit back to normal, processing queued messages again."
+        await post_to_discord(agent, signals_channel, msg)
+    except Exception as e:
+        log.warning(f"Rate-limit pause/resume notice failed (non-fatal): {e}")
 
 async def compact_session(agent: str, reason: str) -> bool:
     """Shared compaction action — finalize (summarize-session.py writes a
@@ -1458,6 +1594,26 @@ async def queued_ack_sweep_loop():
         except Exception as e:
             log.warning(f"queued_ack_sweep_loop error (non-fatal): {e}")
 
+async def rate_limit_gate_sweep_loop():
+    """Runs for the life of the process. process_agent_queue() is only
+    triggered reactively — a new message arrives, or another channel is
+    left queued after a drain — so a paused agent (see
+    is_rate_limit_paused()) has nothing to re-trigger it once the
+    five-hour window actually resets; a new Discord message isn't
+    guaranteed to show up right at that moment. This is what actually
+    resumes a paused queue instead of leaving it stuck until unrelated
+    traffic happens to arrive. process_agent_queue() is cheap to call
+    when there's nothing to do (acquires the lock, checks IDLE / pause /
+    pending messages, returns immediately), so calling it unconditionally
+    for every agent on each tick is fine."""
+    while True:
+        await asyncio.sleep(RATE_LIMIT_GATE_SWEEP_INTERVAL_SEC)
+        for agent in list(agent_config.keys()):
+            try:
+                asyncio.create_task(process_agent_queue(agent))
+            except Exception as e:
+                log.warning(f"rate_limit_gate_sweep_loop error for {agent} (non-fatal): {e}")
+
 async def check_queued_acks():
     """Find the oldest STATUS_QUEUED message per (agent, channel), and for
     any that's been waiting long enough and isn't on cooldown, post a
@@ -1539,17 +1695,54 @@ async def process_agent_queue(agent: str):
         if agent_states.get(agent) != "IDLE":
             return
 
-        # Get pending messages
-        async with db.execute(
-            """
-            SELECT * FROM message_queue
-            WHERE agent = ? AND processed = ?
-            ORDER BY created_at ASC
-            LIMIT 20
-            """,
-            (agent, STATUS_QUEUED)
-        ) as cursor:
-            all_pending = await cursor.fetchall()
+        # Rate-limit circuit breaker (2026-08-07) — checked before
+        # touching message_queue at all. Paused messages stay
+        # STATUS_QUEUED untouched; rate_limit_gate_sweep_loop is what
+        # retries this once the window clears, since a new Discord
+        # message isn't guaranteed to arrive right when that happens.
+        # See is_rate_limit_paused() / RATE_LIMIT_PAUSE_STATUS above —
+        # built after both agents sat at 99% utilization for over four
+        # hours tonight with only a manual, behavioral freeze holding
+        # the line.
+        if is_rate_limit_paused(agent):
+            if not agent_rate_limit_pause_notified.get(agent):
+                agent_rate_limit_pause_notified[agent] = True
+                log.warning(f"{agent} paused — rate limit in warning zone, holding queued messages")
+                asyncio.create_task(_notify_rate_limit_pause(agent, paused=True))
+
+            # Heartbeats still get through — see RATE_LIMIT_HEARTBEAT_AUTHOR
+            # above. Query is scoped to heartbeat messages only so a paused
+            # agent never batches real conversation in alongside one.
+            async with db.execute(
+                """
+                SELECT * FROM message_queue
+                WHERE agent = ? AND processed = ? AND author = ?
+                ORDER BY created_at ASC
+                LIMIT 20
+                """,
+                (agent, STATUS_QUEUED, RATE_LIMIT_HEARTBEAT_AUTHOR)
+            ) as cursor:
+                all_pending = await cursor.fetchall()
+            if not all_pending:
+                return
+            log.info(f"{agent} paused but letting heartbeat through — window headroom covers it")
+        else:
+            if agent_rate_limit_pause_notified.get(agent):
+                agent_rate_limit_pause_notified[agent] = False
+                log.info(f"{agent} resumed — rate limit back to normal")
+                asyncio.create_task(_notify_rate_limit_pause(agent, paused=False))
+
+            # Get pending messages
+            async with db.execute(
+                """
+                SELECT * FROM message_queue
+                WHERE agent = ? AND processed = ?
+                ORDER BY created_at ASC
+                LIMIT 20
+                """,
+                (agent, STATUS_QUEUED)
+            ) as cursor:
+                all_pending = await cursor.fetchall()
 
         if not all_pending:
             return
@@ -1872,6 +2065,23 @@ async def handle_message(request):
             (agent, channel, channel_id, server, author, author_id, int(is_bot), content, message_id, int(mentions_agent))
         )
         await db.commit()
+    except aiosqlite.IntegrityError as e:
+        # message_id is UNIQUE — a duplicate insert here means this exact
+        # message already made it into the queue (or was already fully
+        # processed) on an earlier attempt, most often relay.py retrying a
+        # deferred poke whose original request actually succeeded but
+        # whose response got lost before relay could see it (e.g. the
+        # server died mid-response — see the 08:02-08:05 duplicate-process
+        # incident, agent-server-duplicate-process-incident.md, where this
+        # happened for real). Retrying can never turn that into a
+        # different outcome, so treat it as success: relay's deferred-poke
+        # flush loop deletes the spool file on any 2xx, same as if the
+        # first attempt's response had actually arrived. Previously
+        # returned 500 here, which relay retried for up to 24h
+        # (DEFERRED_POKE_MAX_AGE_SEC in relay.py) against a failure that
+        # could never resolve by retrying.
+        log.info(f"Duplicate message_id {message_id} — already queued/processed, treating as success: {e}")
+        return web.json_response({"status": "duplicate", "message_id": message_id})
     except Exception as e:
         log.error(f"Error inserting message: {e}")
         return web.json_response({"error": "Database error"}, status=500)
@@ -2159,6 +2369,7 @@ async def startup(app):
     """Initialize server on startup"""
     global http_session
 
+    _acquire_singleton_lock("agent-server")
     log.info("Starting Karakos Agent Server")
 
     # Initialize HTTP session
@@ -2169,6 +2380,12 @@ async def startup(app):
 
     # Load configuration
     await load_config()
+
+    # Restore any in-progress rate-limit pause (see
+    # _load_rate_limits_from_db() docstring) before anything starts
+    # pulling from message_queue, so a restart mid-warning can't
+    # silently resume processing.
+    await _load_rate_limits_from_db()
 
     # Initialize locks and state
     for agent in agent_config:
@@ -2192,6 +2409,11 @@ async def startup(app):
     # turn, see queued_ack_sweep_loop() docstring for why this can't just
     # piggyback on process_agent_queue()'s own pass.
     asyncio.create_task(queued_ack_sweep_loop())
+
+    # Rate-limit gate sweep (2026-08-07) — see rate_limit_gate_sweep_loop()
+    # docstring: what actually resumes a paused agent once its five-hour
+    # window resets.
+    asyncio.create_task(rate_limit_gate_sweep_loop())
 
     log.info(f"Agent server ready on port {PORT}")
 
