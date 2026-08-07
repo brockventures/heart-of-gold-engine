@@ -45,9 +45,9 @@ What is the agent currently working on? 1-2 sentences.
 Where did the agent leave off? What's the next step? 2-3 sentences.
 
 ## Key Context for Next Session
-Critical information that must be preserved (decisions made, files changed, commitments, blockers). Bullet list, max 5 items.
+Critical information that must be preserved (decisions made, files changed, commitments, blockers). Bullet list, max 8 items. If the activity below spans multiple distinct threads of work, not just one, make sure at least one bullet covers each thread rather than letting the most recent one crowd out earlier ones.
 
-Keep it concise — aim for 150-250 words total. Do not include full transcripts or code snippets.
+Keep it concise — aim for 200-350 words total. Do not include full transcripts or code snippets.
 
 Recent agent activity:
 {stream_content}
@@ -80,10 +80,30 @@ def find_transcript_path(session_id: str) -> Optional[Path]:
     matches = list(CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
     return matches[0] if matches else None
 
-def read_recent_stream(agent: str, limit: int = 50) -> str:
+def read_recent_stream(agent: str, limit: int = 200) -> str:
     """Read the last N text/tool_use events out of the agent's live Claude
-    CLI transcript. Real per-turn history — replaces the old
-    logs/agent-streams/ read, which nothing ever populated."""
+    CLI transcript.
+
+    limit raised 50 -> 200 (and per-block truncation 200 -> 400 chars)
+    2026-08-07, same day auto-compaction got re-enabled: with the old
+    default, a long multi-threaded session's summary was recency-biased
+    to whatever happened in the last ~50 events, which for a session that
+    size could mean the summary only reflected the most recent thread of
+    work and silently dropped everything earlier — not compressed, gone,
+    since compact_session() clears the actual session (no --resume) and
+    this summary is the only thing carried into the next one. Caught
+    before it actually happened, not after — no confirmed real data loss
+    yet, but the mechanism clearly had the shape for it. 200 events is
+    still bounded (the summarizer call itself has a 20s timeout to stay
+    inside), just a meaningfully wider recent window than 50.
+
+    Real per-turn history — replaces the old
+    logs/agent-streams/ read, which nothing ever populated.
+
+    (The "20s timeout" note above is now 45s — see call_summarizer() —
+    raised 2026-08-07 after a real "Failed to generate summary: timeout"
+    on a live session; the 200-vs-50 event-count sizing above is
+    unaffected by the timeout change, left as-is.)"""
     session_id = find_session_id(agent)
     if not session_id:
         return ""
@@ -112,7 +132,7 @@ def read_recent_stream(agent: str, limit: int = 50) -> str:
             if btype == "text":
                 text = block.get("text", "")
                 if text:
-                    formatted.append(f"[TEXT] {text[:200]}")
+                    formatted.append(f"[TEXT] {text[:400]}")
             elif btype == "tool_use":
                 formatted.append(f"[TOOL] {block.get('name', 'unknown')}")
         if len(formatted) >= limit:
@@ -146,7 +166,15 @@ def call_summarizer(stream_content: str) -> tuple[bool, str, dict]:
             cmd,
             capture_output=True,
             text=True,
-            timeout=20
+            # 20 -> 45s, 2026-08-07: hit a real "timeout" failure on a live
+            # session (agent-server.log 07:19:50) with the 200-event/400-char
+            # window this call reads (raised same day auto-compaction was
+            # re-enabled) — 20s was already tight and only gets tighter as
+            # sessions grow, since compaction now targets a fixed 200k
+            # instead of a fraction of the window. Paired with
+            # agent-server.py's own wrapping subprocess.run timeout going
+            # 60 -> 75s so it doesn't cut this one off first.
+            timeout=45
         )
 
         duration_ms = (time.time() - start_time) * 1000
@@ -225,7 +253,7 @@ def log_audit(event: str, agent: str, success: bool, metadata: dict):
 def main():
     parser = argparse.ArgumentParser(description="Generate session summary for agent")
     parser.add_argument("agent", help="Agent name")
-    parser.add_argument("--limit", type=int, default=50, help="Number of stream lines to read")
+    parser.add_argument("--limit", type=int, default=200, help="Number of stream lines to read")
 
     args = parser.parse_args()
 
