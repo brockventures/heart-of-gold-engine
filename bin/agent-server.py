@@ -589,7 +589,7 @@ async def classify_topic_change(previous_text: str, new_text: str) -> Optional[b
     log.warning(f"Topic-change classifier gave an unparseable answer: {answer!r}")
     return None
 
-async def maybe_topic_change_compact(agent: str, channel_id: str, new_text: str, metadata: Dict[str, Any]) -> None:
+async def maybe_topic_change_compact(agent: str, channel_id: str, new_text: str, metadata: Dict[str, Any], already_compacted: bool = False) -> None:
     """Second, independent compaction trigger, added 2026-08-07 per Ian:
     a continuous multi-channel dialogue changes topics often enough that
     a lot of context is 'useless' well before the token-target trigger
@@ -610,14 +610,21 @@ async def maybe_topic_change_compact(agent: str, channel_id: str, new_text: str,
     genuinely ambiguous is the *same* channel resuming after a gap,
     which is the only case this actually spends a classifier call on).
 
-    Only called when the token-target trigger did NOT already compact
-    this turn (see the call site) — no point spending a classifier call
-    to decide whether to do something that already happened."""
+    Bookkeeping (agent_channel_last_turn) updates unconditionally, every
+    turn, regardless of whether the token-target trigger already compacted
+    this turn — otherwise a token-triggered compaction leaves this
+    channel's baseline stale (comparing future topic checks against
+    pre-compaction text with an inflated gap). The gating/classification
+    below is skipped via already_compacted when that trigger did fire —
+    no point spending a classifier call to decide whether to do something
+    that already happened."""
     key = (agent, channel_id)
     now = time.time()
     prior = agent_channel_last_turn.get(key)
     agent_channel_last_turn[key] = {"at": now, "text": new_text}
 
+    if already_compacted:
+        return  # bookkeeping is refreshed above; nothing left to decide this turn
     if not prior:
         return  # first turn seen in this channel — nothing to compare against yet
     gap_sec = now - prior["at"]
@@ -1749,8 +1756,7 @@ async def process_agent_queue(agent: str):
     # against.
     if metadata:
         compacted = await maybe_compact_session(agent, metadata)
-        if not compacted:
-            await maybe_topic_change_compact(agent, channel_id, formatted_content, metadata)
+        await maybe_topic_change_compact(agent, channel_id, formatted_content, metadata, already_compacted=compacted)
 
 # =============================================================================
 # Crash Recovery
