@@ -47,9 +47,9 @@ OWNER_DISCORD_ID = os.environ.get("OWNER_DISCORD_ID", "0")
 # messages 429-rejected and lost). Ian's decision: adopt Amos's model
 # instead — no dollar cap, protection comes from QUEUE_DEPTH_LIMIT below
 # (already matched his number exactly) plus automatic context compaction
-# (CONTEXT_WINDOW / COMPACTION_THRESHOLD below). These limits are still
-# recorded and still drive the #cost channel post, just no longer used to
-# reject anything.
+# (CONTEXT_WINDOW_TOKENS / COMPACTION_TARGET_TOKENS below). These limits
+# are still recorded and still drive the #cost channel post, just no
+# longer used to reject anything.
 COST_DAILY_LIMIT = float(os.environ.get("COST_DAILY_LIMIT", "25.00"))
 COST_MONTHLY_LIMIT = float(os.environ.get("COST_MONTHLY_LIMIT", "500.00"))
 COST_WARNING_THRESHOLD = float(os.environ.get("COST_WARNING_THRESHOLD", "0.75"))
@@ -76,14 +76,62 @@ QUEUED_ACK_COOLDOWN_SEC = 600
 QUEUED_ACK_SWEEP_INTERVAL_SEC = 15
 
 # Automatic context compaction — replaces the dollar cap as the real
-# protection against runaway sessions. 200k is Sonnet's context window;
-# 85% matches Amos's own stated threshold exactly rather than inventing a
-# different number. Triggered per-agent after a turn completes (never
-# mid-turn), via finalize (summarize-session.py) then a full session
-# reset so the next turn starts fresh with the summary injected by
-# load_last_session().
-CONTEXT_WINDOW_TOKENS = 200_000
-COMPACTION_THRESHOLD = 0.85
+# protection against runaway sessions. Triggered per-agent after a turn
+# completes (never mid-turn), via finalize (summarize-session.py) then a
+# full session reset so the next turn starts fresh with the summary
+# injected by load_last_session().
+#
+# CONTEXT_WINDOW_TOKENS corrected 2026-08-07: was hardcoded to 200_000
+# ("200k is Sonnet's context window") — stale. Live current-model Sonnet
+# (both 4.6 and 5) is a 1M-token window; 200k was true for older Sonnet
+# generations this comment was presumably written against. Caught live
+# when a real session legitimately reached 452,145 estimated tokens and
+# reported as "226% of window" — not a measurement bug this time (that
+# one was fixed 2026-08-06), just the wrong denominator.
+CONTEXT_WINDOW_TOKENS = 1_000_000
+
+# COMPACTION_TARGET_TOKENS re-based 2026-08-07 (same day as the window
+# fix above, second pass, per Ian): compact at a flat 200k rather than a
+# fraction of the 1M window. Not a capability limit — it's "keep it
+# where it already felt comfortable" carried over from his Sonnet 4.6
+# usage, back when 200k *was* the real ceiling. Explicitly a soft
+# target: a failed attempt (see maybe_compact_session) isn't an
+# emergency, it just retries on the next turn same as before. Was 0.5 *
+# CONTEXT_WINDOW_TOKENS (500k) for about half a day — that number is now
+# CONTEXT_CONCERN_TOKENS below, i.e. "the soft target fired and failed
+# enough times to be worth a second look," not the trigger itself.
+COMPACTION_TARGET_TOKENS = 200_000
+
+# Tiered context warnings, added 2026-08-07 per Ian, re-tiered same day
+# once COMPACTION_TARGET_TOKENS moved down to 200k:
+#   - SOFT (= COMPACTION_TARGET_TOKENS, 200k): the compaction trigger
+#     itself now lives here — see maybe_compact_session. Tier label kept
+#     for the heartbeat/status surface; it's no longer "visibility only."
+#   - CONCERN (500k): the soft target fired at least one turn ago and
+#     hasn't cleared — usually a repeated finalize failure (timeout /
+#     no data). Informational: logged, surfaced in /agents and the
+#     heartbeat, not paged.
+#   - CRITICAL (800k): should never actually happen — the soft target at
+#     200k, backstopped by the concern tier at 500k, should have reset
+#     the session well before this. Reaching it means compaction has
+#     been silently failing for a while, so this posts directly to
+#     #signals rather than waiting for the next heartbeat.
+CONTEXT_CONCERN_TOKENS = 500_000
+CONTEXT_CRITICAL_WARNING_TOKENS = 800_000
+
+# Topic-change compaction — second, independent trigger added 2026-08-07
+# per Ian, alongside the token-target one above. Rationale: a continuous
+# multi-channel dialogue changes topics often enough that a lot of
+# context is "useless" well before 200k tokens, but checking every turn
+# would be wasteful (a classifier call for zero signal on back-to-back
+# messages seconds apart) and wrong (two messages seconds apart are
+# essentially never a real topic change). Gated on a real gap instead —
+# see maybe_topic_change_compact().
+TOPIC_CHECK_GAP_SEC = 30 * 60
+# Skip the check on small sessions — nothing "useless" has accumulated
+# yet, and compacting a small session just burns a finalize call and a
+# restart for no real benefit.
+TOPIC_CHECK_MIN_TOKENS = 20_000
 
 # Processing states
 STATUS_QUEUED = 0
@@ -139,6 +187,22 @@ agent_todo_lists: Dict[str, List[Dict]] = {}
 # in-memory for cheap access alongside the persisted copy in the
 # rate_limits DB table (see init_db / _record_rate_limit_event).
 agent_rate_limits: Dict[str, Dict[str, Any]] = {}
+# Context-window fill estimate, same inputs as maybe_compact_session() but
+# purely observational — 2026-08-07, Ian's ask, tracked separately from the
+# (still deliberately disabled) auto-compaction trigger so visibility
+# doesn't require flipping that behavior on. In-memory only, one entry per
+# agent, always overwritten — "how full is the session right now."
+agent_context_usage: Dict[str, Dict[str, Any]] = {}
+# Per-(agent, channel_id) last-turn bookkeeping for the topic-change
+# compaction trigger (maybe_topic_change_compact, 2026-08-07) — "at" is
+# epoch seconds, "text" is that turn's formatted message content, used
+# as the "before" side of the classifier comparison the next time this
+# same channel comes back after a gap. Deliberately scoped per channel,
+# not per agent — see maybe_topic_change_compact()'s docstring. In-memory
+# only; a restart just means the next turn in each channel establishes a
+# fresh baseline instead of comparing against pre-restart content, which
+# is fine (a restart already means compaction happened).
+agent_channel_last_turn: Dict[tuple, Dict[str, Any]] = {}
 active_todo_messages: Dict[str, Dict] = {}
 # Per-channel cooldown tracking for the queued-ack sweep (Task #13). Not
 # persisted — a restart clearing this is fine, worst case one channel
@@ -418,36 +482,38 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
     except Exception as e:
         log.warning(f"Failed to persist rate_limit_event for {agent}: {e}")
 
-async def maybe_compact_session(agent: str, metadata: Dict[str, Any]) -> None:
-    """Automatic context compaction — Amos's model (Mike's Karakos
-    instance), adopted 2026-08-06 in place of the dollar-based daily cap
-    that used to hard-reject messages. Runs after a turn fully completes
-    and its response has already been posted, never mid-turn. Two steps,
-    both using infrastructure that already existed but was never wired to
-    an automatic trigger: finalize (summarize-session.py writes a summary
-    file) then a full session reset (restart_agent — new session_id, no
-    --resume) so the next turn starts fresh and load_last_session() picks
-    the summary back up as injected context."""
-    estimate = estimate_context_tokens(metadata)
-    if estimate < CONTEXT_WINDOW_TOKENS * COMPACTION_THRESHOLD:
-        return
-
-    log.warning(
-        f"{agent} context estimate {estimate:,} tokens crossed "
-        f"{COMPACTION_THRESHOLD:.0%} of {CONTEXT_WINDOW_TOKENS:,} — "
-        f"compacting"
-    )
+async def compact_session(agent: str, reason: str) -> bool:
+    """Shared compaction action — finalize (summarize-session.py writes a
+    summary file) then a full session reset (restart_agent — new
+    session_id, no --resume) so the next turn starts fresh and
+    load_last_session() picks the summary back up as injected context.
+    Split out 2026-08-07 so both compaction triggers (the token-target
+    check in maybe_compact_session() and the gap-and-channel topic-change
+    check in maybe_topic_change_compact()) share one implementation
+    instead of two copies drifting apart. `reason` is just for the log
+    line. Returns True on success so callers can tell whether compaction
+    actually happened (and so a later trigger in the same turn knows not
+    to re-fire)."""
     try:
+        # timeout raised 60 -> 75s, 2026-08-07, paired with the summarizer's
+        # own inner timeout going 20 -> 45s (see summarize-session.py) —
+        # real failure observed same day at the 20s mark
+        # ("Failed to generate summary: timeout") on a session sized right
+        # at the (then-500k) trigger; 20s was already tight for
+        # summarizing real sessions and only gets tighter as sessions
+        # grow, so the fix is headroom on both timeouts, not just a
+        # retry. This outer one just needs to clear the inner one plus
+        # process-spawn overhead.
         result = subprocess.run(
             ["python3", str(Path(__file__).parent / "summarize-session.py"), agent],
-            capture_output=True, text=True, timeout=60, cwd=str(WORKSPACE_ROOT)
+            capture_output=True, text=True, timeout=75, cwd=str(WORKSPACE_ROOT)
         )
         if result.returncode != 0:
-            log.error(f"{agent} finalize failed, skipping compaction this turn: {result.stderr}")
-            return
+            log.error(f"{agent} finalize failed, skipping compaction this turn ({reason}): {result.stderr}")
+            return False
     except Exception as e:
-        log.error(f"{agent} finalize raised, skipping compaction this turn: {e}")
-        return
+        log.error(f"{agent} finalize raised, skipping compaction this turn ({reason}): {e}")
+        return False
 
     await db.execute(
         "UPDATE sessions SET compaction_count = compaction_count + 1 WHERE agent = ?",
@@ -455,7 +521,120 @@ async def maybe_compact_session(agent: str, metadata: Dict[str, Any]) -> None:
     )
     await db.commit()
     await restart_agent(agent)
-    log.info(f"{agent} compacted and restarted with a fresh session")
+    log.info(f"{agent} compacted and restarted with a fresh session ({reason})")
+    return True
+
+async def maybe_compact_session(agent: str, metadata: Dict[str, Any]) -> bool:
+    """Automatic context compaction — Amos's model (Mike's Karakos
+    instance), adopted 2026-08-06 in place of the dollar-based daily cap
+    that used to hard-reject messages. Runs after a turn fully completes
+    and its response has already been posted, never mid-turn. Token-target
+    trigger — see maybe_topic_change_compact() below for the second,
+    gap-and-channel-based trigger added 2026-08-07."""
+    estimate = estimate_context_tokens(metadata)
+    if estimate < COMPACTION_TARGET_TOKENS:
+        return False
+
+    log.warning(
+        f"{agent} context estimate {estimate:,} tokens crossed the "
+        f"{COMPACTION_TARGET_TOKENS:,}-token soft target — compacting"
+    )
+    return await compact_session(agent, reason="token target")
+
+async def classify_topic_change(previous_text: str, new_text: str) -> Optional[bool]:
+    """Cheap same-topic/different-topic classifier for
+    maybe_topic_change_compact() below. Haiku, single turn, small prompt
+    — deliberately not the full summarizer; this only ever needs a
+    yes/no. Returns True if the topic changed, False if it's a
+    continuation, None if the call itself failed or gave an unparseable
+    answer (caller treats None like False — skip rather than guess)."""
+    prompt = (
+        "Two Discord messages from the same ongoing agent conversation, "
+        "separated by a gap of at least 30 minutes. Based on their "
+        "content, is the SECOND message continuing the same topic or "
+        "task as the FIRST, or does it start something new or unrelated?"
+        "\n\nFIRST (before the gap):\n" + previous_text[:1500] +
+        "\n\nSECOND (after the gap):\n" + new_text[:1500] +
+        "\n\nAnswer with exactly one word: SAME or CHANGED."
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", prompt,
+            "--model", "haiku",
+            "--max-turns", "1",
+            "--output-format", "stream-json",
+            "--verbose",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except Exception as e:
+        log.warning(f"Topic-change classifier call failed: {e}")
+        return None
+
+    answer = ""
+    for line in stdout.decode(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result":
+            answer = (event.get("result", "") or "").strip().upper()
+            break
+
+    if "CHANGED" in answer:
+        return True
+    if "SAME" in answer:
+        return False
+    log.warning(f"Topic-change classifier gave an unparseable answer: {answer!r}")
+    return None
+
+async def maybe_topic_change_compact(agent: str, channel_id: str, new_text: str, metadata: Dict[str, Any]) -> None:
+    """Second, independent compaction trigger, added 2026-08-07 per Ian:
+    a continuous multi-channel dialogue changes topics often enough that
+    a lot of context is 'useless' well before the token-target trigger
+    fires, but checking on every turn would be both wasteful (a
+    classifier call for zero signal on back-to-back messages seconds
+    apart) and wrong (two messages seconds apart are essentially never a
+    real topic change) — so this is gated on a real gap
+    (TOPIC_CHECK_GAP_SEC, ~30min) instead of firing per turn.
+
+    Scoped per (agent, channel_id), not per agent, on purpose — this
+    agent runs one shared Claude session across every Discord channel it
+    watches, so 'gap' and 'topic' both need to mean something
+    channel-local: a busy #general shouldn't suppress the check for
+    #signals coming back after real silence, and the classifier should
+    never be asked to compare content from two different channels
+    against each other (a channel switch is already a different
+    conversation by construction — no call needed to know that; what's
+    genuinely ambiguous is the *same* channel resuming after a gap,
+    which is the only case this actually spends a classifier call on).
+
+    Only called when the token-target trigger did NOT already compact
+    this turn (see the call site) — no point spending a classifier call
+    to decide whether to do something that already happened."""
+    key = (agent, channel_id)
+    now = time.time()
+    prior = agent_channel_last_turn.get(key)
+    agent_channel_last_turn[key] = {"at": now, "text": new_text}
+
+    if not prior:
+        return  # first turn seen in this channel — nothing to compare against yet
+    gap_sec = now - prior["at"]
+    if gap_sec < TOPIC_CHECK_GAP_SEC:
+        return  # too recent — this is the "not every turn" gate
+    if estimate_context_tokens(metadata) < TOPIC_CHECK_MIN_TOKENS:
+        return  # session too small for compaction to be worth it yet
+
+    changed = await classify_topic_change(prior["text"], new_text)
+    if changed is not True:
+        return  # False (same topic) or None (classifier failed/unparseable) — leave it
+
+    log.warning(
+        f"{agent}/{channel_id} topic change detected after a "
+        f"{gap_sec / 60:.0f}-minute gap in this channel — compacting"
+    )
+    await compact_session(agent, reason="topic change")
 
 # =============================================================================
 # Session Persistence (Summary and Restore)
@@ -637,7 +816,21 @@ async def start_agent_subprocess(agent: str):
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            # Found live 2026-08-07: asyncio's default StreamReader limit is
+            # 64KiB per line, and stream-json emits one JSON object per
+            # line — a single large tool result or Skill-file dump easily
+            # exceeds that, and read_agent_response()'s proc.stdout.readline()
+            # (line ~1058) then raises LimitOverrunError ("Separator is not
+            # found, and chunk exceed the limit"), silently caught by the
+            # broad `except Exception` around the whole read loop. Net
+            # effect: that turn's response reading aborts wherever it was,
+            # the turn still gets marked processed, and whatever hadn't
+            # posted yet (interim streaming aside) is lost. Hit repeatedly
+            # this session, including right after a large Skill invocation.
+            # 16 MiB is generous headroom — cost is just a larger allowed
+            # buffer, not a preallocation.
+            limit=16 * 1024 * 1024,
         )
         agent_processes[agent] = proc
         agent_states[agent] = "IDLE"
@@ -1487,22 +1680,77 @@ async def process_agent_queue(agent: str):
     if remaining:
         asyncio.create_task(process_agent_queue(agent))
 
+    # Context-fill visibility (2026-08-07, Ian's ask) — same
+    # estimate_context_tokens() inputs the compaction trigger below uses,
+    # recorded for /agents and the heartbeat to surface regardless of
+    # whether compaction itself fires this turn.
+    if metadata:
+        _ctx_estimate = estimate_context_tokens(metadata)
+        _ctx_level = "none"
+        if _ctx_estimate >= CONTEXT_CRITICAL_WARNING_TOKENS:
+            _ctx_level = "critical"
+        elif _ctx_estimate >= CONTEXT_CONCERN_TOKENS:
+            _ctx_level = "concern"
+        elif _ctx_estimate >= COMPACTION_TARGET_TOKENS:
+            _ctx_level = "soft"
+        agent_context_usage[agent] = {
+            "estimated_tokens": _ctx_estimate,
+            "context_window": CONTEXT_WINDOW_TOKENS,
+            "pct": round(100 * _ctx_estimate / CONTEXT_WINDOW_TOKENS, 1),
+            "warning_level": _ctx_level,
+        }
+        if _ctx_level == "soft":
+            log.info(f"{agent} context at {_ctx_estimate:,} tokens — soft target crossed (>{COMPACTION_TARGET_TOKENS:,}), compaction below should clear it this turn")
+        elif _ctx_level == "concern":
+            log.warning(f"{agent} context at {_ctx_estimate:,} tokens — past the {CONTEXT_CONCERN_TOKENS:,}-token concern mark, soft-target compaction has been failing to clear it")
+        elif _ctx_level == "critical":
+            # Should be unreachable — compaction fires at COMPACTION_TARGET_TOKENS
+            # (200k), backstopped by the concern log at 500k, well before this.
+            # Getting here means compaction itself silently failed this
+            # session for a while; page directly rather than wait for the
+            # next heartbeat.
+            log.error(f"{agent} context at {_ctx_estimate:,} tokens — CRITICAL, compaction should already have fired and didn't")
+            try:
+                signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+                if signals_channel:
+                    await post_to_discord(
+                        agent, signals_channel,
+                        f"-# 🚨 {agent} context at {_ctx_estimate:,} tokens ({100*_ctx_estimate/CONTEXT_WINDOW_TOKENS:.0f}% of window) — "
+                        f"past the {CONTEXT_CRITICAL_WARNING_TOKENS:,}-token critical mark. Compaction should have "
+                        f"triggered at {COMPACTION_TARGET_TOKENS:,} and didn't — needs a look."
+                    )
+            except Exception as e:
+                log.warning(f"Critical context alert failed to post (non-fatal): {e}")
+
     # Automatic context compaction (Amos's model, adopted 2026-08-06) —
-    # DISABLED same day, hours after deploy. estimate_context_tokens() is
-    # producing values in the millions (9,682,204 on one real turn) against
-    # a 200k window — physically impossible as "current context", which
-    # means the usage.* fields summed there are very likely cumulative
-    # session totals, not a per-turn snapshot, so the whole measurement is
-    # built on a wrong assumption. It was also firing on every single turn
-    # as a result, and failing every time besides (summarize-session.py's
-    # "No recent stream data" — a second, independent bug: logs/agent-streams/
-    # has never had anything written to it, apparently since this instance's
-    # inception, so finalize can't currently succeed regardless of when it's
-    # triggered). Asked Amos how he actually measures "current context %"
-    # rather than guess again. Re-enable only after both are fixed and
-    # verified — see cost-model-migration.md.
-    # if metadata:
-    #     await maybe_compact_session(agent, metadata)
+    # RE-ENABLED 2026-08-07 per Ian, after a real session (this one) hit
+    # the trigger's territory live and he asked for a formal safeguard
+    # rather than manual eyeballing. Was disabled same-day as the original
+    # deploy for three real, now-resolved reasons:
+    #   1. estimate_context_tokens() summed usage off the wrong stream-json
+    #      event (aggregated across a turn's internal iterations, not a
+    #      per-turn snapshot) — produced a physically impossible 9.68M
+    #      reading. Fixed 2026-08-06: reads the last individual `assistant`
+    #      event's own usage instead.
+    #   2. summarize-session.py failed every time ("No recent stream data")
+    #      because logs/agent-streams/ was never actually written to. Fixed
+    #      2026-08-06: reads real Claude CLI transcripts instead.
+    #   3. CONTEXT_WINDOW_TOKENS was hardcoded to 200k, stale against
+    #      current Sonnet's real 1M window — fixed just above, same pass
+    #      as this re-enable.
+    # All three verified independently before flipping this back on.
+    #
+    # Second trigger added 2026-08-07: gap-and-channel topic-change check
+    # (maybe_topic_change_compact). Only runs when the token-target
+    # trigger above did NOT already compact this turn — no point spending
+    # a classifier call to decide whether to do something that already
+    # happened, and agent_channel_last_turn still needs updating either
+    # way so the next gap in this channel has a real baseline to compare
+    # against.
+    if metadata:
+        compacted = await maybe_compact_session(agent, metadata)
+        if not compacted:
+            await maybe_topic_change_compact(agent, channel_id, formatted_content, metadata)
 
 # =============================================================================
 # Crash Recovery
@@ -1677,6 +1925,10 @@ async def handle_agents(request):
             # one turn since agent-server last started (see
             # _record_rate_limit_event / read_agent_response).
             "rate_limit": agent_rate_limits.get(agent, {}),
+            # Context-window fill estimate, added 2026-08-07 — same caveat
+            # as rate_limit: empty until this agent's subprocess has
+            # completed at least one turn since agent-server last started.
+            "context_usage": agent_context_usage.get(agent, {}),
         })
 
     return web.json_response({"agents": agents_list})
