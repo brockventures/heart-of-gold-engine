@@ -31,6 +31,35 @@ New mail (${MAIL_COUNT}) in the Marvin folder:
 ${MAIL_SUMMARY}"
 fi
 
+# Context-window fill %, added 2026-08-07 per Ian — "keep a tab on it to see
+# if we're hitting limits too regularly." Reads agent-server's own /agents
+# endpoint (same estimate_context_tokens() the compaction trigger uses).
+# Empty until this agent's subprocess has completed at least one turn since
+# agent-server last started — silently omitted rather than shown as 0%,
+# so a fresh restart doesn't read as "context is empty."
+#
+# warning_level (soft/hard/critical, added same day as the tiered warnings)
+# gets a visible tag when non-"none" — hard/critical should be rare given
+# compaction fires at the hard tier, so seeing either in a heartbeat is
+# worth a human noticing without digging into #signals separately.
+AGENT_SERVER_PORT="${AGENT_SERVER_PORT:-18791}"
+CONTEXT_CHECK=$(curl -s -H "Authorization: Bearer ${AGENT_SERVER_TOKEN:-}" \
+    "http://localhost:${AGENT_SERVER_PORT}/agents" 2>/dev/null || echo '{}')
+CONTEXT_PCT=$(echo "$CONTEXT_CHECK" | jq -r --arg agent "$AGENT" \
+    '.agents[]? | select(.name == $agent) | .context_usage.pct // empty' 2>/dev/null)
+CONTEXT_LEVEL=$(echo "$CONTEXT_CHECK" | jq -r --arg agent "$AGENT" \
+    '.agents[]? | select(.name == $agent) | .context_usage.warning_level // empty' 2>/dev/null)
+if [ -n "$CONTEXT_PCT" ]; then
+    LEVEL_TAG=""
+    case "$CONTEXT_LEVEL" in
+        soft) LEVEL_TAG=" [soft warning]" ;;
+        hard) LEVEL_TAG=" [hard warning]" ;;
+        critical) LEVEL_TAG=" [CRITICAL]" ;;
+    esac
+    MESSAGE="${MESSAGE}
+Context: ${CONTEXT_PCT}% of window${LEVEL_TAG}"
+fi
+
 "${WORKSPACE_ROOT}/bin/poke.sh" \
     --agent "$AGENT" \
     --source "heartbeat" \
