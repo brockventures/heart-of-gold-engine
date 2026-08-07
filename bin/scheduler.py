@@ -83,6 +83,23 @@ def run_health_monitor():
     except subprocess.CalledProcessError as e:
         log.error(f"Health monitor failed: {e.stderr}")
 
+def run_friction_sensor():
+    """Scan session transcripts for recurring command/error patterns and
+    write proposals if anything crosses threshold. Design from Amos
+    (Mike's Karakos instance), 2026-08-06 — see bin/friction-sensor.py
+    docstring. Scheduled at 03:46 to match his own stated timing."""
+    log.info("Running friction sensor")
+    try:
+        result = subprocess.run(
+            ["python3", f"{WORKSPACE_ROOT}/bin/friction-sensor.py"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        log.info(f"Friction sensor: {result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        log.error(f"Friction sensor failed: {e.stderr}")
+
 def check_updates():
     """Check for Karakos updates"""
     log.info("Checking for updates")
@@ -136,6 +153,7 @@ def main():
 
     # Schedule maintenance tasks
     schedule.every().day.at("03:00").do(run_memory_maintenance)
+    schedule.every().day.at("03:46").do(run_friction_sensor)
     schedule.every().day.at("04:00").do(run_health_monitor)
     schedule.every().day.at("04:30").do(purge_old_data)
     schedule.every().monday.at("05:00").do(check_updates)  # Weekly update check

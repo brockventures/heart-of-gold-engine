@@ -575,6 +575,15 @@ def main():
         params = request.get("params", {})
 
         if method == "tools/list":
+            # write_health() previously only fired on a successful
+            # tools/call, so a session that never happened to invoke a
+            # tool through this server looked "missing" to health-monitor
+            # even though the server was up and fine — found via a real
+            # alert 2026-08-06. tools/list fires once per session at
+            # startup regardless of what the session goes on to use, so
+            # writing here too catches that case without needing a
+            # separate timer thread in this stdio-loop process.
+            write_health()
             # Return all registered tools
             tools_list = []
             for tool in all_tools:

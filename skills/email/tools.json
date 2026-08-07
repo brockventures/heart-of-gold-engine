@@ -1,0 +1,47 @@
+{
+  "skill_name": "email",
+  "version": "1.1.0",
+  "description": "Send outbound email as marvin@iancoley.org via Mailgun, and read the Marvin label on Ian's Gmail via IMAP",
+  "tools": [
+    {
+      "name": "send_email",
+      "description": "Send an email from marvin@iancoley.org via Mailgun. Requires MAILGUN_API_KEY and MAILGUN_DOMAIN in config/.env.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "Recipient email address"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Email subject line"
+          },
+          "body": {
+            "type": "string",
+            "description": "Plain-text email body"
+          },
+          "from_name": {
+            "type": "string",
+            "description": "Display name for the From header (default: Marvin)"
+          }
+        },
+        "required": ["to", "subject", "body"]
+      }
+    },
+    {
+      "name": "read_marvin_folder",
+      "description": "Read new messages from the 'Marvin' label in Ian's Gmail via IMAP. Returns only messages not seen on a previous call (tracked by UID in a local state file) — doesn't mark anything read/unread in Gmail itself. Requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD in config/.env.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "include_seen": {
+            "type": "boolean",
+            "description": "If true, return every message in the folder regardless of what's already been processed (default: false — only new messages since the last call)"
+          }
+        },
+        "required": []
+      }
+    }
+  ]
+}

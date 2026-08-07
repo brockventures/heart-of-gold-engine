@@ -9,7 +9,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
@@ -28,17 +28,35 @@ log.addHandler(handler)
 
 # Component health thresholds (in seconds)
 THRESHOLDS = {
-    "mcp-tools.json": 600,       # 10 minutes
-    "relay.json": 300,            # 5 minutes
-    "memory.json": 172800,        # 48 hours
-    "scheduler.json": 300,        # 5 minutes
+    "mcp-tools.json": 600,               # 10 minutes
+    "relay.json": 300,                    # 5 minutes
+    "memory-maintenance.json": 172800,    # 48 hours — was "memory.json",
+                                           # a filename that memory-maintenance.py
+                                           # never actually wrote. Fixed 2026-08-06.
+    "scheduler.json": 300,                 # 5 minutes
 }
+
+# mcp-tools.json is written by mcp/tools-server.py, which isn't a
+# supervisord-managed daemon — it's an MCP stdio server spawned fresh per
+# Claude Code session and only writes its health file once it actually
+# receives a tools/list or tools/call RPC. Some MCP clients discover
+# tools lazily, so a session that never happens to invoke a
+# mcp__karakos-admin__* tool may never trigger that RPC at all. Found
+# 2026-08-07: the alert had fired daily with the file simply absent, and
+# mcp-tools-audit.db (created early in that server's own startup, before
+# any RPC handling) didn't exist either — confirms the process has never
+# run this RPC, not that it crashed after running. "Missing" here means
+# "never used yet," not "down" — don't alert on it. A file that exists
+# and goes stale is still a real problem and still alerts normally.
+OPTIONAL_UNTIL_FIRST_USE = {"mcp-tools.json"}
 
 def check_health_file(component: str, threshold: int) -> tuple[bool, str]:
     """Check if health file is fresh"""
     health_file = HEALTH_DIR / component
 
     if not health_file.exists():
+        if component in OPTIONAL_UNTIL_FIRST_USE:
+            return True, ""
         return False, f"{component} health file missing"
 
     try:
@@ -49,8 +67,21 @@ def check_health_file(component: str, threshold: int) -> tuple[bool, str]:
         if not timestamp_str:
             return False, f"{component} has no timestamp"
 
+        # Normalize both sides to aware UTC before subtracting. Writers
+        # aren't consistent about including an offset (relay.py's
+        # write_health_heartbeat() writes naive datetime.now(), which
+        # under this container's TZ=UTC is UTC values without the label;
+        # mcp/tools-server.py's write_health() writes properly
+        # tz-aware datetime.now(timezone.utc)) — subtracting a naive
+        # datetime.now() from an aware one raises "can't subtract
+        # offset-naive and offset-aware datetimes", which is exactly the
+        # error this alerted with 2026-08-07. Handle both without
+        # needing every writer to agree on a convention.
         timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-        age = (datetime.now() - timestamp).total_seconds()
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age = (now - timestamp).total_seconds()
 
         if age > threshold:
             return False, f"{component} stale ({age/60:.1f} min, threshold {threshold/60:.1f} min)"

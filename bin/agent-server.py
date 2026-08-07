@@ -40,7 +40,16 @@ STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = os.environ.get("OWNER_DISCORD_ID", "0")
 
-# Cost limits
+# Cost tracking — informational only as of 2026-08-06. The dollar-based
+# daily cap used to hard-reject inbound messages at COST_DAILY_LIMIT,
+# which silently dropped agent-to-agent messages with no retry (found via
+# a real incident: $53.97 actual spend vs a $25 cap, one of Amos's
+# messages 429-rejected and lost). Ian's decision: adopt Amos's model
+# instead — no dollar cap, protection comes from QUEUE_DEPTH_LIMIT below
+# (already matched his number exactly) plus automatic context compaction
+# (CONTEXT_WINDOW / COMPACTION_THRESHOLD below). These limits are still
+# recorded and still drive the #cost channel post, just no longer used to
+# reject anything.
 COST_DAILY_LIMIT = float(os.environ.get("COST_DAILY_LIMIT", "25.00"))
 COST_MONTHLY_LIMIT = float(os.environ.get("COST_MONTHLY_LIMIT", "500.00"))
 COST_WARNING_THRESHOLD = float(os.environ.get("COST_WARNING_THRESHOLD", "0.75"))
@@ -48,6 +57,33 @@ COST_WARNING_THRESHOLD = float(os.environ.get("COST_WARNING_THRESHOLD", "0.75"))
 # Queue limits
 QUEUE_DEPTH_LIMIT = 50
 TYPING_INTERVAL = 8  # seconds
+
+# Queued-ack sweep (Task #13, 2026-08-06 — deterministic "still here"
+# notice for a channel waiting behind a busy turn on a different
+# channel, since the per-channel typing indicator alone doesn't cover a
+# multi-minute wait). Design worked out with Amos, corrected once by him
+# before landing here:
+#   - 45s wait gate does the anti-spam work by itself — a channel only
+#     qualifies once it has genuinely been ignored that long, so this
+#     doesn't need a conservative cooldown stacked on top of it.
+#   - 10min cooldown, not the 30min originally proposed: at 30min, a
+#     second long turn inside the same half hour goes silent again —
+#     exactly the case the ack exists for (someone waiting through
+#     back-to-back turns). 10min caps it at 6/hour worst case, and every
+#     one of those is a real 45s+ wait, not noise.
+QUEUED_ACK_WAIT_THRESHOLD_SEC = 45
+QUEUED_ACK_COOLDOWN_SEC = 600
+QUEUED_ACK_SWEEP_INTERVAL_SEC = 15
+
+# Automatic context compaction — replaces the dollar cap as the real
+# protection against runaway sessions. 200k is Sonnet's context window;
+# 85% matches Amos's own stated threshold exactly rather than inventing a
+# different number. Triggered per-agent after a turn completes (never
+# mid-turn), via finalize (summarize-session.py) then a full session
+# reset so the next turn starts fresh with the summary injected by
+# load_last_session().
+CONTEXT_WINDOW_TOKENS = 200_000
+COMPACTION_THRESHOLD = 0.85
 
 # Processing states
 STATUS_QUEUED = 0
@@ -96,7 +132,18 @@ agent_last_cost: Dict[str, float] = {}
 agent_sessions: Dict[str, str] = {}
 typing_tasks: Dict[str, asyncio.Task] = {}
 agent_todo_lists: Dict[str, List[Dict]] = {}
+# Anthropic's own live rate-limit signal, straight off the stream-json
+# `rate_limit_event` (2026-08-06 — Ian's ask, per Amos: "if you only ship
+# one, ship this one, it's Anthropic answering the question directly,
+# where everything else we're both doing is inferring it"). Kept
+# in-memory for cheap access alongside the persisted copy in the
+# rate_limits DB table (see init_db / _record_rate_limit_event).
+agent_rate_limits: Dict[str, Dict[str, Any]] = {}
 active_todo_messages: Dict[str, Dict] = {}
+# Per-channel cooldown tracking for the queued-ack sweep (Task #13). Not
+# persisted — a restart clearing this is fine, worst case one channel
+# gets an extra ack sooner than it strictly needed to.
+channel_last_ack: Dict[str, float] = {}
 
 # Discord token mapping
 AGENT_TOKENS: Dict[str, str] = {}
@@ -174,6 +221,25 @@ async def init_db():
         )
     """)
 
+    # Rate-limit state table (2026-08-06) — Anthropic's own live signal
+    # for account usage against the five_hour/weekly windows, straight off
+    # the CLI's stream-json `rate_limit_event`. One row per agent, always
+    # overwritten with the latest known state (history isn't the point
+    # here, "are we close to the edge right now" is). See
+    # _record_rate_limit_event() in read_agent_response().
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            agent TEXT PRIMARY KEY,
+            status TEXT,
+            rate_limit_type TEXT,
+            resets_at INTEGER,
+            overage_status TEXT,
+            overage_resets_at INTEGER,
+            is_using_overage INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     await db.commit()
     log.info("Database initialized")
 
@@ -240,6 +306,15 @@ async def get_or_create_session(agent: str) -> str:
     log.info(f"Created new session for {agent}: {session_id}")
     return session_id
 
+def session_transcript_exists(session_id: str) -> bool:
+    """Check whether the Claude CLI already has a transcript for this
+    session ID. `--session-id` only works for brand-new sessions; once a
+    transcript file exists the CLI refuses with "Session ID ... is already
+    in use", so callers must switch to `--resume` for that ID.
+    """
+    claude_projects_dir = Path.home() / ".claude" / "projects"
+    return any(claude_projects_dir.glob(f"*/{session_id}.jsonl"))
+
 async def clear_session(agent: str):
     """Clear agent session and create new ID"""
     session_id = str(uuid.uuid4())
@@ -266,6 +341,121 @@ async def update_session_tokens(agent: str, input_tokens: int):
         (input_tokens, agent)
     )
     await db.commit()
+
+def estimate_context_tokens(metadata: Dict[str, Any]) -> int:
+    """Estimate the total context an agent is currently carrying. input_tokens
+    alone is only the fresh (non-cached) portion of the last turn —
+    cache_read_input_tokens is what actually reflects how much prior
+    conversation got reused, which is the real signal for "how full is
+    this session." cache_creation_input_tokens covers content newly
+    written into the cache this turn. Summing all three is a
+    same-order-of-magnitude estimate of total context, not an exact
+    figure — good enough to trigger compaction before a session gets
+    dangerously large, not precise enough to bill against.
+
+    FIXED 2026-08-06: this used to receive cache_read_input_tokens summed
+    off the top-level `result` stream-json event, which produced a
+    physically impossible 9,682,204 on one real turn against a 200k
+    window. Root cause (confirmed against Amos's equivalent
+    last_assistant_usage(), same fix independently on his end): the
+    `result` event's usage likely aggregates across every internal
+    tool-call iteration within a turn, not just the last one — a turn
+    with N iterations against an already-large cached context sums to
+    roughly N times the real figure. read_agent_response() now populates
+    metadata's cache_* fields from the LAST individual `assistant` stream
+    event instead (see the comment there), so this function's inputs are
+    correct without any change to the summing logic itself."""
+    return (
+        metadata.get("input_tokens", 0)
+        + metadata.get("cache_read_input_tokens", 0)
+        + metadata.get("cache_creation_input_tokens", 0)
+    )
+
+async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
+    """Persist the CLI's own live rate-limit signal (2026-08-06). One row
+    per agent, always overwritten — this is "where do we stand right
+    now," not a history. Logs a warning when we're not simply "allowed",
+    or when overage is actually being spent, so it shows up in
+    agent-server.log without needing anyone to go looking for it."""
+    agent_rate_limits[agent] = info
+    status = info.get("status")
+    is_using_overage = bool(info.get("isUsingOverage"))
+    if status != "allowed" or is_using_overage:
+        log.warning(
+            f"{agent} rate limit: status={status} type={info.get('rateLimitType')} "
+            f"resetsAt={info.get('resetsAt')} overage={info.get('overageStatus')} "
+            f"isUsingOverage={is_using_overage}"
+        )
+    if db is None:
+        return
+    try:
+        await db.execute(
+            """
+            INSERT INTO rate_limits
+                (agent, status, rate_limit_type, resets_at, overage_status,
+                 overage_resets_at, is_using_overage, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(agent) DO UPDATE SET
+                status=excluded.status,
+                rate_limit_type=excluded.rate_limit_type,
+                resets_at=excluded.resets_at,
+                overage_status=excluded.overage_status,
+                overage_resets_at=excluded.overage_resets_at,
+                is_using_overage=excluded.is_using_overage,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                agent,
+                status,
+                info.get("rateLimitType"),
+                info.get("resetsAt"),
+                info.get("overageStatus"),
+                info.get("overageResetsAt"),
+                1 if is_using_overage else 0,
+            ),
+        )
+        await db.commit()
+    except Exception as e:
+        log.warning(f"Failed to persist rate_limit_event for {agent}: {e}")
+
+async def maybe_compact_session(agent: str, metadata: Dict[str, Any]) -> None:
+    """Automatic context compaction — Amos's model (Mike's Karakos
+    instance), adopted 2026-08-06 in place of the dollar-based daily cap
+    that used to hard-reject messages. Runs after a turn fully completes
+    and its response has already been posted, never mid-turn. Two steps,
+    both using infrastructure that already existed but was never wired to
+    an automatic trigger: finalize (summarize-session.py writes a summary
+    file) then a full session reset (restart_agent — new session_id, no
+    --resume) so the next turn starts fresh and load_last_session() picks
+    the summary back up as injected context."""
+    estimate = estimate_context_tokens(metadata)
+    if estimate < CONTEXT_WINDOW_TOKENS * COMPACTION_THRESHOLD:
+        return
+
+    log.warning(
+        f"{agent} context estimate {estimate:,} tokens crossed "
+        f"{COMPACTION_THRESHOLD:.0%} of {CONTEXT_WINDOW_TOKENS:,} — "
+        f"compacting"
+    )
+    try:
+        result = subprocess.run(
+            ["python3", str(Path(__file__).parent / "summarize-session.py"), agent],
+            capture_output=True, text=True, timeout=60, cwd=str(WORKSPACE_ROOT)
+        )
+        if result.returncode != 0:
+            log.error(f"{agent} finalize failed, skipping compaction this turn: {result.stderr}")
+            return
+    except Exception as e:
+        log.error(f"{agent} finalize raised, skipping compaction this turn: {e}")
+        return
+
+    await db.execute(
+        "UPDATE sessions SET compaction_count = compaction_count + 1 WHERE agent = ?",
+        (agent,)
+    )
+    await db.commit()
+    await restart_agent(agent)
+    log.info(f"{agent} compacted and restarted with a fresh session")
 
 # =============================================================================
 # Session Persistence (Summary and Restore)
@@ -308,6 +498,26 @@ def load_persona_files(agent: str) -> str:
                 persona_parts.append(content)
 
     return "\n\n".join(persona_parts)
+
+
+def load_memory_index(agent: str) -> str:
+    """Load the routing-table-only memory index (MEMORY.md), never the fact
+    bodies it points at. Schema and this constraint ported from Amos (Mike's
+    Karakos instance) 2026-08-05: the index earns its place by staying a
+    list of links and one-line hooks. If it starts holding paragraphs of
+    actual fact content, it has become the exact bloated-context problem
+    the two-layer design (index + individual fact files under
+    agents/{agent}/memory/facts/) exists to avoid. This function loads only
+    agents/{agent}/memory/MEMORY.md; fact files are read on demand, not
+    here."""
+    memory_index = WORKSPACE_ROOT / "agents" / agent / "memory" / "MEMORY.md"
+    if not memory_index.exists():
+        return ""
+    try:
+        return memory_index.read_text().strip()
+    except Exception as e:
+        log.error(f"Failed to read memory index for {agent}: {e}")
+        return ""
 
 
 def load_onboarding_prompt(agent: str) -> str:
@@ -364,6 +574,13 @@ async def start_agent_subprocess(agent: str):
     # Load persona
     persona_content = load_persona_files(agent)
 
+    # Load memory index (routing table only — see load_memory_index)
+    memory_index = load_memory_index(agent)
+    if memory_index:
+        persona_content = (
+            memory_index + ("\n\n" + persona_content if persona_content else "")
+        )
+
     # First-boot gate: if no persona has been written yet, prepend the
     # onboarding prompt so the agent asks the user for guidance instead
     # of arriving fully-formed.
@@ -378,6 +595,12 @@ async def start_agent_subprocess(agent: str):
         log.info(f"Injecting session summary for {agent} (age: {last_session['age_hours']:.1f}h)")
         persona_content = f"[SESSION RESET]\n\n{last_session['summary']}\n\n{persona_content}"
 
+    # --session-id only works for a brand-new session; once the CLI has
+    # written a transcript for this ID (i.e. on every restart after the
+    # first), it must be resumed instead or the CLI exits with
+    # "Session ID ... is already in use".
+    resuming = session_transcript_exists(session_id)
+
     # Build command
     cmd = [
         "claude", "-p",
@@ -387,7 +610,7 @@ async def start_agent_subprocess(agent: str):
         "--max-turns", str(config.get("max_turns", 200)),
         "--verbose",
         "--dangerously-skip-permissions",
-        "--session-id", session_id,
+        "--resume" if resuming else "--session-id", session_id,
         "--system-prompt", system_prompt_text,
     ]
 
@@ -404,7 +627,10 @@ async def start_agent_subprocess(agent: str):
     if allowed:
         cmd.extend(["--allowedTools", ",".join(allowed)])
 
-    log.info(f"Starting {agent} subprocess (model={config.get('model')}, session={session_id[:8]})")
+    log.info(
+        f"Starting {agent} subprocess (model={config.get('model')}, "
+        f"session={session_id[:8]}, {'resuming' if resuming else 'new session'})"
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -510,40 +736,12 @@ async def post_cost_update(agent: str, metadata: Dict):
         message = f"`{agent}` +${cost_delta:.2f} (session: ${session_total:.2f}) • {input_tokens:,}in/{output_tokens:,}out • {duration_s:.1f}s"
         await post_to_discord(agent, cost_channel_id, message)
 
-async def check_cost_limits(author_id: str) -> Dict[str, Any]:
-    """Check if cost limits have been exceeded"""
-    if author_id == OWNER_DISCORD_ID:
-        return {"exceeded": False, "reason": "owner"}
-
-    # Get daily cost
-    async with db.execute(
-        """
-        SELECT SUM(cost_delta) as total
-        FROM cost_events
-        WHERE timestamp > datetime('now', '-1 day')
-        """
-    ) as cursor:
-        row = await cursor.fetchone()
-        daily_total = row["total"] or 0.0
-
-    if daily_total >= COST_DAILY_LIMIT:
-        return {"exceeded": True, "reason": "daily", "total": daily_total, "limit": COST_DAILY_LIMIT}
-
-    # Get monthly cost
-    async with db.execute(
-        """
-        SELECT SUM(cost_delta) as total
-        FROM cost_events
-        WHERE timestamp > datetime('now', '-30 days')
-        """
-    ) as cursor:
-        row = await cursor.fetchone()
-        monthly_total = row["total"] or 0.0
-
-    if monthly_total >= COST_MONTHLY_LIMIT:
-        return {"exceeded": True, "reason": "monthly", "total": monthly_total, "limit": COST_MONTHLY_LIMIT}
-
-    return {"exceeded": False, "daily": daily_total, "monthly": monthly_total}
+# check_cost_limits() removed 2026-08-06 — it had exactly one caller
+# (the handle_message rejection below, also removed the same day) and is
+# fully dead now that rejection is gone. COST_DAILY_LIMIT /
+# COST_MONTHLY_LIMIT constants stay (still read from .env, still shown by
+# `cost-report.sh` / handle_cost_get, which does its own independent SUM
+# query rather than calling this), just nothing enforces them anymore.
 
 # =============================================================================
 # Discord Integration
@@ -552,36 +750,38 @@ async def check_cost_limits(author_id: str) -> Dict[str, Any]:
 MAX_DISCORD_MSG_LEN = 2000
 
 def split_discord_message(text: str, max_length: int = MAX_DISCORD_MSG_LEN) -> List[str]:
-    """Split text into chunks Discord will accept (max 2000 chars each).
-
-    Splits on the largest boundary that fits — paragraph, then line, then a
-    hard cut mid-line. The hard cut is the part that matters: a reply with no
-    blank line and no newline in it has no boundary to split on, and the
-    previous implementation returned it as a single oversize chunk. Discord
-    rejects anything over 2000 with a 400 and the message is lost.
-    """
+    """Split text into Discord-compatible chunks (max 2000 chars per message)"""
     if len(text) <= max_length:
-        return [text] if text else []
+        return [text]
 
-    chunks: List[str] = []
-    remaining = text
+    chunks = []
+    paragraphs = text.split('\n\n')
+    current_chunk = ""
 
-    while len(remaining) > max_length:
-        window = remaining[:max_length]
-        cut = window.rfind("\n\n")
-        if cut <= 0:
-            cut = window.rfind("\n")
-        if cut <= 0:
-            # A solid wall of text. Cut it at the limit rather than handing
-            # Discord something it will refuse.
-            cut = max_length
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip("\n")
+    for paragraph in paragraphs:
+        if len(paragraph) > max_length:
+            # Split oversized paragraphs on newlines
+            lines = paragraph.split('\n')
+            for line in lines:
+                if len(current_chunk) + len(line) + 2 > max_length:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = line
+                else:
+                    current_chunk += ('\n' if current_chunk else '') + line
+        else:
+            if len(current_chunk) + len(paragraph) + 2 > max_length:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = paragraph
+            else:
+                current_chunk += ('\n\n' if current_chunk else '') + paragraph
 
-    if remaining:
-        chunks.append(remaining)
+    if current_chunk:
+        chunks.append(current_chunk.strip())
 
     return chunks if chunks else [text]
+
 async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: Optional[str] = None) -> Optional[str]:
     """Post message to Discord as agent, splitting if over 2000 chars"""
     global http_session
@@ -609,21 +809,18 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
 
     chunks = split_discord_message(content)
     last_msg_id = None
-    failed = 0
 
-    for idx, chunk in enumerate(chunks):
+    for chunk in chunks:
         payload = {"content": chunk}
         # Only reply-reference the first chunk
         if reply_to and last_msg_id is None:
             payload["message_reference"] = {"message_id": reply_to}
 
-        posted = False
         try:
             async with http_session.post(url, headers=headers, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     last_msg_id = data.get("id")
-                    posted = True
                 elif resp.status == 429:
                     retry_after = (await resp.json()).get("retry_after", 1)
                     log.warning(f"Rate limited posting to {channel_id}, retry after {retry_after}s")
@@ -633,35 +830,10 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
                         if retry_resp.status == 200:
                             data = await retry_resp.json()
                             last_msg_id = data.get("id")
-                            posted = True
-                        else:
-                            log.error(
-                                f"Discord API error {retry_resp.status} on chunk "
-                                f"{idx + 1}/{len(chunks)} ({len(chunk)} chars) after "
-                                f"rate-limit retry: {await retry_resp.text()}"
-                            )
                 else:
-                    log.error(
-                        f"Discord API error {resp.status} on chunk "
-                        f"{idx + 1}/{len(chunks)} ({len(chunk)} chars): "
-                        f"{await resp.text()}"
-                    )
+                    log.error(f"Discord API error {resp.status}: {await resp.text()}")
         except Exception as e:
-            log.error(f"Error posting chunk {idx + 1}/{len(chunks)} to Discord: {e}")
-
-        if not posted:
-            failed += 1
-
-    # A chunk that never landed is a piece of the reply the user will never
-    # see. Returning the id of a sibling chunk reports the whole message as
-    # delivered and the loss goes unnoticed — which is how two replies
-    # vanished silently before this was caught.
-    if failed:
-        log.error(
-            f"post_to_discord: {failed} of {len(chunks)} chunk(s) failed for "
-            f"{agent} in {channel_id}; message is incomplete"
-        )
-        return None
+            log.error(f"Error posting to Discord: {e}")
 
     return last_msg_id
 
@@ -727,6 +899,94 @@ async def send_to_agent(agent: str, content: str, message_ids: List[str]):
         log.error(f"Error sending to {agent}: {e}")
         agent_states[agent] = "ERROR_RECOVERY"
 
+def format_tool_summary(tool_name: str, tool_input: Dict[str, Any]) -> Optional[str]:
+    """Build the text after '-# ⚙️ ' for a tool-streaming line. Returns None
+    for tools that should be suppressed entirely (no gear line at all).
+
+    Format ported from Amos (Mike's Karakos instance), shared 2026-08-06:
+    per-tool shapes rather than one generic "Tool — description" line,
+    em-dash separator, fixed gear icon for everything (per-tool icons
+    "never worth the lookup table" in his words).
+
+    Known gaps versus his implementation, deliberately not ported yet:
+      - Ordering: his gear line waits for the sibling text pump before
+        posting, so it never lands ahead of the assistant text it belongs
+        to. Marvin's current loop posts tool lines inline as they're seen,
+        which can interleave oddly if a text block and a tool_use block
+        share one stream event with the text first. Noted, not fixed —
+        would need restructuring read_agent_response's event loop.
+      - Merge mode (collapsing consecutive same-tool calls to "Tool ×N")
+        exists on his side but is off by default. Not ported.
+    """
+    if tool_name in ("TaskList", "TaskGet"):
+        return None
+
+    def trunc(s: str, n: int) -> str:
+        # Collapse ALL whitespace runs (including newlines) to single
+        # spaces, not just strip the edges. A multi-line command (heredoc,
+        # embedded python3 -<<EOF, etc.) left its internal "\n"s intact
+        # here before 2026-08-06 — Discord's "-# " subtext prefix only
+        # applies to the first line, so every line after it broke out of
+        # the quiet formatting into a plain-size dump, and an inline
+        # single-backtick span doesn't render across multiple lines
+        # either, so the backticks themselves showed up broken. Ian
+        # flagged this directly ("work on the syntax for some of these
+        # bash commands") after watching it happen live.
+        s = " ".join((s or "").split())
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    if tool_name == "Read":
+        path = tool_input.get("file_path", "") or tool_input.get("path", "")
+        parts = path.rstrip("/").split("/")
+        short = "/".join(parts[-2:]) if len(parts) >= 2 else path
+        return f"Read — {short}"
+
+    if tool_name == "Write":
+        path = tool_input.get("file_path", "") or tool_input.get("path", "")
+        content = tool_input.get("content", "")
+        return f"Write — {path} ({len(content)} chars)"
+
+    if tool_name == "Edit":
+        path = tool_input.get("file_path", "") or tool_input.get("path", "")
+        return f"Edit — {path}"
+
+    if tool_name == "Bash":
+        desc = tool_input.get("description", "")
+        cmd = tool_input.get("command", "")
+        # Show the actual command syntax whenever there is one — a
+        # description alone ("Check system health") tells Ian what I
+        # claim I'm doing, not what actually ran. trunc() now collapses
+        # newlines, so this backtick span is always safe as one line.
+        cmd_code = f"`{trunc(cmd, 65)}`" if cmd else ""
+        if desc and cmd_code:
+            return f"Bash — {trunc(desc, 40)}: {cmd_code}"
+        if cmd_code:
+            return f"Bash — {cmd_code}"
+        if desc:
+            return f"Bash — {trunc(desc, 80)}"
+        return "Bash"
+
+    if tool_name == "Grep":
+        pattern = trunc(tool_input.get("pattern", ""), 40)
+        path = tool_input.get("path", "")
+        return f"Grep — /{pattern}/ in {path}" if path else f"Grep — /{pattern}/"
+
+    if tool_name == "WebFetch":
+        return f"WebFetch — {trunc(tool_input.get('url', ''), 60)}"
+
+    if tool_name == "WebSearch":
+        return f"WebSearch — {trunc(tool_input.get('query', ''), 60)}"
+
+    if tool_name == "Task":
+        agent_type = tool_input.get("subagent_type", "general-purpose")
+        desc = tool_input.get("description", "")
+        return f"Task — {agent_type}: {trunc(desc, 60)}" if desc else f"Task — {agent_type}"
+
+    # Fallback for anything without a dedicated shape (Glob, NotebookEdit,
+    # MCP tools, etc.) — bare tool name, no crash on the unexpected case.
+    return tool_name
+
+
 async def write_streaming_response(message_ids: List[str], text: str) -> None:
     """Push partial response text into message_queue so SSE polling sees it.
 
@@ -763,6 +1023,29 @@ async def read_agent_response(
     final_text = ""
     metadata = {}
     last_posted_chunk = ""
+    last_assistant_usage: Dict[str, Any] = {}
+
+    # Chunked/interim Discord streaming (added 2026-08-06, per Ian: "make
+    # sure the interstitial thinking phrases get spoken while cogitating
+    # instead of dumping them all at the end"). Each text block is held as
+    # "pending" until we know what follows it in the stream: if another
+    # text block or a tool call comes next, the pending one was
+    # interstitial commentary and posts in italics; if the turn ends with
+    # it still pending, it's the real final answer and posts plain, no
+    # italics. Matches the distinction Mike drew, relayed via Amos
+    # 2026-08-06 — subtext ("-# ") stays reserved for tool lines only.
+    pending_interim_text = None
+    text_streamed_this_turn = False
+    last_discord_msg_id = None
+
+    async def flush_pending_text():
+        nonlocal pending_interim_text, text_streamed_this_turn, last_discord_msg_id
+        if pending_interim_text and stream_to_channel and channel_id != "0":
+            msg_id = await post_to_discord(agent, channel_id, f"*{pending_interim_text}*")
+            if msg_id:
+                last_discord_msg_id = msg_id
+            text_streamed_this_turn = True
+        pending_interim_text = None
 
     try:
         while True:
@@ -783,39 +1066,149 @@ async def read_agent_response(
             if event_type == "assistant":
                 message = event.get("message", {}) or {}
                 got_text = False
+
+                # Real per-turn context size (2026-08-06 fix). The old
+                # code summed cache_read_input_tokens etc. off the
+                # top-level `result` event, which produced a physically
+                # impossible 9.68M-token reading on one real turn —
+                # confirmed with Amos (his last_assistant_usage() does the
+                # same thing we're doing here) that `result`-level usage
+                # likely aggregates across every internal tool-call
+                # iteration in the turn, since each iteration re-reads the
+                # full cached context. This assistant event's own
+                # `message.usage` is the real, individual snapshot.
+                # Unconditionally overwritten on every assistant event, so
+                # by the time the loop ends this holds the LAST one — no
+                # separate timestamp-anchoring needed the way Amos's
+                # recovery-from-file path requires it, because this loop
+                # only ever reads its own subprocess's live stdout in
+                # causal order, never replays historical events.
+                msg_usage = message.get("usage") or {}
+                if msg_usage:
+                    last_assistant_usage = msg_usage
+
+                # Merge mode: consecutive tool_use blocks calling the same
+                # tool collapse into one "Tool ×N" line instead of N
+                # separate gear lines. Matches Amos's (Mike's Karakos
+                # instance) design — his version is a real debounced
+                # collapse across stream events with a 1.0s window; this is
+                # the simpler same-event version (merging only tool_use
+                # blocks that land together in one assistant stream event,
+                # not a timer-based window across separate events), which
+                # covers the common case without needing async timers in
+                # this request-scoped loop. Added 2026-08-06.
+                pending_tool_name = None
+                pending_tool_count = 0
+                pending_tool_summary = None
+
+                async def flush_pending_tool():
+                    nonlocal pending_tool_name, pending_tool_count, pending_tool_summary, last_discord_msg_id
+                    if pending_tool_name and tool_streaming and channel_id != "0":
+                        line = (
+                            pending_tool_summary if pending_tool_count == 1
+                            else f"{pending_tool_name} ×{pending_tool_count}"
+                        )
+                        if line:
+                            msg_id = await post_to_discord(agent, channel_id, f"-# ⚙️ {line}")
+                            if msg_id:
+                                last_discord_msg_id = msg_id
+                    pending_tool_name = None
+                    pending_tool_count = 0
+                    pending_tool_summary = None
+
                 for block in message.get("content", []) or []:
                     btype = block.get("type")
                     if btype == "text":
+                        await flush_pending_tool()
                         text = block.get("text", "")
                         if text:
                             final_text += text
                             response_buffers[agent] = final_text
                             got_text = True
                             if stream_to_channel and channel_id != "0":
-                                # TODO: Implement chunked streaming
-                                pass
+                                # A new text block arrived, so whatever was
+                                # pending before it wasn't the final answer
+                                # after all — flush it as interim, then this
+                                # one becomes the new pending segment.
+                                await flush_pending_text()
+                                pending_interim_text = text
                     elif btype == "tool_use":
+                        # A tool call follows, so any pending text segment
+                        # was interstitial commentary, not the final answer
+                        # — flush it as interim before the tool line posts.
+                        await flush_pending_text()
                         tool_name = block.get("name", "unknown")
                         log.info(f"{agent} called tool: {tool_name}")
-                        if tool_streaming and channel_id != "0":
-                            await post_to_discord(agent, channel_id, f"🔧 {tool_name}")
+                        # "-# ⚙️ ..." — Discord subtext markdown so it reads
+                        # as quiet metadata, not a normal message. Format
+                        # matches Amos's per-tool shapes, shared
+                        # 2026-08-06 — see format_tool_summary().
+                        summary = format_tool_summary(
+                            tool_name, block.get("input", {}) or {}
+                        )
+                        if summary is None:
+                            # Suppressed tool (e.g. TaskList/TaskGet) — a
+                            # silent call still breaks run adjacency, but
+                            # doesn't start a new pending run of its own.
+                            await flush_pending_tool()
+                            continue
+                        if tool_name == pending_tool_name:
+                            pending_tool_count += 1
+                            pending_tool_summary = summary
+                        else:
+                            await flush_pending_tool()
+                            pending_tool_name = tool_name
+                            pending_tool_count = 1
+                            pending_tool_summary = summary
                     # `thinking` blocks are intentionally ignored here — they
                     # are stripped from the final text below as a belt-and-
                     # braces measure for any inline <thinking> tags.
+
+                await flush_pending_tool()
 
                 if got_text:
                     cleaned = THINKING_BLOCK_RE.sub("", final_text)
                     await write_streaming_response(msg_ids, cleaned)
 
+            elif event_type == "rate_limit_event":
+                # Anthropic's own live answer to "session usage within the
+                # relevant time window" (2026-08-06, Ian's ask). Confirmed
+                # with Amos that even his more mature system doesn't read
+                # this in-band — his equivalent comes from polling the
+                # OAuth usage endpoint out-of-band, which is separate
+                # auth, separate cron, and stale between polls. This is
+                # neither: it's already on the stream we're reading.
+                info = event.get("rate_limit_info", {}) or {}
+                if info:
+                    await _record_rate_limit_event(agent, info)
+
             elif event_type == "result":
-                # Extract metadata. Token counts live under `usage`,
-                # cost/duration are top-level. Final text is in `result`
-                # for success, or `error` field for failures.
+                # Extract metadata. Cost/duration are top-level and come
+                # straight from the CLI's own accounting, which cost_events
+                # history confirms stays sane turn over turn — trusted
+                # as-is. Token counts used to also come from this event's
+                # `usage` field, but that field is what produced the
+                # impossible 9.68M-token context reading (see comment
+                # above, in the `assistant` branch) — use
+                # last_assistant_usage instead for anything context-size
+                # related.
                 usage = event.get("usage", {}) or {}
                 metadata = {
                     "session_id": event.get("session_id"),
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
+                    # Real per-turn context size — last individual
+                    # assistant event's own usage, not this result event's
+                    # (likely-aggregated) figures. Falls back to this
+                    # event's numbers only if the assistant stream somehow
+                    # produced no usage at all, so the field is never just
+                    # missing.
+                    "cache_read_input_tokens": last_assistant_usage.get(
+                        "cache_read_input_tokens", usage.get("cache_read_input_tokens", 0)
+                    ),
+                    "cache_creation_input_tokens": last_assistant_usage.get(
+                        "cache_creation_input_tokens", usage.get("cache_creation_input_tokens", 0)
+                    ),
                     "total_cost_usd": event.get("total_cost_usd", 0.0),
                     "duration_ms": event.get("duration_ms", 0),
                     "is_error": event.get("is_error", False),
@@ -832,8 +1225,109 @@ async def read_agent_response(
     # Strip any inline thinking blocks (defense in depth)
     final_text = THINKING_BLOCK_RE.sub("", final_text).strip()
 
+    # Whatever's still pending is the true final answer — nothing followed
+    # it in the stream, so it never got flushed as an interim italic post.
+    # Posted plain by the caller. If everything that streamed got flushed
+    # as interim already (turn ended right after a tool call, no trailing
+    # text), there's nothing left to post. If streaming never engaged this
+    # turn at all (config off, DM, or an empty assistant stream that fell
+    # back to the result event's flat text above), hand back the whole
+    # response, same as before this feature existed.
+    if pending_interim_text is not None:
+        pending_final = THINKING_BLOCK_RE.sub("", pending_interim_text).strip()
+    elif text_streamed_this_turn:
+        pending_final = ""
+    else:
+        pending_final = final_text
+
     agent_states[agent] = "IDLE"
-    return final_text, metadata
+    return final_text, metadata, pending_final, last_discord_msg_id
+
+async def queued_ack_sweep_loop():
+    """Runs for the life of the process, independent of any single agent's
+    turn (Task #13). The per-channel typing indicator added earlier only
+    fires from inside process_agent_queue()'s own pass, which is fine for
+    "is anyone even looking at this" but doesn't cover a channel that's
+    been waiting several minutes through back-to-back busy turns — that
+    needs its own clock, not one piggybacked on whichever channel happens
+    to be draining right now."""
+    while True:
+        await asyncio.sleep(QUEUED_ACK_SWEEP_INTERVAL_SEC)
+        try:
+            await check_queued_acks()
+        except Exception as e:
+            log.warning(f"queued_ack_sweep_loop error (non-fatal): {e}")
+
+async def check_queued_acks():
+    """Find the oldest STATUS_QUEUED message per (agent, channel), and for
+    any that's been waiting long enough and isn't on cooldown, post a
+    deterministic ack — no model call. Amos's race-condition catch: the
+    sweep and the drain aren't ordered against each other, so a turn that
+    finishes right as this fires could post the ack immediately followed
+    by the real answer, which reads worse than silence. Guarded by
+    re-checking the specific row is still STATUS_QUEUED right before
+    sending, not just when this sweep started."""
+    if db is None:
+        return
+
+    async with db.execute(
+        "SELECT agent, channel_id, message_id, created_at FROM message_queue WHERE processed = ?",
+        (STATUS_QUEUED,)
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    oldest: Dict[tuple, Dict] = {}
+    for row in rows:
+        if row["channel_id"] == "0":
+            continue
+        key = (row["agent"], row["channel_id"])
+        if key not in oldest or row["created_at"] < oldest[key]["created_at"]:
+            oldest[key] = dict(row)
+
+    now = time.time()
+    for (agent, channel_id), row in oldest.items():
+        try:
+            created = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
+            waited_sec = (datetime.utcnow() - created).total_seconds()
+        except (ValueError, TypeError):
+            continue
+
+        if waited_sec < QUEUED_ACK_WAIT_THRESHOLD_SEC:
+            continue
+        last_ack = channel_last_ack.get(channel_id, 0)
+        if now - last_ack < QUEUED_ACK_COOLDOWN_SEC:
+            continue
+
+        # Race guard, corrected 2026-08-06 per Amos: a re-check
+        # immediately before sending still leaves a gap for exactly as
+        # long as post_to_discord()'s own network call takes — the drain
+        # can acquire the lock, complete a turn, and post the real answer
+        # during that window, so the ack can still land after it despite
+        # the recheck saying "still queued" moments earlier. Closing the
+        # gap for real (not just narrowing it) means holding the SAME
+        # lock process_agent_queue() uses across both the recheck and
+        # the send — while this lock is held, the drain cannot be
+        # running for this agent at all, so there is no window left for
+        # it to interleave in. Costs a brief serialization (drain start
+        # waits for the ack post to finish, typically sub-second) in
+        # exchange for an actual guarantee instead of a narrowed race.
+        agent_lock = agent_locks.get(agent)
+        if agent_lock is None:
+            continue
+        async with agent_lock:
+            async with db.execute(
+                "SELECT processed FROM message_queue WHERE message_id = ?",
+                (row["message_id"],)
+            ) as cursor:
+                current = await cursor.fetchone()
+            if not current or current["processed"] != STATUS_QUEUED:
+                continue
+
+            await post_to_discord(
+                agent, channel_id,
+                "-# ⏳ queued — finishing up elsewhere, will get to this shortly"
+            )
+            channel_last_ack[channel_id] = now
 
 async def process_agent_queue(agent: str):
     """Process pending messages for agent"""
@@ -855,10 +1349,40 @@ async def process_agent_queue(agent: str):
             """,
             (agent, STATUS_QUEUED)
         ) as cursor:
-            messages = await cursor.fetchall()
+            all_pending = await cursor.fetchall()
 
-        if not messages:
+        if not all_pending:
             return
+
+        # Process only the oldest message's channel this pass. Messages
+        # queued for OTHER channels while this agent was busy must never be
+        # merged into the same response and posted to a single channel —
+        # found 2026-08-05 when a #signals heartbeat and a live exchange in
+        # a different Discord server's #agent-chat landed in the queue
+        # together; the combined response (including internal heartbeat
+        # status) posted only to #agent-chat, leaking it into a shared
+        # external server. Leftover messages for other channels stay
+        # STATUS_QUEUED and get drained in a follow-up pass (see the
+        # self-continuation check after the lock releases below).
+        target_channel_id = all_pending[0]["channel_id"]
+        messages = [m for m in all_pending if m["channel_id"] == target_channel_id]
+
+        # Typing indicator for every OTHER channel with a message waiting
+        # behind this one, not just the one being drained (Task #13,
+        # 2026-08-06 — the "simultaneous conversation" problem: a channel
+        # queued behind a busy turn showed zero signal — no typing, no
+        # ack — until its own turn finally started, so replies "read as a
+        # clump then all at once"). Confirmed with Amos his system has the
+        # identical structural limit (one lock, one subprocess, strictly
+        # serial); this is the fix he'd adopt too — "strictly better than
+        # what either of us runs," a Discord API call with no model
+        # anywhere near it. Not stopped explicitly here: start_typing()
+        # is idempotent per channel_id, and each channel's own real pass
+        # through this function calls stop_typing() once its actual
+        # response is ready, same as it always has.
+        waiting_channel_ids = {m["channel_id"] for m in all_pending} - {target_channel_id}
+        for waiting_channel_id in waiting_channel_ids:
+            await start_typing(agent, waiting_channel_id)
 
         # Mark as in progress
         message_ids = [msg["message_id"] for msg in messages]
@@ -873,8 +1397,29 @@ async def process_agent_queue(agent: str):
         await db.commit()
 
         # Format batch
-        channel_id = messages[0]["channel_id"]
-        formatted_parts = []
+        channel_id = target_channel_id
+        # Explicit channel header (2026-08-06) — the actual root cause
+        # behind four separate misrouting incidents tonight: nothing in
+        # the prompt ever told the agent which channel a turn was
+        # actually scoped to, so content addressed to a third party (most
+        # often Amos, discussed but not present in the triggering
+        # message) kept winning over the channel the reply would really
+        # post to. Each incident got patched by hand after the fact via a
+        # direct Discord API call — this is the fix for the cause instead
+        # of the symptom. Every response posts to exactly one channel
+        # regardless of who it's "about"; say so plainly, every turn.
+        channel_name = next(
+            (name for name, cfg in channels_config.get("channels", {}).items()
+             if cfg.get("id") == channel_id),
+            channel_id,
+        )
+        formatted_parts = [
+            f"[This turn posts ONLY to #{channel_name} — regardless of who "
+            f"the conversation is about, your response goes here and "
+            f"nowhere else. If this content is meant for someone in a "
+            f"different channel, say so explicitly rather than writing as "
+            f"if they'll see it.]"
+        ]
         for msg in messages:
             timestamp = msg["created_at"]
             author = msg["author"]
@@ -890,7 +1435,9 @@ async def process_agent_queue(agent: str):
         await send_to_agent(agent, formatted_content, message_ids)
 
         # Read response
-        response_text, metadata = await read_agent_response(agent, channel_id, message_ids)
+        response_text, metadata, pending_final, discord_msg_id = await read_agent_response(
+            agent, channel_id, message_ids
+        )
 
         # Stop typing
         await stop_typing(channel_id)
@@ -900,10 +1447,18 @@ async def process_agent_queue(agent: str):
             await post_cost_update(agent, metadata)
             await update_session_tokens(agent, metadata.get("input_tokens", 0))
 
-        # Post response to Discord
-        discord_msg_id = None
-        if response_text and channel_id != "0":
-            discord_msg_id = await post_to_discord(agent, channel_id, response_text)
+        # Post whatever's left to Discord. When stream_to_channel is on,
+        # most (or all) of response_text already went out incrementally
+        # inside read_agent_response — interim segments as italic asides,
+        # tool calls as "-# " subtext. pending_final is only the remainder:
+        # the true final answer if the turn ended mid-text (plain, no
+        # italics), empty if the last thing streamed was itself final
+        # already, or the whole response if streaming never engaged this
+        # turn. discord_msg_id starts as whatever last posted during
+        # streaming, so history still gets a real message ID even on turns
+        # where this post is skipped.
+        if pending_final and channel_id != "0":
+            discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
 
         # Mark complete
         await db.execute(
@@ -917,6 +1472,37 @@ async def process_agent_queue(agent: str):
         await db.commit()
 
         log.info(f"{agent} processed {len(message_ids)} messages")
+
+    # Lock released above. If messages for other channels were left queued
+    # (deferred by the same-channel filter this pass), keep draining rather
+    # than waiting for the next externally-triggered message — otherwise a
+    # channel with no new traffic could sit queued indefinitely behind a
+    # busy one. A fresh task re-acquires the lock and re-checks IDLE state
+    # itself, so this is safe to fire unconditionally.
+    async with db.execute(
+        "SELECT 1 FROM message_queue WHERE agent = ? AND processed = ? LIMIT 1",
+        (agent, STATUS_QUEUED)
+    ) as cursor:
+        remaining = await cursor.fetchone()
+    if remaining:
+        asyncio.create_task(process_agent_queue(agent))
+
+    # Automatic context compaction (Amos's model, adopted 2026-08-06) —
+    # DISABLED same day, hours after deploy. estimate_context_tokens() is
+    # producing values in the millions (9,682,204 on one real turn) against
+    # a 200k window — physically impossible as "current context", which
+    # means the usage.* fields summed there are very likely cumulative
+    # session totals, not a per-turn snapshot, so the whole measurement is
+    # built on a wrong assumption. It was also firing on every single turn
+    # as a result, and failing every time besides (summarize-session.py's
+    # "No recent stream data" — a second, independent bug: logs/agent-streams/
+    # has never had anything written to it, apparently since this instance's
+    # inception, so finalize can't currently succeed regardless of when it's
+    # triggered). Asked Amos how he actually measures "current context %"
+    # rather than guess again. Re-enable only after both are fixed and
+    # verified — see cost-model-migration.md.
+    # if metadata:
+    #     await maybe_compact_session(agent, metadata)
 
 # =============================================================================
 # Crash Recovery
@@ -999,15 +1585,18 @@ async def handle_message(request):
     if not content:
         return web.json_response({"error": "Empty content"}, status=400)
 
-    # Check cost limits (unless owner or heartbeat)
-    if server != "local" and author_id != OWNER_DISCORD_ID:
-        cost_check = await check_cost_limits(author_id)
-        if cost_check["exceeded"]:
-            return web.json_response(
-                {"error": "Cost limit exceeded", "reason": cost_check["reason"]},
-                status=429,
-                headers={"Retry-After": "3600"}
-            )
+    # Cost limits no longer reject inbound messages, as of 2026-08-06. The
+    # hard dollar-based rejection here used to silently drop agent-to-agent
+    # messages with no retry (a real incident: $53.97 actual spend vs the
+    # $25 cap, one of Amos's messages 429-rejected and lost, no requeue).
+    # Ian's decision: adopt Amos's model instead — protection is
+    # QUEUE_DEPTH_LIMIT below (already matches his number) plus automatic
+    # context compaction (maybe_compact_session, called from
+    # process_agent_queue) rather than a spend ceiling. COST_DAILY_LIMIT /
+    # COST_MONTHLY_LIMIT stay defined for `cost-report.sh` visibility
+    # (handle_cost_get queries cost_events directly); check_cost_limits(),
+    # which only ever fed this now-removed rejection, was deleted outright
+    # rather than left as dead code.
 
     # Check queue depth
     async with db.execute(
@@ -1082,7 +1671,12 @@ async def handle_agents(request):
             "name": agent,
             "model": config.get("model"),
             "state": agent_states.get(agent, "UNKNOWN"),
-            "has_discord_token": agent in AGENT_TOKENS
+            "has_discord_token": agent in AGENT_TOKENS,
+            # Anthropic's own live rate-limit signal, added 2026-08-06 —
+            # empty until this agent's subprocess has completed at least
+            # one turn since agent-server last started (see
+            # _record_rate_limit_event / read_agent_response).
+            "rate_limit": agent_rate_limits.get(agent, {}),
         })
 
     return web.json_response({"agents": agents_list})
@@ -1336,7 +1930,30 @@ async def startup(app):
     loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(graceful_shutdown("SIGTERM")))
     loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(graceful_shutdown("SIGINT")))
 
+    # Queued-ack sweep (Task #13) — independent of any single agent's
+    # turn, see queued_ack_sweep_loop() docstring for why this can't just
+    # piggyback on process_agent_queue()'s own pass.
+    asyncio.create_task(queued_ack_sweep_loop())
+
     log.info(f"Agent server ready on port {PORT}")
+
+    # Startup notice (2026-08-06) — Ian, after several restarts tonight:
+    # "when you restart you don't come back with a 'hey I did it'
+    # message." Correct — a restart was only visible by reading logs or
+    # asking. Post one short line to #signals so it's visible without
+    # digging. Best-effort: must never block startup if it fails (no
+    # signals channel configured, Discord unreachable, etc).
+    try:
+        signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+        primary_agent = next(iter(agent_config), None)
+        if signals_channel and primary_agent:
+            agents_up = ", ".join(agent_config.keys())
+            await post_to_discord(
+                primary_agent, signals_channel,
+                f"-# 🔄 agent-server restarted — {agents_up} back up"
+            )
+    except Exception as e:
+        log.warning(f"Startup notice failed (non-fatal): {e}")
 
 async def shutdown(app):
     """Cleanup on shutdown"""

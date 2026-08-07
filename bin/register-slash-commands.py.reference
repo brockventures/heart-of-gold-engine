@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Register Amos's Discord application ("slash") commands.
+
+The adapter in `lib/herald/discord_adapter.py` runs five bare
+`discord.Client`s, one per agent identity. discord.py's `CommandTree` wants a
+client it owns and a `sync()` inside the event loop, which would mean
+restructuring all five. Registering over the REST API instead keeps that
+arrangement, and command definitions change far less often than the handler
+does — one script run per change is cheap.
+
+Guild-scoped registration (not global): guild commands appear immediately,
+global ones take up to an hour to propagate.
+
+    python3 bin/register-slash-commands.py            # register/update
+    python3 bin/register-slash-commands.py --list     # show what is registered
+    python3 bin/register-slash-commands.py --clear    # remove all of them
+
+The handler lives in `DiscordAdapter._handle_interaction`, which delegates to
+the same `_handle_sys_command` the `/sys` text intercept uses. Adding a
+subcommand here without a matching branch there gets you a command that
+silently does nothing.
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import requests
+
+WORKSPACE = Path(__file__).resolve().parent.parent
+APP_ID = "000000000000000000"       # Amos bot application
+GUILD_ID = "000000000000000000"     # Karakos
+API = "https://discord.com/api/v10"
+
+STRING, INTEGER = 3, 4
+
+AGENT_OPTION = {
+    "name": "agent",
+    "description": "Target agent (default: the channel's owning agent)",
+    "type": STRING,
+    "required": False,
+}
+
+
+def _cmd(name, description, options=None):
+    c = {"name": name, "description": description, "type": 1}
+    if options:
+        c["options"] = options
+    return c
+
+
+# Every command `_handle_sys_command` implements, registered top-level. There
+# is no `sys` group: the prefix only ever existed so `on_message` could tell a
+# command from a sentence, and an application command needs no sentinel.
+#
+# Option values are reassembled into the `args` string each branch already
+# parses (see `_handle_interaction`), so the two surfaces stay one
+# implementation.
+COMMANDS = [
+    # --- no arguments ---
+    _cmd("status", "Agent server status"),
+    _cmd("health", "Full system health check"),
+    _cmd("usage", "Account usage vs rate-limit metrics"),
+    _cmd("sessions", "Show active channel affinity sessions"),
+    _cmd("restart-server", "Restart the agent server service"),
+    _cmd("restart-relay", "Restart the herald-relay service"),
+
+    # --- agent-targeted ---
+    _cmd("clear", "Clear session + restart subprocess (destructive)", [AGENT_OPTION]),
+    _cmd("reload", "Restart subprocess, keep session", [AGENT_OPTION]),
+    _cmd("flush", "Flush an agent's pending message queue", [AGENT_OPTION]),
+    _cmd("kill", "Kill an agent's subprocess (auto-restarts)", [AGENT_OPTION]),
+    _cmd("summarize", "Summarize session, then clear + restart", [AGENT_OPTION]),
+    _cmd("interrupt", "Stop an agent's current generation ('all' for every agent)", [AGENT_OPTION]),
+
+    # --- shaped arguments ---
+    _cmd("model", "Flip a pty agent's model live", [
+        AGENT_OPTION,
+        {"name": "model", "description": "Model id/alias, 'clear', or 'status'", "type": STRING, "required": False},
+    ]),
+    _cmd("logs", "Tail a service log", [
+        {"name": "service", "description": "Service name", "type": STRING, "required": True},
+        {"name": "lines", "description": "How many lines (default 40)", "type": INTEGER, "required": False},
+    ]),
+    _cmd("goal", "Start autonomous goal mode", [
+        {"name": "text", "description": "The goal", "type": STRING, "required": True},
+        {"name": "agent", "description": "Target agent", "type": STRING, "required": False},
+        {"name": "cost", "description": "Cost ceiling in dollars", "type": INTEGER, "required": False},
+        {"name": "turns", "description": "Turn ceiling", "type": INTEGER, "required": False},
+        {"name": "stop_time", "description": "Wall-clock stop, Pacific (e.g. 2:00am)", "type": STRING, "required": False},
+    ]),
+    _cmd("login", "Re-auth the shared Claude account (run again with the code)", [
+        {"name": "code", "description": "Auth code from the posted URL", "type": STRING, "required": False},
+    ]),
+]
+
+
+def token() -> str:
+    env = WORKSPACE / ".env"
+    for line in env.read_text().splitlines():
+        if line.startswith("DISCORD_BOT_TOKEN="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    sys.exit("DISCORD_BOT_TOKEN not found in .env")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--list", action="store_true", help="show registered commands")
+    ap.add_argument("--clear", action="store_true", help="deregister everything")
+    args = ap.parse_args()
+
+    headers = {"Authorization": f"Bot {token()}", "Content-Type": "application/json"}
+    url = f"{API}/applications/{APP_ID}/guilds/{GUILD_ID}/commands"
+
+    if args.list:
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        for c in r.json():
+            subs = ", ".join(o["name"] for o in c.get("options", []) if o.get("type") == 1)
+            print(f"/{c['name']}  [{subs}]" if subs else f"/{c['name']}")
+        return 0
+
+    payload = [] if args.clear else COMMANDS
+    r = requests.put(url, headers=headers, data=json.dumps(payload), timeout=20)
+    if r.status_code != 200:
+        # 403 here means the bot was invited without the applications.commands
+        # scope — that needs a human with Manage Server to re-authorise it, no
+        # amount of token permission fixes it.
+        print(f"HTTP {r.status_code}: {r.text[:400]}", file=sys.stderr)
+        return 1
+
+    print(f"{'Cleared' if args.clear else 'Registered'} {len(r.json())} command(s) in guild {GUILD_ID}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
