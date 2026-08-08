@@ -14,6 +14,7 @@ logs/
 # Node
 dashboard/node_modules/
 dashboard/.next/
+dashboard/tsconfig.tsbuildinfo
 npm-debug.log*
 
 # Python
