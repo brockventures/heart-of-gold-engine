@@ -195,6 +195,30 @@ def load_config():
 
     log.info(f"Loaded config for {len(agent_config)} agents, {len(channels_config.get('channels', {}))} channels")
 
+
+def load_server_ids(config: Dict) -> set:
+    """Discord server IDs this relay will accept messages from.
+
+    `server_id` (a single string, what setup.sh writes) stays supported. A
+    system that also needs to reach a shared server — a second household, a
+    server where agents from different installs talk to each other — adds
+    `server_ids` alongside it, and both are honoured:
+
+        {"server_id": "111", "server_ids": ["222", "333"], "channels": {...}}
+
+    Channels are still matched by ID, so a channel only routes if it's listed
+    in `channels` regardless of which server it lives in.
+    """
+    ids = set()
+    single = config.get("server_id")
+    if single:
+        ids.add(str(single))
+    extra = config.get("server_ids") or []
+    if isinstance(extra, (str, int)):
+        extra = [extra]
+    ids.update(str(s) for s in extra if s)
+    return ids
+
 # =============================================================================
 # Discord Adapter
 # =============================================================================
@@ -210,7 +234,7 @@ class DiscordAdapter(discord.Client):
         super().__init__(intents=intents, *args, **kwargs)
 
         self.http_session = None
-        self.server_ids = []
+        self.server_ids = set()
         self.gate: Optional[ReplyGate] = None
         self._health_task: Optional[asyncio.Task] = None
         self._deferred_poke_task: Optional[asyncio.Task] = None
@@ -277,14 +301,11 @@ class DiscordAdapter(discord.Client):
         """Initialize HTTP session"""
         import aiohttp
         self.http_session = aiohttp.ClientSession()
-        # "server_ids" (list) supports multiple connected guilds; fall back
-        # to the older singular "server_id" for configs that predate that.
-        server_ids = channels_config.get("server_ids")
-        if server_ids is None:
-            single = channels_config.get("server_id")
-            server_ids = [single] if single else []
-        self.server_ids = [str(s) for s in server_ids]
-        log.info("Discord adapter initialized")
+        self.server_ids = load_server_ids(channels_config)
+        log.info(
+            "Discord adapter initialized (servers: %s)",
+            ", ".join(sorted(self.server_ids)) or "none configured",
+        )
 
     async def on_ready(self):
         """Bot logged in"""
