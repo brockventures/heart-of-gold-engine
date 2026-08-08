@@ -221,8 +221,6 @@ def load_server_ids(config: Dict) -> set:
 
 # =============================================================================
 # Discord Adapter
-# (comment-only touch 2026-08-08 — live smoke test for the new
-# auto-reload-on-commit post-commit hook, system/reload-on-commit.py)
 # =============================================================================
 
 class DiscordAdapter(discord.Client):
