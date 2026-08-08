@@ -1,58 +1,27 @@
-# Environment and credentials
+# Secrets — never commit real credentials
 config/.env
-.env
+
+# Runtime state and data — not source, regenerated/accumulated at runtime
+data/
+logs/
+
+# Local install metadata (owner name, install timestamp) — not for a shared repo
+.karakos/
+
+# Claude Code's own local session state
+.claude/
+
+# Node
+dashboard/node_modules/
+dashboard/.next/
+npm-debug.log*
 
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-# Python lib/ (not dashboard/lib/)
-/lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+*.pyc
+*.pyo
+.pytest_cache/
 *.egg-info/
-.installed.cfg
-*.egg
 
-# Node
-node_modules/
-.next/
-out/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Data and state
-data/
-logs/
-inbox/
-agents/*/inbox/
-agents/*/journal/
-.setup-state.json
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
+# OS cruft
 .DS_Store
-Thumbs.db
-
-# Docker
-docker-compose.override.yml
-
-*.tsbuildinfo

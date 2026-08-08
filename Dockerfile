@@ -7,12 +7,15 @@ RUN npm run build
 
 FROM python:3.11-slim
 
-# Install runtime tools (tini for PID 1, git/curl/jq for runtime use)
+# Install runtime tools (tini for PID 1, git/curl/jq for runtime use,
+# procps for ps/pgrep/pkill — added 2026-08-06 so scripts like
+# bin/safe-pkill.sh don't have to work around their absence via /proc, and
+# to keep parity with Mike's Karakos instance).
 # build-essential is needed because some Python deps (PyStemmer via fastembed)
 # ship no aarch64 wheel and have to compile from source. We purge it after
 # pip install to keep the final image small.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl tini jq build-essential \
+    git curl tini jq procps build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Install supervisord
@@ -53,6 +56,12 @@ COPY --chown=karakos:karakos --from=dashboard-build /app/.next dashboard/.next
 COPY --chown=karakos:karakos --from=dashboard-build /app/node_modules dashboard/node_modules
 COPY --chown=karakos:karakos --from=dashboard-build /app/public dashboard/public
 COPY --chown=karakos:karakos --from=dashboard-build /app/package.json dashboard/package.json
+# `output: standalone` traces server.js + a trimmed node_modules into
+# .next/standalone/, but per Next.js docs it does NOT copy public/ or
+# .next/static into that tree — the standalone server needs those manually
+# placed alongside it or it 404s on every static asset.
+COPY --chown=karakos:karakos --from=dashboard-build /app/public dashboard/.next/standalone/public
+COPY --chown=karakos:karakos --from=dashboard-build /app/.next/static dashboard/.next/standalone/.next/static
 COPY --chown=karakos:karakos . .
 
 # Create data directories owned by karakos so volume mounts get the right

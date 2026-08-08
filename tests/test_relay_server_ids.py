@@ -31,6 +31,12 @@ def relay(tmp_path_factory):
     import os
     prev = os.environ.get("WORKSPACE_ROOT")
     os.environ["WORKSPACE_ROOT"] = str(workspace)
+    # relay.py imports sibling modules (reply_gate, handoff) by bare name —
+    # spec_from_file_location loads relay.py standalone and doesn't put its
+    # directory on sys.path, so those imports 404 unless bin/ is added here.
+    bin_dir = str(PACKAGE_ROOT / "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
     try:
         spec = importlib.util.spec_from_file_location("relay_under_test", RELAY_PATH)
         module = importlib.util.module_from_spec(spec)
