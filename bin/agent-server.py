@@ -2128,6 +2128,96 @@ async def handle_message(request):
 
     return web.json_response({"status": "queued", "message_id": message_id}, status=202)
 
+async def handle_status(request):
+    """GET /status - Rich per-agent status for the dashboard.
+
+    The dashboard (dashboard/app/api/agents/route.ts) has always called
+    this exact path and reshaped its response into per-agent cards, but
+    the route was never actually registered here -- every dashboard page
+    that lists agents (the Agents page, and transitively the Chat page's
+    agent picker) has been getting a 500 from its own proxy since
+    whenever that dashboard code was written. Found while investigating
+    "chat doesn't work as intended" -- the chat page's dropdown never
+    populated because this 404'd, so `agent` stayed empty and sends were
+    silently no-op'd by the empty-agent guard.
+
+    Shape: a plain object keyed by agent name (not wrapped in {agents:
+    ...}), matching route.ts's `Object.entries(status)` call.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    status = {}
+    for agent in agent_config:
+        proc = agent_processes.get(agent)
+
+        queue_depths: Dict[str, int] = {}
+        async with db.execute(
+            "SELECT channel, COUNT(*) as count FROM message_queue "
+            "WHERE agent = ? AND processed = ? GROUP BY channel",
+            (agent, STATUS_QUEUED)
+        ) as cursor:
+            async for row in cursor:
+                queue_depths[row["channel"]] = row["count"]
+        total_pending = sum(queue_depths.values())
+
+        async with db.execute(
+            "SELECT COUNT(*) as count FROM message_queue WHERE agent = ? AND processed = ?",
+            (agent, STATUS_COMPLETE)
+        ) as cursor:
+            row = await cursor.fetchone()
+            messages_processed = row["count"]
+
+        compaction_count = 0
+        async with db.execute(
+            "SELECT compaction_count FROM sessions WHERE agent = ?", (agent,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                compaction_count = row["compaction_count"]
+
+        # cost_events rows are per-turn deltas except session_total, which
+        # is already a running cumulative -- take the latest row's
+        # session_total for cost rather than summing (summing
+        # session_total would double-count), and sum input_tokens for a
+        # cumulative usage figure. Field names below (session_cost,
+        # input_tokens flat rather than nested) match what
+        # dashboard/app/api/agents/route.ts has always expected from this
+        # endpoint -- it was written against this shape, it just never
+        # had a real endpoint to call.
+        session_cost = None
+        input_tokens = None
+        async with db.execute(
+            "SELECT session_total FROM cost_events WHERE agent = ? "
+            "ORDER BY id DESC LIMIT 1", (agent,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                session_cost = row["session_total"]
+        async with db.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0) as inp "
+            "FROM cost_events WHERE agent = ?", (agent,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row["inp"]:
+                input_tokens = row["inp"]
+
+        status[agent] = {
+            "state": agent_states.get(agent, "UNKNOWN"),
+            "subprocess_alive": proc is not None and proc.returncode is None,
+            "subprocess_pid": proc.pid if proc is not None else None,
+            "session_id": agent_sessions.get(agent, ""),
+            "queue_depths": queue_depths,
+            "total_pending": total_pending,
+            "messages_processed": messages_processed,
+            "compaction_count": compaction_count,
+            "session_cost": session_cost,
+            "input_tokens": input_tokens,
+        }
+
+    return web.json_response(status)
+
 async def handle_health(request):
     """GET /health - Health check"""
     # Check bearer token
@@ -2502,6 +2592,7 @@ def main():
     # Register routes
     app.router.add_post("/message", handle_message)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/status", handle_status)
     app.router.add_get("/agents", handle_agents)
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
     app.router.add_post("/agents/{name}/reload", handle_agent_reload)
