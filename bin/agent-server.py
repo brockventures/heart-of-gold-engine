@@ -148,14 +148,29 @@ TOPIC_CHECK_MIN_TOKENS = 20_000
 # removed the $/day cap, there's no other backstop against burning
 # overage dollars.
 RATE_LIMIT_PAUSE_STATUS = "allowed_warning"
-# Second pause trigger, added 2026-08-08 per Ian: an explicit utilization
-# cutoff alongside the status check above (not instead of it — checking
-# `status == RATE_LIMIT_PAUSE_STATUS` first in is_rate_limit_paused() is a
-# cheap dict-equality check that covers the common case, so utilization is
-# only inspected when that misses). Also the trigger point for proactive
-# wind-down/compaction (see maybe_rate_limit_compact()) so a session
-# summarizes itself before the pause actually holds the queue, rather than
-# freezing mid-thought.
+# Anthropic's status enum is "allowed" | "allowed_warning" | "rejected"
+# (confirmed against the CLI's own zod schema, TOm, 2026-08-08) — "rejected"
+# means a request was already denied, a strictly stronger signal than the
+# warning. Found live tonight (Marvin 20:11:42, relay 20:22:56) right at the
+# tail of a five_hour window, with utilization absent from the payload both
+# times — utilization is genuinely optional in Anthropic's schema, not
+# reliably present, so it can't be the only hard-stop signal.
+RATE_LIMIT_REJECTED_STATUS = "rejected"
+# 2026-08-08 (second revision, per Ian): status == RATE_LIMIT_PAUSE_STATUS
+# used to hard-pause the queue by itself. Anthropic sets that status around
+# 90% utilization ("surpassedThreshold, typically 90%" — see below), which
+# meant a real incident (agent jammed with utilization still well under
+# the 97% cutoff and plenty of window left) triggered a full stop far
+# earlier than intended. Anthropic's status is now a WARNING signal only —
+# see is_rate_limit_warning() — logged and notified but not blocking.
+# is_rate_limit_paused() below is the only hard stop, and it's keyed
+# purely on utilization crossing RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD.
+RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 0.90
+# The hard stop. Utilization-only (not status) so it can't fire early off
+# Anthropic's own ~90% warning flag — see comment above. Also the trigger
+# point for proactive wind-down/compaction (see maybe_rate_limit_compact())
+# so a session summarizes itself before the pause actually holds the
+# queue, rather than freezing mid-thought.
 RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD = 0.97
 # Heartbeats (poke.sh --source heartbeat, see heartbeat.sh) are exempted
 # from the pause below (2026-08-07, per Ian/Moon Problem): the pause trips
@@ -262,6 +277,10 @@ agent_rate_limits: Dict[str, Dict[str, Any]] = {}
 # retrying every 60s doesn't spam a notice on every retry while still
 # paused. See is_rate_limit_paused() / process_agent_queue().
 agent_rate_limit_pause_notified: Dict[str, bool] = {}
+# Same idea for the (non-blocking) warning zone — added 2026-08-08 so
+# crossing ~90% posts one #signals notice instead of one per sweep tick,
+# and posts again on clearing. See is_rate_limit_warning().
+agent_rate_limit_warning_notified: Dict[str, bool] = {}
 # Context-window fill estimate, same inputs as maybe_compact_session() but
 # purely observational — 2026-08-07, Ian's ask, tracked separately from the
 # (still deliberately disabled) auto-compaction trigger so visibility
@@ -375,9 +394,22 @@ async def init_db():
             overage_status TEXT,
             overage_resets_at INTEGER,
             is_using_overage INTEGER DEFAULT 0,
+            utilization REAL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 2026-08-08: utilization added after the hard-stop moved from
+    # Anthropic's status flag to a pure utilization threshold (see
+    # is_rate_limit_paused()) — without persisting the number itself, a
+    # restart mid-pause couldn't tell it had been paused and would
+    # silently resume early. CREATE TABLE IF NOT EXISTS is a no-op on the
+    # already-live table, so this migrates it explicitly; ALTER TABLE has
+    # no "IF NOT EXISTS" in sqlite, hence the try/except.
+    try:
+        await db.execute("ALTER TABLE rate_limits ADD COLUMN utilization REAL")
+        await db.commit()
+    except Exception:
+        pass  # column already exists
 
     await db.commit()
     log.info("Database initialized")
@@ -532,8 +564,8 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
             """
             INSERT INTO rate_limits
                 (agent, status, rate_limit_type, resets_at, overage_status,
-                 overage_resets_at, is_using_overage, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 overage_resets_at, is_using_overage, utilization, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(agent) DO UPDATE SET
                 status=excluded.status,
                 rate_limit_type=excluded.rate_limit_type,
@@ -541,6 +573,7 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
                 overage_status=excluded.overage_status,
                 overage_resets_at=excluded.overage_resets_at,
                 is_using_overage=excluded.is_using_overage,
+                utilization=excluded.utilization,
                 updated_at=CURRENT_TIMESTAMP
             """,
             (
@@ -551,6 +584,7 @@ async def _record_rate_limit_event(agent: str, info: Dict[str, Any]) -> None:
                 info.get("overageStatus"),
                 info.get("overageResetsAt"),
                 1 if is_using_overage else 0,
+                info.get("utilization"),
             ),
         )
         await db.commit()
@@ -573,50 +607,71 @@ async def _load_rate_limits_from_db() -> None:
     try:
         now = time.time()
         async with db.execute(
-            "SELECT agent, status, rate_limit_type, resets_at FROM rate_limits"
+            "SELECT agent, status, rate_limit_type, resets_at, utilization FROM rate_limits"
         ) as cursor:
             rows = await cursor.fetchall()
         for row in rows:
             resets_at = row["resets_at"]
             if resets_at and resets_at <= now:
                 continue  # stale — window already over, let a live event set this
+            utilization = row["utilization"]
             agent_rate_limits[row["agent"]] = {
                 "status": row["status"],
                 "rateLimitType": row["rate_limit_type"],
                 "resetsAt": resets_at,
+                "utilization": utilization,
             }
-            if row["status"] == RATE_LIMIT_PAUSE_STATUS and row["rate_limit_type"] == "five_hour":
+            # Hard-pause criteria is status=="rejected" OR utilization
+            # crossing the threshold (see is_rate_limit_paused()) —
+            # restoring both (not just status) is what lets a restart
+            # mid-pause stay paused instead of silently resuming until
+            # the next live event.
+            if row["status"] == RATE_LIMIT_REJECTED_STATUS:
+                log.warning(
+                    f"{row['agent']} restored rate-limit pause state from DB "
+                    "on startup (status=rejected) — staying paused until it clears"
+                )
+            elif utilization and utilization >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:
+                log.warning(
+                    f"{row['agent']} restored rate-limit pause state from DB "
+                    f"on startup ({utilization:.0%} utilization) — staying paused until it clears"
+                )
+            elif row["status"] == RATE_LIMIT_PAUSE_STATUS:
                 log.warning(
                     f"{row['agent']} restored rate-limit warning state from DB "
-                    "on startup — staying paused until it clears"
+                    "on startup — not paused, still under the hard-stop threshold"
                 )
     except Exception as e:
         log.warning(f"Failed to preload rate_limits from DB (non-fatal): {e}")
 
-def is_rate_limit_paused(agent: str) -> bool:
-    """True if this agent's most recent known rate-limit status is
-    Anthropic's own 'warning' state for the current five-hour window, OR
-    its utilization has independently crossed RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
-    (added 2026-08-08 per Ian). Status is checked first and short-circuits —
-    it's a cheap dict-equality check that covers the common case, so the
-    utilization comparison only runs when status alone doesn't already
-    answer it. Empty/missing info (e.g. right after a startup with nothing
-    yet loaded from the DB and no turn completed) is NOT paused by
-    default — _load_rate_limits_from_db() is what covers the
-    restart-mid-warning case, this function just reads whatever's
-    currently known."""
+def is_rate_limit_warning(agent: str) -> bool:
+    """True once this agent is in the warning zone — Anthropic's own
+    'allowed_warning' status (whatever window it's for; unlike the hard
+    stop below, the warning doesn't care about rateLimitType, since it's
+    not blocking anything) OR utilization has crossed
+    RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD (0.90) on its own. Logged
+    and notified (see _notify_rate_limit_warning) but never holds the
+    queue — see is_rate_limit_paused() for the actual hard stop."""
     info = agent_rate_limits.get(agent, {})
-    # 2026-08-08 fix: only Anthropic's five-hour warning gets the hard
-    # pause — it self-heals within hours. The weekly (seven_day) window
-    # also reports "allowed_warning" but its resetsAt can be days out;
-    # treating it the same way as five_hour held the real message queue
-    # closed for ~2 days (Marvin + relay both stuck on rate_limit_type
-    # "seven_day" until 2026-08-10). The utilization backstop below still
-    # applies to either window, since that's about actual spend, not
-    # which window reported the warning.
-    if info.get("status") == RATE_LIMIT_PAUSE_STATUS and info.get("rateLimitType") == "five_hour":
+    if info.get("status") in (RATE_LIMIT_PAUSE_STATUS, RATE_LIMIT_REJECTED_STATUS):
         return True
-    return info.get("utilization", 0) >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
+    return (info.get("utilization") or 0) >= RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD
+
+def is_rate_limit_paused(agent: str) -> bool:
+    """True if status=="rejected" (Anthropic already denied a request —
+    stronger than a warning, hard-pause immediately, don't wait on
+    utilization) OR utilization has crossed
+    RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD (0.97). Deliberately NOT keyed
+    off 'allowed_warning' alone (see is_rate_limit_warning() for that
+    signal) — Anthropic sets that status around 90% utilization, which
+    jammed a real session with plenty of window left (2026-08-08, Ian:
+    'we shouldn't stop work just at 90%'). Empty/missing info (e.g. right
+    after a startup with nothing yet loaded from the DB and no turn
+    completed) is NOT paused by default."""
+    info = agent_rate_limits.get(agent, {})
+    if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
+        return True
+    return (info.get("utilization") or 0) >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
 
 async def _notify_rate_limit_pause(agent: str, paused: bool) -> None:
     """Best-effort #signals notice on entering/leaving a rate-limit
@@ -633,17 +688,48 @@ async def _notify_rate_limit_pause(agent: str, paused: bool) -> None:
                 datetime.fromtimestamp(resets).strftime("%H:%M UTC")
                 if isinstance(resets, (int, float)) else "an unknown time"
             )
+            info = agent_rate_limits.get(agent, {})
+            if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
+                reason = "a request was already rejected by Anthropic"
+            else:
+                utilization = info.get("utilization") or 0
+                reason = f"utilization hit {utilization:.0%} (threshold {RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:.0%})"
             msg = (
-                f"-# ⏸️ {agent} paused — five-hour rate limit hit its warning "
-                f"threshold, holding new messages to avoid overage spend. "
-                f"Resumes automatically around {resets_str}, or sooner if the "
-                f"status clears early."
+                f"-# ⏸️ {agent} paused — rate limit {reason}, "
+                f"holding new messages to avoid overage spend. "
+                f"Resumes automatically around {resets_str}, or sooner if the status clears."
             )
         else:
             msg = f"-# ▶️ {agent} resumed — rate limit back to normal, processing queued messages again."
         await post_to_discord(agent, signals_channel, msg)
     except Exception as e:
         log.warning(f"Rate-limit pause/resume notice failed (non-fatal): {e}")
+
+async def _notify_rate_limit_warning(agent: str, warning: bool) -> None:
+    """Best-effort #signals notice on entering/leaving the (non-blocking)
+    rate-limit warning zone — added 2026-08-08 alongside splitting warning
+    from hard-pause (see is_rate_limit_warning() / is_rate_limit_paused()).
+    Mirrors _notify_rate_limit_pause's fire-and-forget pattern but never
+    implies the queue is held, since this zone doesn't hold it."""
+    try:
+        signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+        if not signals_channel:
+            return
+        if warning:
+            info = agent_rate_limits.get(agent, {})
+            utilization = info.get("utilization") or 0
+            status = info.get("status")
+            msg = (
+                f"-# ⚠️ {agent} rate limit warning — "
+                f"{f'{utilization:.0%} utilization' if utilization else f'status={status}'}, "
+                f"still processing messages normally. Hard pause at "
+                f"{RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:.0%} utilization."
+            )
+        else:
+            msg = f"-# {agent} rate limit warning cleared — back under {RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD:.0%}."
+        await post_to_discord(agent, signals_channel, msg)
+    except Exception as e:
+        log.warning(f"Rate-limit warning notice failed (non-fatal): {e}")
 
 async def compact_session(agent: str, reason: str) -> bool:
     """Shared compaction action — finalize (summarize-session.py writes a
@@ -715,7 +801,7 @@ async def maybe_rate_limit_compact(agent: str, already_compacted: bool) -> bool:
     a second finalize+restart back to back."""
     if already_compacted:
         return False
-    utilization = agent_rate_limits.get(agent, {}).get("utilization", 0)
+    utilization = agent_rate_limits.get(agent, {}).get("utilization") or 0
     if utilization < RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:
         return False
 
@@ -1822,6 +1908,16 @@ async def process_agent_queue(agent: str):
                 agent_rate_limit_pause_notified[agent] = False
                 log.info(f"{agent} resumed — rate limit back to normal")
                 asyncio.create_task(_notify_rate_limit_pause(agent, paused=False))
+
+            if is_rate_limit_warning(agent):
+                if not agent_rate_limit_warning_notified.get(agent):
+                    agent_rate_limit_warning_notified[agent] = True
+                    log.warning(f"{agent} rate limit in warning zone (not paused, still under {RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:.0%})")
+                    asyncio.create_task(_notify_rate_limit_warning(agent, warning=True))
+            elif agent_rate_limit_warning_notified.get(agent):
+                agent_rate_limit_warning_notified[agent] = False
+                log.info(f"{agent} rate limit warning cleared")
+                asyncio.create_task(_notify_rate_limit_warning(agent, warning=False))
 
             # Get pending messages
             async with db.execute(

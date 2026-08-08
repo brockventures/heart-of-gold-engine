@@ -26,16 +26,17 @@ def agent_server():
 # observed live (see memory fact ratelimit-freeze-2026-08-07: status,
 # utilization, overageInUse, surpassedThreshold, isUsingOverage, resetsAt).
 #
-# 2026-08-08 update: status=="allowed_warning" only hard-pauses when
-# rateLimitType=="five_hour" — that window self-heals within hours. The
-# weekly (seven_day) window also reports allowed_warning but its resetsAt
-# can be days out; treating it the same held Marvin+relay's real queues
-# shut for ~2 days (see facts/ around 2026-08-08, commit 3fac226). The
-# utilization backstop is unaffected — it's about actual spend, not which
-# window reported the warning.
+# 2026-08-08 update (second revision, per Ian): status=="allowed_warning"
+# used to hard-pause on its own for rateLimitType=="five_hour". Anthropic
+# sets that status around 90% utilization, which jammed a real session
+# with plenty of window left — "we shouldn't stop work just at 90%".
+# status is now ONLY a warning signal (is_rate_limit_warning) with no
+# blocking effect; is_rate_limit_paused is the sole hard stop and is
+# utilization-only, threshold 0.97, regardless of status or window type.
 @pytest.mark.parametrize("label,info,expected", [
     ("healthy", {"status": "allowed", "utilization": 0.42}, False),
-    ("five_hour warning", {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.91}, True),
+    ("five_hour warning alone does NOT hard-pause anymore",
+     {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.91}, False),
     ("seven_day warning does NOT hard-pause",
      {"status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 0.77}, False),
     ("warning with no rateLimitType at all does NOT hard-pause",
@@ -44,7 +45,9 @@ def agent_server():
      {"status": "allowed", "utilization": 0.985, "overageInUse": True}, True),
     ("exactly at the utilization threshold", {"status": "allowed", "utilization": 0.97}, True),
     ("just under the utilization threshold", {"status": "allowed", "utilization": 0.969999}, False),
-    ("seven_day warning past utilization threshold still pauses on utilization backstop",
+    ("five_hour warning past utilization threshold pauses on utilization",
+     {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.99}, True),
+    ("seven_day warning past utilization threshold pauses on utilization",
      {"status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 0.99}, True),
     ("empty/missing info (e.g. right after startup)", {}, False),
 ])
@@ -53,14 +56,63 @@ def test_is_rate_limit_paused(agent_server, label, info, expected):
     assert agent_server.is_rate_limit_paused("TestAgent") is expected, label
 
 
-def test_status_checked_before_utilization(agent_server):
-    """Ian's ask (2026-08-08): check status first since it's the cheap
-    common-case short-circuit. Can't observe order directly on a dict
-    lookup, but we can confirm a five_hour warning alone is sufficient to
-    pause even when utilization is missing/low — proving the utilization
-    branch isn't a hard requirement, i.e. it's an OR, and status is
-    evaluated without needing utilization to be present at all."""
-    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed_warning", "rateLimitType": "five_hour"}
+@pytest.mark.parametrize("label,info,expected", [
+    ("healthy, well under warning", {"status": "allowed", "utilization": 0.42}, False),
+    ("anthropic status flag alone warns", {"status": "allowed_warning", "utilization": 0.5}, True),
+    ("utilization alone crosses 90%", {"status": "allowed", "utilization": 0.91}, True),
+    ("just under the warning threshold", {"status": "allowed", "utilization": 0.899999}, False),
+    ("in warning zone but nowhere near the hard stop",
+     {"status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 0.5}, True),
+    ("empty/missing info", {}, False),
+])
+def test_is_rate_limit_warning(agent_server, label, info, expected):
+    agent_server.agent_rate_limits["TestAgent"] = info
+    assert agent_server.is_rate_limit_warning("TestAgent") is expected, label
+
+
+def test_warning_does_not_imply_paused(agent_server):
+    """Core of the 2026-08-08 fix: crossing Anthropic's ~90% warning
+    status must NOT hold the queue by itself. Only the 97% utilization
+    threshold does."""
+    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.91}
+    assert agent_server.is_rate_limit_warning("TestAgent") is True
+    assert agent_server.is_rate_limit_paused("TestAgent") is False
+
+
+def test_utilization_key_present_but_none_does_not_crash(agent_server):
+    """Regression for the 2026-08-08 deploy: dict.get(key, default) only
+    applies the default when the key is ABSENT, not when it's present
+    with value None. A DB row restored right after the utilization
+    column migration (or before any live event has populated it) has
+    exactly this shape and briefly took down check_queued_acks() /
+    process_agent_queue() with 'None >= float' on the first restart after
+    this fix shipped. Must resolve to falsy, not raise."""
+    agent_server.agent_rate_limits["TestAgent"] = {"status": "allowed", "utilization": None}
+    assert agent_server.is_rate_limit_warning("TestAgent") is False
+    assert agent_server.is_rate_limit_paused("TestAgent") is False
+
+
+def test_rejected_status_hard_pauses_even_without_utilization(agent_server):
+    """Live 2026-08-08: Marvin and relay both hit status=="rejected" right
+    at the tail of a five_hour window, with utilization absent from the
+    payload both times (confirmed against Anthropic's own CLI schema —
+    utilization is optional and often missing). "rejected" means a
+    request was ALREADY denied — stronger than "allowed_warning" — so it
+    must hard-pause on its own, not rely on a utilization number that
+    frequently isn't there."""
+    agent_server.agent_rate_limits["TestAgent"] = {
+        "status": "rejected", "rateLimitType": "five_hour",
+        "overageStatus": "rejected", "isUsingOverage": False,
+    }
+    assert agent_server.is_rate_limit_warning("TestAgent") is True
+    assert agent_server.is_rate_limit_paused("TestAgent") is True
+
+
+def test_rejected_status_pauses_regardless_of_low_utilization(agent_server):
+    """Even if a stray/incorrect low utilization number ever showed up
+    alongside a rejection, the rejection itself is definitive — it must
+    still pause."""
+    agent_server.agent_rate_limits["TestAgent"] = {"status": "rejected", "utilization": 0.1}
     assert agent_server.is_rate_limit_paused("TestAgent") is True
 
 
