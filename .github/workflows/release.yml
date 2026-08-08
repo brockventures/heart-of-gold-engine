@@ -72,7 +72,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/mcarmody/karakos
+          images: ghcr.io/iacoley/karakos-package
           tags: |
             type=semver,pattern=v{{major}}.{{minor}},value=${{ steps.version.outputs.value }}
             type=semver,pattern=v{{major}},value=${{ steps.version.outputs.value }}
@@ -114,7 +114,7 @@ jobs:
         run: |
           # Pull the freshly-published image by digest to ensure we test the
           # artifact we just pushed, not a cached layer from a previous release.
-          IMAGE="ghcr.io/mcarmody/karakos@${{ needs.build-push.outputs.image_digest }}"
+          IMAGE="ghcr.io/iacoley/karakos-package@${{ needs.build-push.outputs.image_digest }}"
           docker pull --platform ${{ matrix.platform }} "$IMAGE"
 
           # Verify dashboard was built into the image
