@@ -14,7 +14,10 @@ export async function GET(request: NextRequest) {
     const agents = Object.entries(status).map(([name, info]: [string, any]) => ({
       name,
       state: info.state || "UNKNOWN",
-      messages_processed: 0, // Not tracked in /status
+      messages_processed: info.messages_processed ?? 0,
+      // Not tracked server-side yet -- agent-server.py doesn't record a
+      // session start timestamp anywhere. Left undefined rather than
+      // guessed; agents/page.tsx already treats this as optional.
       session_age_seconds: undefined,
       token_usage: info.input_tokens
         ? { input: info.input_tokens, output: 0 }

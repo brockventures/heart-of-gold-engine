@@ -6,7 +6,14 @@ import remarkGfm from "remark-gfm";
 import { usePoll } from "@/lib/hooks";
 
 interface AgentList {
-  agents: Record<string, { state: string }>;
+  // Matches /api/agents' real shape (see dashboard/app/agents/page.tsx,
+  // which already consumes this correctly) -- an array, not a dict keyed
+  // by name. This was previously typed as Record<string, {state}> and
+  // read via Object.keys(agentData.agents), which on an array yields
+  // numeric indices ("0", "1", ...) instead of agent names. Combined
+  // with /api/agents 500ing outright (see agent-server.py's /status
+  // fix), the agent dropdown here never had a chance to populate.
+  agents: { name: string; state: string }[];
 }
 
 interface ChatMessage {
@@ -29,7 +36,7 @@ export default function ChatPage() {
   const messagesEnd = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const agents = agentData?.agents ? Object.keys(agentData.agents) : [];
+  const agents = agentData?.agents ? agentData.agents.map((a) => a.name) : [];
 
   // Set default agent
   useEffect(() => {
