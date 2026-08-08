@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export WORKSPACE_ROOT=/workspace
+export WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 
 # Validate required environment variables
 required_vars=("DASHBOARD_PORT" "AGENT_SERVER_TOKEN")
