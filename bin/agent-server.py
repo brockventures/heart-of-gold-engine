@@ -1144,18 +1144,21 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
 
     chunks = split_discord_message(content)
     last_msg_id = None
+    failed = 0
 
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
         payload = {"content": chunk}
         # Only reply-reference the first chunk
         if reply_to and last_msg_id is None:
             payload["message_reference"] = {"message_id": reply_to}
 
+        posted = False
         try:
             async with http_session.post(url, headers=headers, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     last_msg_id = data.get("id")
+                    posted = True
                 elif resp.status == 429:
                     retry_after = (await resp.json()).get("retry_after", 1)
                     log.warning(f"Rate limited posting to {channel_id}, retry after {retry_after}s")
@@ -1165,10 +1168,35 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
                         if retry_resp.status == 200:
                             data = await retry_resp.json()
                             last_msg_id = data.get("id")
+                            posted = True
+                        else:
+                            log.error(
+                                f"Discord API error {retry_resp.status} on chunk "
+                                f"{idx + 1}/{len(chunks)} ({len(chunk)} chars) after "
+                                f"rate-limit retry: {await retry_resp.text()}"
+                            )
                 else:
-                    log.error(f"Discord API error {resp.status}: {await resp.text()}")
+                    log.error(
+                        f"Discord API error {resp.status} on chunk "
+                        f"{idx + 1}/{len(chunks)} ({len(chunk)} chars): "
+                        f"{await resp.text()}"
+                    )
         except Exception as e:
-            log.error(f"Error posting to Discord: {e}")
+            log.error(f"Error posting chunk {idx + 1}/{len(chunks)} to Discord: {e}")
+
+        if not posted:
+            failed += 1
+
+    # A chunk that never landed is a piece of the reply the user will never
+    # see. Returning the id of a sibling chunk reports the whole message as
+    # delivered and the loss goes unnoticed — which is how two replies
+    # vanished silently before this was caught.
+    if failed:
+        log.error(
+            f"post_to_discord: {failed} of {len(chunks)} chunk(s) failed for "
+            f"{agent} in {channel_id}; message is incomplete"
+        )
+        return None
 
     return last_msg_id
 
