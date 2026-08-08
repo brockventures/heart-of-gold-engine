@@ -138,13 +138,25 @@ TOPIC_CHECK_MIN_TOKENS = 20_000
 # both agents sat at 99% utilization / overageInUse=true from ~08:19 to
 # 12:39, and the only "fix" was Ian manually telling Marvin to go quiet
 # until the five-hour window reset, because nothing here actually gated
-# on the rate_limit_event data already being recorded. Deliberately
-# keyed off Anthropic's own "allowed_warning" status (their
-# surpassedThreshold, typically 90%) rather than us picking our own
-# utilization cutoff — see is_rate_limit_paused(). Since the cost-model
-# migration removed the $/day cap, there's no other backstop against
-# burning overage dollars.
+# on the rate_limit_event data already being recorded. Originally keyed
+# solely off Anthropic's own "allowed_warning" status (their
+# surpassedThreshold, typically 90%) rather than a locally-chosen
+# utilization cutoff. 2026-08-08 per Ian: added an explicit utilization
+# threshold too (RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD below) — status is
+# still checked first in is_rate_limit_paused() since it's the cheaper
+# check and covers the common case. Since the cost-model migration
+# removed the $/day cap, there's no other backstop against burning
+# overage dollars.
 RATE_LIMIT_PAUSE_STATUS = "allowed_warning"
+# Second pause trigger, added 2026-08-08 per Ian: an explicit utilization
+# cutoff alongside the status check above (not instead of it — checking
+# `status == RATE_LIMIT_PAUSE_STATUS` first in is_rate_limit_paused() is a
+# cheap dict-equality check that covers the common case, so utilization is
+# only inspected when that misses). Also the trigger point for proactive
+# wind-down/compaction (see maybe_rate_limit_compact()) so a session
+# summarizes itself before the pause actually holds the queue, rather than
+# freezing mid-thought.
+RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD = 0.97
 # Heartbeats (poke.sh --source heartbeat, see heartbeat.sh) are exempted
 # from the pause below (2026-08-07, per Ian/Moon Problem): the pause trips
 # at Anthropic's own warning threshold, well short of 100%, so there's
@@ -582,14 +594,20 @@ async def _load_rate_limits_from_db() -> None:
 
 def is_rate_limit_paused(agent: str) -> bool:
     """True if this agent's most recent known rate-limit status is
-    Anthropic's own 'warning' state for the current five-hour window —
-    see RATE_LIMIT_PAUSE_STATUS above for why this is keyed off their
-    status field rather than a locally-chosen utilization cutoff. Empty/
-    missing info (e.g. right after a startup with nothing yet loaded
-    from the DB and no turn completed) is NOT paused by default —
-    _load_rate_limits_from_db() is what covers the restart-mid-warning
-    case, this function just reads whatever's currently known."""
-    return agent_rate_limits.get(agent, {}).get("status") == RATE_LIMIT_PAUSE_STATUS
+    Anthropic's own 'warning' state for the current five-hour window, OR
+    its utilization has independently crossed RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
+    (added 2026-08-08 per Ian). Status is checked first and short-circuits —
+    it's a cheap dict-equality check that covers the common case, so the
+    utilization comparison only runs when status alone doesn't already
+    answer it. Empty/missing info (e.g. right after a startup with nothing
+    yet loaded from the DB and no turn completed) is NOT paused by
+    default — _load_rate_limits_from_db() is what covers the
+    restart-mid-warning case, this function just reads whatever's
+    currently known."""
+    info = agent_rate_limits.get(agent, {})
+    if info.get("status") == RATE_LIMIT_PAUSE_STATUS:
+        return True
+    return info.get("utilization", 0) >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
 
 async def _notify_rate_limit_pause(agent: str, paused: bool) -> None:
     """Best-effort #signals notice on entering/leaving a rate-limit
@@ -676,6 +694,27 @@ async def maybe_compact_session(agent: str, metadata: Dict[str, Any]) -> bool:
         f"{COMPACTION_TARGET_TOKENS:,}-token soft target — compacting"
     )
     return await compact_session(agent, reason="token target")
+
+async def maybe_rate_limit_compact(agent: str, already_compacted: bool) -> bool:
+    """Third compaction trigger, added 2026-08-08 per Ian — proactive
+    wind-down/summarize once utilization crosses
+    RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD, the same mark
+    is_rate_limit_paused() uses to hold the queue. Point is to summarize
+    ahead of the pause so a session doesn't get frozen mid-thought once
+    the queue actually stops draining. Skipped if an earlier trigger this
+    turn (maybe_compact_session) already compacted — no point paying for
+    a second finalize+restart back to back."""
+    if already_compacted:
+        return False
+    utilization = agent_rate_limits.get(agent, {}).get("utilization", 0)
+    if utilization < RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:
+        return False
+
+    log.warning(
+        f"{agent} rate-limit utilization {utilization:.0%} crossed the "
+        f"{RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:.0%} mark — compacting ahead of the pause"
+    )
+    return await compact_session(agent, reason="rate-limit utilization")
 
 async def classify_topic_change(previous_text: str, new_text: str) -> Optional[bool]:
     """Cheap same-topic/different-topic classifier for
@@ -1706,9 +1745,25 @@ async def check_queued_acks():
             if not current or current["processed"] != STATUS_QUEUED:
                 continue
 
+            # Per Ian (#general 2026-08-08 07:46:31): a generic ack reads
+            # as evasive when the real reason is known — e.g. paused for
+            # the rate-limit warning zone can sit for hours, which is a
+            # very different wait than an ordinary busy turn. Surface the
+            # actual cause when we have one; fall back to the old generic
+            # copy only when it's just normal turn-processing.
+            if is_rate_limit_paused(agent):
+                resets_at = agent_rate_limits.get(agent, {}).get("resetsAt")
+                if resets_at:
+                    reset_str = datetime.utcfromtimestamp(resets_at).strftime("%H:%M UTC")
+                    reason = f"paused — five-hour rate limit window in the warning zone, resumes ~{reset_str}"
+                else:
+                    reason = "paused — five-hour rate limit window in the warning zone"
+            else:
+                reason = "finishing up elsewhere, will get to this shortly"
+
             await post_to_discord(
                 agent, channel_id,
-                "-# ⏳ queued — finishing up elsewhere, will get to this shortly"
+                f"-# ⏳ queued — {reason}"
             )
             channel_last_ack[channel_id] = now
 
@@ -1976,6 +2031,7 @@ async def process_agent_queue(agent: str):
     # against.
     if metadata:
         compacted = await maybe_compact_session(agent, metadata)
+        compacted = await maybe_rate_limit_compact(agent, already_compacted=compacted) or compacted
         await maybe_topic_change_compact(agent, channel_id, formatted_content, metadata, already_compacted=compacted)
 
 # =============================================================================
