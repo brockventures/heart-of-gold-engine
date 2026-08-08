@@ -1,6 +1,6 @@
 services:
   karakos:
-    image: ghcr.io/iacoley/karakos-package:${KARAKOS_VERSION:-latest}
+    image: ghcr.io/mcarmody/karakos:latest
     env_file: .env
     volumes:
       # Bind-mount config + agents from the host so setup.sh's output (the
