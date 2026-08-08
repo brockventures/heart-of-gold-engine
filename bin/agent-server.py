@@ -573,7 +573,7 @@ async def _load_rate_limits_from_db() -> None:
     try:
         now = time.time()
         async with db.execute(
-            "SELECT agent, status, resets_at FROM rate_limits"
+            "SELECT agent, status, rate_limit_type, resets_at FROM rate_limits"
         ) as cursor:
             rows = await cursor.fetchall()
         for row in rows:
@@ -582,9 +582,10 @@ async def _load_rate_limits_from_db() -> None:
                 continue  # stale — window already over, let a live event set this
             agent_rate_limits[row["agent"]] = {
                 "status": row["status"],
+                "rateLimitType": row["rate_limit_type"],
                 "resetsAt": resets_at,
             }
-            if row["status"] == RATE_LIMIT_PAUSE_STATUS:
+            if row["status"] == RATE_LIMIT_PAUSE_STATUS and row["rate_limit_type"] == "five_hour":
                 log.warning(
                     f"{row['agent']} restored rate-limit warning state from DB "
                     "on startup — staying paused until it clears"
@@ -605,7 +606,15 @@ def is_rate_limit_paused(agent: str) -> bool:
     restart-mid-warning case, this function just reads whatever's
     currently known."""
     info = agent_rate_limits.get(agent, {})
-    if info.get("status") == RATE_LIMIT_PAUSE_STATUS:
+    # 2026-08-08 fix: only Anthropic's five-hour warning gets the hard
+    # pause — it self-heals within hours. The weekly (seven_day) window
+    # also reports "allowed_warning" but its resetsAt can be days out;
+    # treating it the same way as five_hour held the real message queue
+    # closed for ~2 days (Marvin + relay both stuck on rate_limit_type
+    # "seven_day" until 2026-08-10). The utilization backstop below still
+    # applies to either window, since that's about actual spend, not
+    # which window reported the warning.
+    if info.get("status") == RATE_LIMIT_PAUSE_STATUS and info.get("rateLimitType") == "five_hour":
         return True
     return info.get("utilization", 0) >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
 
