@@ -1,24 +1,32 @@
-# Karakos
+# Heart of Gold
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docker Required](https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Internal Use Only](https://img.shields.io/badge/access-private%2Finternal-red.svg)]()
 [![Anthropic Claude](https://img.shields.io/badge/Powered_by-Claude-orange)](https://www.anthropic.com/claude)
 
-A self-contained, installable multi-agent household assistant system powered by Claude.
+**This is not the Karakos package.** This is `iacoley`'s private install
+repo for a running Karakos instance — config, agent memory, and deployment
+state for the "Heart of Gold" household system. It is not installable by
+anyone else and is not meant to be; there is no public setup flow here.
 
-## Install
+- **The actual software** lives upstream at
+  [mcarmody/karakos-package](https://github.com/mcarmody/karakos-package)
+  (public, MIT). This repo's deployment pulls the prebuilt image
+  `ghcr.io/mcarmody/karakos:latest` from there — it does not build from
+  the `Dockerfile` in this tree.
+- **What's actually unique to this repo**: `config/` (this install's
+  Discord server/channel wiring, `.env`), `agents/*/memory/` (this
+  instance's episodic memory and facts), and deployment-specific files
+  like `config/docker-compose.yml`'s image pin.
+- **What's a stale/drifted copy of the package**: `bin/`, `dashboard/`,
+  and most everything else — carried over from when this repo was a fork
+  of `karakos-package` rather than a clean install-only repo. Some of it
+  has local bug fixes not yet upstreamed; some of it is just behind. Not
+  authoritative — treat `mcarmody/karakos-package` as the source of truth
+  for anything that isn't config or memory.
 
-**Linux / macOS** — one command:
-```bash
-curl -fsSL https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.sh | bash
-```
-
-**Windows** — one command (PowerShell as admin):
-```powershell
-irm https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.ps1 | iex
-```
-
-The installer handles prerequisites (Docker, Git, jq), clones the repo, runs the setup wizard, pulls the prebuilt image from GHCR, and starts the system. Open http://localhost:3000 when it's done.
+If you're trying to install Karakos for your own use, go to
+[mcarmody/karakos-package](https://github.com/mcarmody/karakos-package)
+instead — see its README for the install command.
 
 ## What is Karakos?
 
@@ -95,12 +103,19 @@ Karakos consists of:
 
 ## License
 
-MIT
+Inherited MIT license from upstream `karakos-package` for the software
+itself. This repo (config, memory, deployment state) is private and not
+licensed for reuse.
 
 ## Contributing
 
-Contributions welcome! Please open an issue or pull request on GitHub.
+This is a private install repo, not accepting outside contributions.
+Bugs found here that trace back to the actual package should be reported
+or PR'd against
+[mcarmody/karakos-package](https://github.com/mcarmody/karakos-package)
+instead — see `agents/Marvin/memory/facts/` for ones already flagged
+upstream.
 
 ---
 
-Built with [Claude Code](https://claude.ai/claude-code) (Anthropic).
+Maintained by Marvin, an instance of [Claude Code](https://claude.ai/claude-code) (Anthropic), on behalf of `iacoley`.
