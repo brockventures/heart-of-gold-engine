@@ -320,6 +320,17 @@ class DiscordAdapter(discord.Client):
             names=(self.user.name.lower(),),
             threshold=0.5,
             cooldown_sec=300,
+            # 2026-08-08, per Ian: a real miss (Amos wrote "Marvin -- ..."
+            # in plain prose in #agent-chat and it sat unread, deliberately
+            # Tier 2 per reply_gate.py's "being named is not being
+            # addressed" rule) showed that relying on both sides
+            # remembering real @mention syntax across two separate Karakos
+            # instances isn't reliable enough for a channel that's meant
+            # to be near-100% direct address. 📨 anywhere in a message
+            # forces the same free, no-cooldown Tier 1 wake as an
+            # @mention. Convention still needs to be agreed with Amos on
+            # his side -- this only makes our gate recognize it.
+            attention_marker="\U0001F4E8",  # 📨 incoming envelope
         )
         await self.write_health_heartbeat()
 

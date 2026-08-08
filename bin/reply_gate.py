@@ -79,12 +79,26 @@ class ReplyGate:
         names: Iterable[str] = (),
         threshold: float = 0.5,
         cooldown_sec: float = 300.0,
+        attention_marker: Optional[str] = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.self_id = str(self_id)
         self.threshold = threshold
         self.cooldown_sec = cooldown_sec
         self._clock = clock
+        # Attention marker (2026-08-08, per Ian): a channel-agreed literal
+        # (e.g. an emoji unlikely to appear in ordinary technical prose)
+        # that forces Tier 1 exactly like an @mention, without needing a
+        # real Discord mention or the full handoff.py envelope. Added after
+        # a real miss -- Amos wrote "Marvin -- ..." in plain prose (a bare
+        # name, deliberately Tier 2 per the docstring above) and it sat
+        # unread. A real @mention already solves this, but relies on both
+        # sides remembering to type <@id> instead of a name every time; a
+        # single agreed glyph is cheaper to get right consistently than
+        # remembering Discord mention syntax, especially across two
+        # separate Karakos instances that don't share code. None disables
+        # it (default) -- existing deployments/tests are unaffected.
+        self.attention_marker = attention_marker
         self._name_re = (
             re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\b", re.I)
             if names else None
@@ -100,10 +114,16 @@ class ReplyGate:
         if str(msg.author_id) == self.self_id:
             return Decision(False, "self", "own message", channel_id=msg.channel_id)
 
-        if msg.mentions_self or msg.is_reply_to_self:
+        has_marker = bool(self.attention_marker) and self.attention_marker in (msg.content or "")
+
+        if msg.mentions_self or msg.is_reply_to_self or has_marker:
+            reason = (
+                "@mention" if msg.mentions_self else
+                "reply to you" if msg.is_reply_to_self else
+                "attention marker"
+            )
             return Decision(
-                True, "tier1",
-                "@mention" if msg.mentions_self else "reply to you",
+                True, "tier1", reason,
                 named=named, channel_id=msg.channel_id,
             )
 
@@ -212,6 +232,18 @@ def _selftest() -> int:
     g.note_human_message("c1")
     check("a human resets the cooldown",
           g.evaluate(M(content="ambient again")).needs_score, True)
+
+    g_marker = ReplyGate(self_id="me", names=("marvin",), cooldown_sec=300,
+                          attention_marker="\U0001F4E8", clock=lambda: t["now"])
+    check("attention marker wakes without a real @mention",
+          g_marker.evaluate(M(content="\U0001F4E8 marvin, need this today")).wake, True)
+    check("attention marker ignores the cooldown, like @mention",
+          g_marker.evaluate(M(content="ambient")).needs_score, True)
+    g_marker.resolve(g_marker.evaluate(M(content="ambient")), 0.9)  # start a cooldown
+    check("marker still wakes during an active cooldown",
+          g_marker.evaluate(M(content="\U0001F4E8 urgent")).wake, True)
+    check("no marker configured means plain prose never force-wakes",
+          g.evaluate(M(content="\U0001F4E8 marvin, need this today")).wake, False)
 
     d4 = g.evaluate(GateMessage(channel_id="c2", author_id="them", content="other room"))
     check("cooldown is per-channel", d4.needs_score, True)
