@@ -132,6 +132,25 @@ def run_friction_sensor():
     except subprocess.CalledProcessError as e:
         log.error(f"Friction sensor failed: {e.stderr}")
 
+def run_outbox_flush():
+    """Deliver any messages queued via bin/outbox.py to channels outside
+    the turn that queued them. Fix for 'Marvin knows he owes a channel a
+    message but has no turn scoped there to send it' (2026-08-08) — see
+    bin/outbox.py docstring for the full incident. Runs every minute so a
+    queued relay lands within a minute instead of waiting on the next
+    turn that happens to be routed correctly."""
+    try:
+        result = subprocess.run(
+            ["python3", f"{WORKSPACE_ROOT}/bin/outbox.py", "flush"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        if result.stdout.strip() and "Nothing to deliver" not in result.stdout:
+            log.info(f"Outbox flush: {result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        log.error(f"Outbox flush failed: {e.stderr}")
+
 def check_updates():
     """Check for Karakos updates"""
     log.info("Checking for updates")
@@ -190,6 +209,7 @@ def main():
     schedule.every().day.at("04:00").do(run_health_monitor)
     schedule.every().day.at("04:30").do(purge_old_data)
     schedule.every().monday.at("05:00").do(check_updates)  # Weekly update check
+    schedule.every(1).minutes.do(run_outbox_flush)
 
     log.info("Scheduler configured, entering main loop")
 
