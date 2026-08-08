@@ -86,6 +86,15 @@ if [ -f "$WORKSPACE_ROOT/system/check-protected-paths.py" ]; then
     chmod +x "$WORKSPACE_ROOT/.git/hooks/pre-commit" 2>/dev/null || true
 fi
 
+# Install auto-reload-on-commit git hook (2026-08-08) — bounces
+# relay/scheduler when a commit changes the files that govern their
+# behavior, so a landed commit can't silently diverge from what's
+# actually running. See system/reload-on-commit.py.
+if [ -f "$WORKSPACE_ROOT/system/reload-on-commit.py" ]; then
+    cp "$WORKSPACE_ROOT/system/install-post-commit-hook.sh" "$WORKSPACE_ROOT/.git/hooks/post-commit" 2>/dev/null || true
+    chmod +x "$WORKSPACE_ROOT/.git/hooks/post-commit" 2>/dev/null || true
+fi
+
 # Register Discord slash commands so they show up in the guild's "/" picker
 # with no extra script to run and no documented follow-up step. Guild-scoped
 # (immediate) rather than global, and safe to re-run on every start -- the
