@@ -117,9 +117,12 @@ kind.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
+
+log = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"```handoff\s*\n(.*?)\n```", re.DOTALL)
 
@@ -169,12 +172,33 @@ def parse_handoff(content: str) -> Optional[Envelope]:
     if not isinstance(data, dict):
         return None
 
+    # reply and kind both fail the envelope open on an unrecognized value —
+    # but silently, they were indistinguishable from "no envelope at all,"
+    # which is the exact bug Amos found and fixed on his side 2026-08-09
+    # (his enum-drift logging covered `kind`, which drives nothing on his
+    # gate, but not `reply`, which drives everything). `reply` is the
+    # more load-bearing field here too — an unrecognized value (a typo, a
+    # future "deferred", a capitalization mismatch) means a sender who
+    # believes they declared reply:required or reply:none is silently
+    # getting the default gate instead, with no line to grep. Logged, not
+    # fixed differently — fail-open is still correct, a malformed field
+    # is a reason to fall through to the normal gate, never to drop the
+    # message. Only the silence was the bug.
     reply = data.get("reply")
     if reply not in VALID_REPLY:
+        log.warning(
+            f"handoff envelope: unrecognized reply={reply!r} — falling "
+            f"through as if no envelope present (reply is load-bearing; "
+            f"see kind check below)"
+        )
         return None
 
     kind = data.get("kind")
     if kind not in VALID_KINDS:
+        log.warning(
+            f"handoff envelope: unrecognized kind={kind!r} — falling "
+            f"through as if no envelope present"
+        )
         return None
 
     try:
@@ -256,6 +280,41 @@ def _selftest() -> int:
     check("unknown kind fails open (typo, not a new type)",
           parse_handoff('```handoff\n{"v":0,"kind":"observation","reply":"none"}\n```'), None)
     check("non-object json fails open", parse_handoff("```handoff\n[1,2,3]\n```"), None)
+
+    # -- 2026-08-09: an unrecognized reply/kind value must be LOGGED, not
+    # just silently degraded — Amos found the equivalent bug on his side
+    # (kind drift was logged, reply drift wasn't, and reply is the field
+    # that actually gates). Behaviour is unchanged (still fails open);
+    # only visibility is new.
+    import logging as _logging
+
+    class _CapturingHandler(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record.getMessage())
+
+    _cap = _CapturingHandler()
+    log.addHandler(_cap)
+    log.setLevel(_logging.WARNING)
+    try:
+        parse_handoff('```handoff\n{"v":0,"kind":"finding","reply":"deferred"}\n```')
+        check("unrecognized reply value logs a drift warning",
+              any("reply" in r and "deferred" in r for r in _cap.records), True)
+
+        _cap.records.clear()
+        parse_handoff('```handoff\n{"v":0,"kind":"telemetry","reply":"none"}\n```')
+        check("unrecognized kind value logs a drift warning",
+              any("kind" in r and "telemetry" in r for r in _cap.records), True)
+
+        _cap.records.clear()
+        parse_handoff("just plain prose")
+        check("no envelope present logs nothing (only known-but-invalid drifts)",
+              len(_cap.records), 0)
+    finally:
+        log.removeHandler(_cap)
 
     for k in ("finding", "question", "answer", "handoff", "correction", "status"):
         check(f"kind={k} accepted",
