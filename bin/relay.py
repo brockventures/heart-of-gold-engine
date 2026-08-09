@@ -547,6 +547,23 @@ class DiscordAdapter(discord.Client):
                     lines.append(line)
                 return "**/sys status**\n" + "\n".join(lines) if lines else "No agents found."
 
+            if cmd == "usage":
+                # Headroom is a whole-install question, not a per-agent
+                # one — every agent shares the same account's rate
+                # limit — so like status it runs ahead of target
+                # resolution rather than demanding one. Ported from
+                # mcarmody/karakos-package#128.
+                async with self.http_session.get(
+                    f"{AGENT_SERVER_URL}/usage", headers=headers
+                ) as resp:
+                    data = await resp.json()
+                agents = data.get("agents") or {}
+                if not agents:
+                    return "**/sys usage**: no agents configured."
+                lines = [f"`{name}` — {(agents[name] or {}).get('summary', 'no reading')}"
+                         for name in sorted(agents)]
+                return "**/sys usage**\n" + "\n".join(lines)
+
             if not agent:
                 return "**/sys**: no agent configured to target"
 
@@ -566,7 +583,7 @@ class DiscordAdapter(discord.Client):
                 return (f"**/sys reload** `{agent}`: "
                         f"{'done — session preserved' if ok else f'failed ({resp.status})'}")
 
-            return f"Unknown /sys command: `{cmd}`. Known: status, clear, reload"
+            return f"Unknown /sys command: `{cmd}`. Known: status, clear, reload, usage"
         except Exception as e:
             return f"**/sys {cmd}** failed: {e}"
 

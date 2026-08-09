@@ -187,6 +187,29 @@ RATE_LIMIT_HEARTBEAT_AUTHOR = "heartbeat"
 # QUEUED_ACK_SWEEP_INTERVAL_SEC above.
 RATE_LIMIT_GATE_SWEEP_INTERVAL_SEC = 60
 
+# Headroom tracking (2026-08-09, ported/adapted from
+# mcarmody/karakos-package#128) — `cost_events`/`/cost` track dollars;
+# dollars are not what stops an agent mid-sentence, the rate limit is,
+# and until now the only visibility into it was status/utilization
+# (above), which Amos's instance confirmed can be entirely absent from
+# the CLI's rate_limit_event (no utilization field at all, ever — see
+# the #agent-chat exchange 2026-08-08 23:38). Window *time* progress is
+# the one thing resetsAt always gives us even then, so it's tracked as
+# an independent, complementary signal — NOT a replacement for the
+# status/utilization checks above, and deliberately not its own table:
+# reuses the existing `rate_limits` row per agent (see
+# _record_rate_limit_event) rather than the parallel `rate_limit_state`
+# table upstream added, since every field it needs is already there.
+RATE_LIMIT_WINDOW_SECONDS = {
+    "five_hour": 5 * 3600,
+    "seven_day": 7 * 86400,
+}
+# Fraction of the window elapsed at which is_rate_limit_warning() also
+# fires (OR'd with the status/utilization checks it already does) — an
+# agent sitting near the end of its window with no utilization reading
+# at all (Amos's case) still gets a signal instead of none.
+RATE_LIMIT_WINDOW_PROGRESS_WARNING_FRACTION = 0.80
+
 # Processing states
 STATUS_QUEUED = 0
 STATUS_IN_PROGRESS = 1
@@ -658,18 +681,96 @@ async def _load_rate_limits_from_db() -> None:
     except Exception as e:
         log.warning(f"Failed to preload rate_limits from DB (non-fatal): {e}")
 
+def rate_limit_window_progress(info: Optional[Dict[str, Any]], now: Optional[float] = None) -> Optional[float]:
+    """Fraction (0.0-1.0) of the current rate-limit window that has elapsed.
+
+    Ported from mcarmody/karakos-package#128. Returns None when it cannot
+    be computed, which callers must render as "unknown" rather than as
+    0%. A missing resetsAt, an unrecognised rateLimitType, or a reset
+    time already in the past all land here — reporting any of them as
+    "0% used" would be the exact failure this feature exists to prevent
+    (a reassuring number standing in for no data), just dressed up as
+    output instead of silence.
+    """
+    if not isinstance(info, dict):
+        return None
+    resets_at = info.get("resetsAt")
+    window = RATE_LIMIT_WINDOW_SECONDS.get(info.get("rateLimitType"))
+    if not isinstance(resets_at, (int, float)) or not window:
+        return None
+
+    now = time.time() if now is None else now
+    remaining = resets_at - now
+    if remaining <= 0:
+        # The window is over; the next event will describe the new one.
+        return None
+    if remaining >= window:
+        return 0.0
+    return (window - remaining) / window
+
+
+def format_usage_report(agent: str, now: Optional[float] = None) -> str:
+    """Render an agent's current rate-limit headroom for a human — the
+    counterpart to cost-report.sh: that answers "what has this spent",
+    this answers "how close is it to being cut off", which is the number
+    that actually stops a turn mid-sentence. Never raises on a
+    partial/missing reading."""
+    info = agent_rate_limits.get(agent)
+    if not info:
+        return (
+            "No rate-limit reading yet — the CLI reports headroom in-band, "
+            "so this fills in the first time the agent takes a turn."
+        )
+
+    progress = rate_limit_window_progress(info, now=now)
+    window_name = (info.get("rateLimitType") or "unknown").replace("_", "-")
+    consumed = (
+        "window position unknown" if progress is None
+        else f"{progress * 100:.0f}% through the {window_name} window"
+    )
+    parts = [f"status `{info.get('status') or 'unknown'}` — {consumed}"]
+
+    resets_at = info.get("resetsAt")
+    if resets_at:
+        now = time.time() if now is None else now
+        remaining = int(resets_at - now)
+        if remaining > 0:
+            hours, minutes = divmod(remaining // 60, 60)
+            parts.append(f"resets in {hours}h{minutes:02d}m")
+        else:
+            parts.append("window has reset")
+
+    if info.get("isUsingOverage"):
+        parts.append("currently on overage")
+    elif info.get("overageStatus"):
+        parts.append(f"overage {info.get('overageStatus')}")
+
+    utilization = info.get("utilization")
+    if utilization is not None:
+        parts.append(f"{utilization * 100:.0f}% utilization")
+
+    return ", ".join(parts)
+
+
 def is_rate_limit_warning(agent: str) -> bool:
     """True once this agent is in the warning zone — Anthropic's own
     'allowed_warning' status (whatever window it's for; unlike the hard
     stop below, the warning doesn't care about rateLimitType, since it's
-    not blocking anything) OR utilization has crossed
-    RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD (0.90) on its own. Logged
-    and notified (see _notify_rate_limit_warning) but never holds the
-    queue — see is_rate_limit_paused() for the actual hard stop."""
+    not blocking anything), OR utilization has crossed
+    RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD (0.90) on its own, OR the
+    window is RATE_LIMIT_WINDOW_PROGRESS_WARNING_FRACTION (80%) through
+    its wall-clock life (2026-08-09 — a backstop for the case where
+    utilization is never present at all, confirmed live on Amos's
+    instance). Logged and notified (see _notify_rate_limit_warning) but
+    never holds the queue — see is_rate_limit_paused() for the actual
+    hard stop."""
     info = agent_rate_limits.get(agent, {})
     if info.get("status") in (RATE_LIMIT_PAUSE_STATUS, RATE_LIMIT_REJECTED_STATUS):
         return True
-    return (info.get("utilization") or 0) >= RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD
+    if (info.get("utilization") or 0) >= RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD:
+        return True
+    progress = rate_limit_window_progress(info)
+    return progress is not None and progress >= RATE_LIMIT_WINDOW_PROGRESS_WARNING_FRACTION
 
 def is_rate_limit_paused(agent: str) -> bool:
     """True if status=="rejected" (Anthropic already denied a request —
@@ -733,9 +834,22 @@ async def _notify_rate_limit_warning(agent: str, warning: bool) -> None:
             info = agent_rate_limits.get(agent, {})
             utilization = info.get("utilization") or 0
             status = info.get("status")
+            if utilization:
+                reason = f"{utilization:.0%} utilization"
+            elif status in (RATE_LIMIT_PAUSE_STATUS, RATE_LIMIT_REJECTED_STATUS):
+                reason = f"status={status}"
+            else:
+                # Neither utilization nor status crossed — must be the
+                # window-progress backstop (2026-08-09, see
+                # rate_limit_window_progress) firing on its own, the case
+                # Amos's instance hits with no utilization field at all.
+                progress = rate_limit_window_progress(info)
+                reason = (
+                    f"{progress:.0%} through the window" if progress is not None
+                    else f"status={status}"
+                )
             msg = (
-                f"-# ⚠️ {agent} rate limit warning — "
-                f"{f'{utilization:.0%} utilization' if utilization else f'status={status}'}, "
+                f"-# ⚠️ {agent} rate limit warning — {reason}, "
                 f"still processing messages normally. Hard pause at "
                 f"{RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:.0%} utilization."
             )
@@ -2693,6 +2807,40 @@ async def handle_cost_get(request):
         "session": agent_last_cost.get(agent, 0.0)
     })
 
+async def handle_usage(request):
+    """GET /usage - rate-limit headroom for every agent.
+
+    Ported from mcarmody/karakos-package#128. The counterpart to /cost:
+    /cost answers "what has this spent", this answers "how close is it
+    to being cut off", which is the number that actually stops a turn
+    mid-sentence. Reads the same in-memory agent_rate_limits dict
+    is_rate_limit_warning()/is_rate_limit_paused() already use — see
+    format_usage_report() — rather than a separate table, since every
+    field this needs is already tracked there.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agents = {}
+    for name in agent_config:
+        info = agent_rate_limits.get(name)
+        progress = rate_limit_window_progress(info) if info else None
+        agents[name] = {
+            "status": info.get("status") if info else None,
+            "rate_limit_type": info.get("rateLimitType") if info else None,
+            "resets_at": info.get("resetsAt") if info else None,
+            "is_using_overage": bool(info.get("isUsingOverage")) if info else False,
+            "overage_status": info.get("overageStatus") if info else None,
+            "utilization": info.get("utilization") if info else None,
+            # None, never 0 — "no reading yet" and "0% consumed" are
+            # opposite answers and must not render as the same number.
+            "percent_of_window_used": round(progress * 100, 1) if progress is not None else None,
+            "summary": format_usage_report(name),
+        }
+
+    return web.json_response({"agents": agents})
+
 # =============================================================================
 # Graceful Shutdown
 # =============================================================================
@@ -2860,6 +3008,7 @@ def main():
     app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/cost", handle_cost)
     app.router.add_get("/cost/{agent}", handle_cost_get)
+    app.router.add_get("/usage", handle_usage)
 
     # Register startup/shutdown handlers
     app.on_startup.append(startup)
