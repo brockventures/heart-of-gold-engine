@@ -2421,6 +2421,16 @@ async def handle_agents(request):
         agents_list.append({
             "name": agent,
             "model": config.get("model"),
+            # The same defaults the subprocess is actually launched with (see
+            # start_agent). Reporting the raw config.get() would show a blank
+            # for every agent that relies on the default, which reads as "not
+            # configured" rather than "configured by omission". Added
+            # 2026-08-08 for the dashboard settings page (see
+            # dashboard/app/api/agents/config/route.ts) — /status has none of
+            # this, only runtime state, so the settings page needs this
+            # endpoint specifically rather than reusing /api/agents.
+            "max_turns": config.get("max_turns", 200),
+            "timeout": config.get("timeout"),
             "state": agent_states.get(agent, "UNKNOWN"),
             "has_discord_token": agent in AGENT_TOKENS,
             # Anthropic's own live rate-limit signal, added 2026-08-06 —

@@ -9,17 +9,25 @@ interface ConfigData {
   workspace: string;
 }
 
+interface AgentConfigEntry {
+  name: string;
+  model: string | null;
+  max_turns: number;
+  timeout: number | null;
+}
+
 interface AgentConfig {
-  agents: Record<string, {
-    model: string;
-    max_turns: number;
-    timeout: number;
-  }>;
+  agents: AgentConfigEntry[];
 }
 
 export default function SettingsPage() {
   const { data: config } = usePoll<ConfigData>("/api/health", 60000);
-  const { data: agents } = usePoll<AgentConfig>("/api/agents", 60000);
+  // /api/agents/config proxies agent-server's GET /agents (config), not
+  // /api/agents (runtime state via /status) — /status carries none of
+  // model/max_turns/timeout. Both return { agents: [...] }, an array, not
+  // a dict — see the array/dict bug fixed on the chat page (commit
+  // 37c87cc) and its second instance here (2026-08-08).
+  const { data: agents } = usePoll<AgentConfig>("/api/agents/config", 60000);
 
   return (
     <div>
@@ -32,12 +40,12 @@ export default function SettingsPage() {
       </Section>
 
       <Section title="Agent Configuration">
-        {agents?.agents && Object.entries(agents.agents).map(([name, cfg]) => (
-          <div key={name} style={{ marginBottom: "0.75rem" }}>
-            <h3 style={{ fontSize: "0.9rem", margin: "0 0 0.25rem" }}>{name}</h3>
-            <Row label="Model" value={cfg.model} />
+        {agents?.agents?.map((cfg) => (
+          <div key={cfg.name} style={{ marginBottom: "0.75rem" }}>
+            <h3 style={{ fontSize: "0.9rem", margin: "0 0 0.25rem" }}>{cfg.name}</h3>
+            <Row label="Model" value={cfg.model || "—"} />
             <Row label="Max Turns" value={String(cfg.max_turns)} />
-            <Row label="Timeout" value={`${cfg.timeout}s`} />
+            <Row label="Timeout" value={cfg.timeout != null ? `${cfg.timeout}s` : "—"} />
           </div>
         ))}
       </Section>

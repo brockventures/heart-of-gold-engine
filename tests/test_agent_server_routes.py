@@ -115,3 +115,25 @@ def test_crash_recovery_commits_unposted_retry_per_message():
         "db.execute(' statement it follows — a dedent means it moved "
         "back outside the loop"
     )
+
+
+def test_handle_agents_reports_config_not_just_runtime_state():
+    """GET /agents backs dashboard/app/api/agents/config/route.ts, which
+    feeds the settings page (2026-08-08, ported from upstream
+    mcarmody/karakos-package#130). The settings page renders
+    cfg.model/cfg.max_turns/cfg.timeout — if handle_agents() stops
+    reporting any of those, the page silently shows "—" for everything
+    again instead of failing loudly, so pin the fields here instead.
+
+    max_turns must fall back to 200 (the same default start_agent
+    actually launches with) rather than surfacing a bare
+    config.get("max_turns") — an agent configured by omission should
+    not read as "not configured" on the settings page.
+    """
+    src = AGENT_SERVER.read_text()
+    start = src.index("async def handle_agents")
+    end = src.index("\nasync def ", start + 1)
+    body = src[start:end]
+
+    assert '"max_turns": config.get("max_turns", 200)' in body
+    assert '"timeout": config.get("timeout")' in body
