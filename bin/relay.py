@@ -676,7 +676,26 @@ class DiscordAdapter(discord.Client):
                     score = await self.score_with_cheap_model(
                         context, message.author.display_name
                     )
-                    decision = self.gate.resolve(decision, score)
+                    if score is None:
+                        # Scorer died (timeout/bad output/missing binary)
+                        # even after its internal retry. Do NOT let this
+                        # collapse into a 0.0 score — that's the bug Amos
+                        # hit 2026-08-09: a dead classifier and a real
+                        # confident-no both logged as score=0.00, so a
+                        # message sat unread for 13 minutes before Mike
+                        # caught it by hand. Fall back to envelope +
+                        # substance floor instead, and log it as a
+                        # failure, not a decline.
+                        content = message.content or ""
+                        fallback = envelope is not None or self._substance_floor(content)
+                        log.warning(
+                            f"[gate] {channel_name} tier2 scorer failed twice, "
+                            f"falling back to envelope+substance floor -> "
+                            f"{'WAKE' if fallback else 'quiet'}"
+                        )
+                        decision = self.gate.resolve(decision, None, fallback=fallback)
+                    else:
+                        decision = self.gate.resolve(decision, score)
 
             log.info(
                 f"[gate] {channel_name} {decision.tier}: {decision.reason} "
@@ -738,29 +757,66 @@ class DiscordAdapter(discord.Client):
             f"{m.author.display_name}: {m.content}" for m in reversed(history)
         )
 
-    async def score_with_cheap_model(self, context: str, author: str) -> float:
-        """Tier 2 scorer: one-shot Haiku call, no session state. Any failure
-        (timeout, bad output, missing binary) returns 0.0 — a broken
-        classifier must fail toward silence, never toward waking on
-        everything, per Amos's design."""
+    async def score_with_cheap_model(self, context: str, author: str) -> Optional[float]:
+        """Tier 2 scorer: one-shot Haiku call, no session state.
+
+        Fixed 2026-08-09: this used to catch any failure (timeout, bad
+        output, missing binary) and return 0.0, on the theory that a
+        broken classifier should fail toward silence. That reasoning was
+        wrong in a way Amos discovered on his side first: 0.0 is also
+        exactly what a real, confident "ignore it" scores, so the two
+        cases were indistinguishable in the log — `score=0.00` was true
+        either way and told nobody which one happened. A message sat
+        unread for 13 minutes on his side before a human caught it by
+        hand.
+
+        Now: one retry on failure, then return None (not a number) if
+        both attempts fail. None is a distinct, loggable signal that the
+        classifier died rather than declined. The caller (see the
+        needs_score branch above) is responsible for a fallback decision
+        — handoff envelope presence plus a substance floor — instead of
+        silently trusting a fabricated 0.0.
+        """
         prompt = SCORER_PROMPT.format(agent="Marvin", context=context, author=author)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude", "-p",
-                "--model", "haiku",
-                "--max-turns", "1",
-                "--dangerously-skip-permissions",
-                prompt,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-            raw = stdout.decode(errors="ignore")
-            match = re.search(r"[01]?\.\d+|\b[01]\b", raw)
-            return float(match.group(0)) if match else 0.0
-        except Exception as e:
-            log.error(f"Gate scorer failed, defaulting to silence: {e}")
-            return 0.0
+        for attempt in range(2):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "claude", "-p",
+                    "--model", "haiku",
+                    "--max-turns", "1",
+                    "--dangerously-skip-permissions",
+                    prompt,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+                raw = stdout.decode(errors="ignore")
+                match = re.search(r"[01]?\.\d+|\b[01]\b", raw)
+                if match:
+                    return float(match.group(0))
+                log.warning(
+                    f"Gate scorer produced unparseable output "
+                    f"(attempt {attempt + 1}/2): {raw[:200]!r}"
+                )
+            except Exception as e:
+                log.warning(f"Gate scorer failed (attempt {attempt + 1}/2): {e}")
+        log.error(
+            "Gate scorer failed twice in a row — returning None, not 0.0. "
+            "Caller must apply its own fallback."
+        )
+        return None
+
+    @staticmethod
+    def _substance_floor(content: str) -> bool:
+        """Crude fallback heuristic used only when the tier-2 scorer itself
+        is broken (see score_with_cheap_model). Not a replacement for the
+        real classifier — just the least-bad default while it's
+        unavailable. Biased slightly toward waking on longer or
+        question-shaped messages, because the failure mode this guards
+        against (a message silently dropped because the classifier died)
+        is invisible to the sender, per Amos's 2026-08-09 report."""
+        content = content or ""
+        return len(content.split()) >= 8 or "?" in content
 
     async def _post_to_agent_server(self, payload: dict) -> tuple[bool, str]:
         """POST one message payload to the agent server. Returns (success,
