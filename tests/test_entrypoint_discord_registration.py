@@ -63,8 +63,17 @@ def run_entrypoint(workspace: Path, extra_env=None) -> subprocess.CompletedProce
         f"#!/usr/bin/env bash\ntouch '{supervisord_marker}'\nexit 0\n",
     )
 
+    # Strip the real Discord credentials this live bot runs with before
+    # layering in the test's own extra_env. Without this, os.environ
+    # already has all three vars set for real (this suite runs inside a
+    # deployed Marvin instance), so "not configured" / "partially
+    # configured" cases never actually see them absent — the real values
+    # leak through underneath and registration always looks fully
+    # configured. Found 2026-08-09 alongside the identical bug in
+    # test_register_discord_commands.py.
+    base_environ = {k: v for k, v in os.environ.items() if k not in DISCORD_ENV}
     env = {
-        **os.environ,
+        **base_environ,
         "WORKSPACE_ROOT": str(workspace),
         "DASHBOARD_PORT": "3000",
         "AGENT_SERVER_TOKEN": "test-token",

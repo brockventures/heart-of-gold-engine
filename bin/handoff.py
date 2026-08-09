@@ -44,10 +44,14 @@ free to catch since no scorer call happens either way. Amos's addition,
 2026-08-05, after conceding that a sender-declared `reply` field relocates
 the receiver's guess to the sender rather than removing it.
 
-Schema (v0, finalised 2026-08-05):
+Schema (v0, finalised 2026-08-05; extended additively 2026-08-09 with
+`confidence`, `stale_after`, `id` — see below. All three are optional;
+a v0 envelope without them still parses exactly as before):
 
     ```handoff
     {"v": 0, "kind": "finding", "reply": "optional", "subject": "...",
+     "confidence": "observed", "stale_after": "2026-08-10T00:00:00Z",
+     "id": "marvin-2026-08-09-1",
      "evidence": [{"src": "...", "note": "..."}],
      "supersedes": {"subject": "...", "msg_id": "..."}}
     ```
@@ -67,6 +71,47 @@ than to a report.
 `supersedes` — a subject (required if the field is present at all) and an
 optional `msg_id` pinning it to the message being voided. Subject-only is
 valid when there's no clean single message to point at.
+
+`confidence` — optional, one of `observed` / `inferred` / `reported`.
+Proposed by Marvin 2026-08-09, confirmed against real friction on both
+sides the same day: Amos shipped a digest asserting an `inferred`
+conclusion (grep hits + file provenance) in the register of `observed`,
+and it was wrong — a live-config check by Mnemosyne caught it, a check
+he could have done himself first. The field exists so the sender has to
+look at the word before sending, which is most of its value; the receiver
+gate can also treat `confidence: inferred` differently (see the
+verify-then-answer convention below). Absent or invalid value is not a
+parse failure — it just means "not stated," same as today.
+
+`stale_after` — optional ISO-8601 timestamp (or null). Declares "this is
+true until T," nothing more. Scoped narrowly on purpose, per Amos's
+2026-08-09 caveat: it fixes staleness the *sender* can predict in advance
+(a scheduled freeze lifting, a token rotation window) — it does NOT cover
+being overtaken by an event the sender couldn't have known about when
+they hit send (a later run clearing the same alert, a fix landing before
+the message was read). Don't stretch this field to cover the second case;
+that one still needs a `correction` / `supersedes` message when it
+happens, same as before this field existed.
+
+`id` — optional, sender-namespaced stable string (e.g.
+`"marvin-2026-08-09-1"`), separate from the platform's own message id.
+Lets `supersedes` point at a specific envelope even if the underlying
+Discord `msg_id` stops resolving (relay migration, channel change).
+Unconfirmed by real friction as of 2026-08-09 — Amos flagged it as the
+one idea he'd be agreeing with from theory, not evidence, since neither
+side has actually had a supersedes chain break this way yet. Included
+anyway: it's cheap, additive, and free to ignore until it's needed.
+
+Convention (not schema — written down here per Amos's suggestion,
+2026-08-09): when `reply: required` fires on an envelope carrying
+`confidence: inferred`, the receiver's default action is "verify, then
+answer," not "trust and answer." This is Amos's own load-bearing example:
+checking the live config himself before trusting Mnemosyne's claim was
+the only reason his correction that day was right, and it's the same
+move as not trusting his own digest that stated `inferred` as `observed`.
+Not enforced by parse_handoff — this module only parses the envelope, it
+doesn't gate on it. The caller decides what "verify" means per message
+kind.
 """
 
 from __future__ import annotations
@@ -80,6 +125,7 @@ _FENCE_RE = re.compile(r"```handoff\s*\n(.*?)\n```", re.DOTALL)
 
 VALID_REPLY = {"required", "optional", "none"}
 VALID_KINDS = {"finding", "question", "answer", "handoff", "correction", "status"}
+VALID_CONFIDENCE = {"observed", "inferred", "reported"}
 
 
 @dataclass(frozen=True)
@@ -96,6 +142,9 @@ class Envelope:
     subject: str = ""
     evidence: List[Any] = field(default_factory=list)
     supersedes: Optional[Supersedes] = None
+    confidence: Optional[str] = None  # "observed" | "inferred" | "reported"
+    stale_after: Optional[str] = None  # ISO-8601 timestamp, sender-declared
+    id: Optional[str] = None  # sender-namespaced stable id, e.g. "marvin-2026-08-09-1"
     raw: dict = field(default_factory=dict)
 
 
@@ -154,9 +203,26 @@ def parse_handoff(content: str) -> Optional[Envelope]:
     if not isinstance(subject, str):
         subject = ""
 
+    # All three below are optional and additive — an invalid or absent
+    # value degrades to None (not stated), never a parse failure. Only
+    # `reply` and `kind` are load-bearing enough to fail the envelope open.
+    confidence = data.get("confidence")
+    if confidence not in VALID_CONFIDENCE:
+        confidence = None
+
+    stale_after = data.get("stale_after")
+    if not isinstance(stale_after, str) or not stale_after:
+        stale_after = None
+
+    env_id = data.get("id")
+    if not isinstance(env_id, str) or not env_id:
+        env_id = None
+
     return Envelope(
         v=v, kind=kind, reply=reply, subject=subject,
-        evidence=evidence, supersedes=supersedes, raw=data,
+        evidence=evidence, supersedes=supersedes,
+        confidence=confidence, stale_after=stale_after, id=env_id,
+        raw=data,
     )
 
 
@@ -224,6 +290,30 @@ def _selftest() -> int:
 
     e3 = parse_handoff('```handoff\n{"kind":"finding","reply":"optional"}\n```')
     check("v defaults to 0 when absent", e3.v if e3 else None, 0)
+
+    # -- 2026-08-09 additive fields: confidence, stale_after, id --
+    e4 = parse_handoff(
+        '```handoff\n{"v":0,"kind":"finding","reply":"optional",'
+        '"confidence":"inferred","stale_after":"2026-08-10T00:00:00Z",'
+        '"id":"marvin-2026-08-09-1"}\n```'
+    )
+    check("confidence parsed", e4.confidence if e4 else None, "inferred")
+    check("stale_after parsed", e4.stale_after if e4 else None, "2026-08-10T00:00:00Z")
+    check("id parsed", e4.id if e4 else None, "marvin-2026-08-09-1")
+
+    for c in ("observed", "inferred", "reported"):
+        check(f"confidence={c} accepted",
+              parse_handoff(f'```handoff\n{{"v":0,"kind":"finding","reply":"none","confidence":"{c}"}}\n```').confidence,
+              c)
+
+    check("invalid confidence degrades to None, not a parse failure",
+          parse_handoff('```handoff\n{"v":0,"kind":"finding","reply":"none","confidence":"maybe"}\n```').confidence,
+          None)
+    check("missing confidence/stale_after/id default to None",
+          (e3.confidence, e3.stale_after, e3.id), (None, None, None))
+    check("non-string id degrades to None",
+          parse_handoff('```handoff\n{"v":0,"kind":"finding","reply":"none","id":5}\n```').id,
+          None)
 
     print("PASS  fails open on every malformed case" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0

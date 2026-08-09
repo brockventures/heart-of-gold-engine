@@ -84,7 +84,16 @@ def fake_discord():
 
 
 def run_script(args, env_overrides, base_url=None):
-    env = {**os.environ, **env_overrides}
+    # Strip the real Discord credentials this live bot runs with before
+    # layering in the test's own env_overrides. Without this, os.environ
+    # already has all three vars set for real (this test suite runs
+    # inside a deployed Marvin instance), so a test that omits one var
+    # from env_overrides to simulate it being "missing" never actually
+    # sees it missing — the real value leaks through underneath. Found
+    # 2026-08-09: every "missing env var" case was passing (returncode 0)
+    # instead of the loud-failure the test expects.
+    base_env = {k: v for k, v in os.environ.items() if k not in VALID_ENV}
+    env = {**base_env, **env_overrides}
     if base_url is not None:
         env["KARAKOS_DISCORD_API_BASE"] = base_url
     return subprocess.run(

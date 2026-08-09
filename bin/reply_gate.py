@@ -141,14 +141,37 @@ class ReplyGate:
         )
 
     # -- step 2 -------------------------------------------------------------
-    def resolve(self, decision: Decision, score: float) -> Decision:
+    def resolve(
+        self, decision: Decision, score: Optional[float], *, fallback: Optional[bool] = None
+    ) -> Decision:
         """Apply your classifier's 0-1 score. Only call on needs_score decisions.
 
         A wake here starts the cooldown; a decline does not. Declining is the
         cheap path and must stay free.
+
+        `score=None` means the classifier itself failed (timeout, bad
+        output, missing binary) — NOT a real low score. Fixed 2026-08-09
+        after Amos hit this exact bug on his side: a prior version of this
+        caller collapsed every scorer failure into 0.0, the same value a
+        genuine confident-no produces, so a dead classifier and a real
+        decline were indistinguishable in the logs (`score=0.00` either
+        way). The caller must not do that anymore — pass `score=None` and
+        supply `fallback` (its own decision from, e.g., a handoff envelope
+        plus a substance floor) instead of coercing to a number. The
+        resulting Decision is tagged "tier2-fallback" with `score=None` so
+        the two cases stay distinguishable downstream.
         """
         if not decision.needs_score:
             return decision
+        if score is None:
+            wake = bool(fallback)
+            if wake:
+                self._last_tier2_wake[decision.channel_id] = self._clock()
+            return Decision(
+                wake, "tier2-fallback",
+                f"scorer failed, fallback={'wake' if wake else 'quiet'}",
+                named=decision.named, score=None, channel_id=decision.channel_id,
+            )
         wake = score >= self.threshold
         if wake:
             self._last_tier2_wake[decision.channel_id] = self._clock()
@@ -250,6 +273,20 @@ def _selftest() -> int:
 
     t["now"] += 301
     check("cooldown expires", g.evaluate(M(content="later")).needs_score, True)
+
+    # -- 2026-08-09: scorer-failure fallback must not collapse to 0.0 --
+    d5 = g.evaluate(M(content="scorer will fail on this one"))
+    r5 = g.resolve(d5, None, fallback=True)
+    check("score=None with fallback=True wakes", r5.wake, True)
+    check("score=None result is tagged tier2-fallback, not tier2", r5.tier, "tier2-fallback")
+    check("score=None result keeps score=None (not coerced to a number)", r5.score, None)
+
+    t["now"] += 301
+    d6 = g.evaluate(M(content="scorer will fail on this one too"))
+    r6 = g.resolve(d6, None, fallback=False)
+    check("score=None with fallback=False stays quiet", r6.wake, False)
+    check("score=None fallback=False does NOT start a cooldown",
+          g.evaluate(M(content="right after")).needs_score, True)
 
     print("PASS  the gate declines when it should" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0
