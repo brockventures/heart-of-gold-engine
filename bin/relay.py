@@ -63,6 +63,36 @@ def split_discord_message(text: str, max_length: int = 2000) -> List[str]:
 
     return chunks if chunks else [text]
 
+
+# =============================================================================
+# Attachments (2026-08-09, ported from mcarmody/karakos-package#127)
+# =============================================================================
+
+# Anything outside this set is replaced. That covers `/` and `\` — an
+# uploader controls the filename, and a name like `../../config/agents.json`
+# must not be able to choose where the relay writes.
+_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def safe_attachment_name(filename: str, index: int) -> str:
+    """Return a filesystem-safe name for a Discord-supplied filename.
+
+    The index prefix is not decoration: two attachments on one message may
+    share a filename, and without it the second silently overwrites the
+    first and the agent is handed the same bytes twice.
+    """
+    cleaned = _UNSAFE_FILENAME_RE.sub("_", filename or "")
+    # Leading dots are stripped so a name of `..` or `.` cannot survive as a
+    # path component, and so uploads do not land as dotfiles.
+    cleaned = cleaned.lstrip(".")
+    if not cleaned:
+        cleaned = "attachment"
+    # Long names are truncated from the front, keeping the tail so the
+    # extension (which is how the agent knows it is an image) survives.
+    if len(cleaned) > 96:
+        cleaned = cleaned[-96:]
+    return f"{index}-{cleaned}"
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -71,7 +101,18 @@ WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.json"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 MESSAGES_DIR = WORKSPACE_ROOT / "data" / "messages"
+ATTACHMENTS_DIR = WORKSPACE_ROOT / "data" / "attachments"
 HEALTH_FILE = WORKSPACE_ROOT / "data" / "health" / "relay.json"
+
+# Attachments the relay will pull down before handing a message to an agent
+# (2026-08-09, ported from mcarmody/karakos-package#127 — posting an image
+# with "what's in this" got answered about the text only, the file was
+# never downloaded or described). Discord's own ceiling is 25 MB on an
+# unboosted server, so the default cap refuses nothing Discord would have
+# accepted while still bounding what a single message can write to the
+# data volume.
+MAX_ATTACHMENT_BYTES = int(os.environ.get("MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
+MAX_ATTACHMENTS_PER_MESSAGE = int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "10"))
 
 # Retry-spooling for messages the agent server rejects or can't be reached
 # for (Task #9, built 2026-08-06). Before this, send_to_agent_server()
@@ -740,6 +781,73 @@ class DiscordAdapter(discord.Client):
         except Exception as e:
             log.error(f"Failed to spool deferred poke — message lost: {e}")
 
+    async def download_attachments(self, message: discord.Message) -> List[Dict]:
+        """Save a message's attachments locally and describe them for the agent.
+
+        Called from `send_to_agent_server` rather than `on_message` so that
+        files on a message the gates are about to drop are never written to
+        disk at all.
+
+        An attachment that is too large, or that fails to download, still
+        comes back in the list with `path: None` and a `skipped` reason. The
+        agent needs to be able to say "you sent me a 40 MB video and I could
+        not open it" — going quiet about the file is the bug this fixes, and
+        a failed download reproduces it exactly.
+        """
+        attachments = getattr(message, "attachments", None) or []
+        if not attachments:
+            return []
+
+        described: List[Dict] = []
+        dest_dir = ATTACHMENTS_DIR / str(message.id)
+
+        for index, attachment in enumerate(attachments[:MAX_ATTACHMENTS_PER_MESSAGE]):
+            entry = {
+                "filename": attachment.filename,
+                "content_type": getattr(attachment, "content_type", None),
+                "size": getattr(attachment, "size", None),
+                "path": None,
+                "skipped": None,
+            }
+
+            size = entry["size"] or 0
+            if size > MAX_ATTACHMENT_BYTES:
+                entry["skipped"] = f"exceeds the {MAX_ATTACHMENT_BYTES} byte download limit"
+                log.warning(
+                    "Attachment %s on message %s skipped: %d bytes",
+                    attachment.filename, message.id, size
+                )
+                described.append(entry)
+                continue
+
+            path = dest_dir / safe_attachment_name(attachment.filename, index)
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                await attachment.save(path)
+                entry["path"] = str(path)
+            except Exception as e:
+                # One bad download must not cost the message. The text
+                # still goes through, and the envelope says what failed.
+                entry["skipped"] = f"download failed: {e}"
+                log.error(
+                    "Failed to download attachment %s on message %s: %s",
+                    attachment.filename, message.id, e
+                )
+
+            described.append(entry)
+
+        dropped = len(attachments) - len(described)
+        if dropped > 0:
+            described.append({
+                "filename": f"<{dropped} more attachment(s)>",
+                "content_type": None,
+                "size": None,
+                "path": None,
+                "skipped": f"over the {MAX_ATTACHMENTS_PER_MESSAGE} attachment per message limit",
+            })
+
+        return described
+
     async def send_to_agent_server(self, message: discord.Message, agent: str):
         """Send message to agent server. On failure (non-202 response or a
         connection error — agent server down, rate-limited, etc.), spool
@@ -751,6 +859,8 @@ class DiscordAdapter(discord.Client):
         if not channel_name:
             channel_name = "unknown"
 
+        attachments = await self.download_attachments(message)
+
         payload = {
             "agent": agent,
             "channel": channel_name,
@@ -761,7 +871,8 @@ class DiscordAdapter(discord.Client):
             "is_bot": message.author.bot,
             "content": message.content,
             "message_id": str(message.id),
-            "mentions_agent": any(m.id in discord_id_to_agent for m in message.mentions)
+            "mentions_agent": any(m.id in discord_id_to_agent for m in message.mentions),
+            "attachments": attachments,
         }
 
         ok, detail = await self._post_to_agent_server(payload)
@@ -785,7 +896,11 @@ class DiscordAdapter(discord.Client):
             "author_name": message.author.display_name,
             "is_bot": message.author.bot,
             "content": message.content,
-            "message_id": str(message.id)
+            "message_id": str(message.id),
+            # Names only — the capture log is a record of what was said,
+            # and a message whose whole payload was a file reads as blank
+            # without this.
+            "attachments": [a.filename for a in getattr(message, "attachments", None) or []],
         }
 
         # Write to daily JSONL

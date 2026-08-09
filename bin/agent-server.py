@@ -335,6 +335,7 @@ async def init_db():
             content TEXT NOT NULL,
             message_id TEXT UNIQUE NOT NULL,
             mentions_agent INTEGER DEFAULT 0,
+            attachments TEXT,
             processed INTEGER DEFAULT 0,
             response TEXT,
             discord_response_id TEXT,
@@ -343,6 +344,19 @@ async def init_db():
             processed_at TIMESTAMP
         )
     """)
+    # 2026-08-09: attachments added alongside relay.py's attachment-download
+    # support (ported from mcarmody/karakos-package#127). CREATE TABLE IF
+    # NOT EXISTS is a no-op on an already-live table, so an upgraded
+    # install only gets this column through the migration below; without
+    # it, every INSERT on an existing install (see handle_message) would
+    # 500 the moment relay.py started sending the new field. Same
+    # try/except pattern as the rate_limits.utilization migration above —
+    # ALTER TABLE has no "IF NOT EXISTS" in sqlite.
+    try:
+        await db.execute("ALTER TABLE message_queue ADD COLUMN attachments TEXT")
+        await db.commit()
+    except Exception:
+        pass  # column already exists
 
     await db.execute("""
         CREATE INDEX IF NOT EXISTS idx_queue_agent
@@ -912,6 +926,71 @@ async def maybe_topic_change_compact(agent: str, channel_id: str, new_text: str,
         f"{gap_sec / 60:.0f}-minute gap in this channel — compacting"
     )
     await compact_session(agent, reason="topic change")
+
+# =============================================================================
+# Attachments (2026-08-09, ported from mcarmody/karakos-package#127)
+# =============================================================================
+
+def _human_size(size) -> str:
+    """Bytes as something an agent can reason about at a glance."""
+    if not isinstance(size, (int, float)) or size < 0:
+        return "unknown size"
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def format_attachments(raw) -> str:
+    """Render a queued message's attachments as lines for the agent envelope.
+
+    Returns "" when there are none, so callers can append unconditionally.
+
+    Every attachment gets a line whether or not the relay managed to save
+    it. The failure line is the point of the feature as much as the
+    success line: before this, a message carrying a file reached the
+    agent as bare text and the user got an answer that never acknowledged
+    the file existed.
+    """
+    if not raw:
+        return ""
+
+    if isinstance(raw, str):
+        try:
+            attachments = json.loads(raw)
+        except (ValueError, TypeError):
+            log.warning("Unparseable attachments column: %r", raw[:200])
+            return ""
+    else:
+        attachments = raw
+
+    if not isinstance(attachments, list) or not attachments:
+        return ""
+
+    lines = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("filename") or "unnamed"
+        path = item.get("path")
+        if path:
+            descriptor = ", ".join(
+                p for p in (item.get("content_type"), _human_size(item.get("size"))) if p
+            )
+            lines.append(f"  - {name} ({descriptor}) saved at: {path}")
+        else:
+            reason = item.get("skipped") or "not available"
+            lines.append(f"  - {name} — NOT saved: {reason}")
+
+    if not lines:
+        return ""
+
+    header = (
+        f"  [{len(lines)} attachment(s) on this message. "
+        "Open a saved one with the Read tool at the path given.]"
+    )
+    return "\n".join([header, *lines])
 
 # =============================================================================
 # Session Persistence (Summary and Restore)
@@ -2004,7 +2083,11 @@ async def process_agent_queue(agent: str):
             timestamp = msg["created_at"]
             author = msg["author"]
             content = msg["content"]
-            formatted_parts.append(f"[{timestamp}] {author}: {content}")
+            part = f"[{timestamp}] {author}: {content}"
+            attachment_lines = format_attachments(msg["attachments"])
+            if attachment_lines:
+                part = f"{part}\n{attachment_lines}"
+            formatted_parts.append(part)
 
         formatted_content = "\n\n".join(formatted_parts)
 
@@ -2222,11 +2305,17 @@ async def handle_message(request):
     content = data.get("content", "")
     message_id = data.get("message_id", f"msg-{uuid.uuid4()}")
     mentions_agent = data.get("mentions_agent", False)
+    attachments = data.get("attachments") or []
+    if not isinstance(attachments, list):
+        return web.json_response({"error": "attachments must be a list"}, status=400)
 
     if not agent or agent not in agent_config:
         return web.json_response({"error": "Invalid agent"}, status=400)
 
-    if not content:
+    # An image posted with no caption is a real message with empty text —
+    # it used to be rejected here as "Empty content" and never reached the
+    # agent at all (2026-08-09, ported from mcarmody/karakos-package#127).
+    if not content and not attachments:
         return web.json_response({"error": "Empty content"}, status=400)
 
     # Cost limits no longer reject inbound messages, as of 2026-08-06. The
@@ -2256,10 +2345,11 @@ async def handle_message(request):
         await db.execute(
             """
             INSERT INTO message_queue
-            (agent, channel, channel_id, server, author, author_id, is_bot, content, message_id, mentions_agent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (agent, channel, channel_id, server, author, author_id, is_bot, content, message_id, mentions_agent, attachments)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (agent, channel, channel_id, server, author, author_id, int(is_bot), content, message_id, int(mentions_agent))
+            (agent, channel, channel_id, server, author, author_id, int(is_bot), content, message_id,
+             int(mentions_agent), json.dumps(attachments) if attachments else None)
         )
         await db.commit()
     except aiosqlite.IntegrityError as e:
