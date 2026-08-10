@@ -345,13 +345,21 @@ class DiscordAdapter(discord.Client):
         self.server_ids = load_server_ids(channels_config)
         # `server_ids` is a set (order isn't meaningful, and sets aren't
         # subscriptable — `server_ids[0]` below used to raise "'set' object
-        # is not subscriptable"). The single `server_id` config field is the
-        # actual primary guild (Heart of Gold); `server_ids` (plural) only
-        # adds extra servers to accept messages from, e.g. Amos's Crab
-        # Cavern. Fall back to an arbitrary member only if `server_id` was
-        # never set.
-        self.primary_server_id = str(channels_config.get("server_id") or "") or (
-            next(iter(self.server_ids), None)
+        # is not subscriptable"). The primary guild (Heart of Gold, not
+        # Amos's Crab Cavern) has to be picked from *ordered* config data,
+        # not the set: this config only has `server_ids` (plural), no
+        # singular `server_id`, and an earlier version of this fix fell
+        # back to `next(iter(self.server_ids))` for that case — which
+        # silently picked a different guild on every other restart
+        # (Python set iteration order isn't stable across processes),
+        # confirmed live: two consecutive boots synced slash commands to
+        # two different guilds. Config list order is stable; use that.
+        single = channels_config.get("server_id")
+        extra = channels_config.get("server_ids") or []
+        if isinstance(extra, (str, int)):
+            extra = [extra]
+        self.primary_server_id = str(single) if single else (
+            str(extra[0]) if extra else None
         )
         log.info(
             "Discord adapter initialized (servers: %s)",
