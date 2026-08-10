@@ -44,6 +44,7 @@ survives even if delivery has a transient hiccup.
 
 import fcntl
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -52,10 +53,36 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
+
+# Logging — mirrors relay.py/agent-server.py's pattern. Previously this
+# module only used bare print()/print(..., file=sys.stderr), which
+# supervisord routes straight to the container's own stdout/stderr
+# (stdout_logfile=/dev/stdout in supervisord.conf) and nowhere under
+# logs/. That meant a crash here left no trace reachable from inside the
+# container — found the hard way 2026-08-10 when recovery-agent hit a
+# rapid exit-status-2 crash-loop during a container migration and
+# supervisord gave up after 6 deaths in 13s, with no way to recover the
+# actual traceback short of `docker logs` on the host. A dedicated file
+# handler here means the next occurrence is diagnosable in-band.
+log = logging.getLogger("recovery-agent")
+log.setLevel(logging.INFO)
+_handler = RotatingFileHandler(
+    WORKSPACE_ROOT / "logs" / "recovery-agent.log",
+    maxBytes=10 * 1024 * 1024,
+    backupCount=7,
+)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+log.addHandler(_handler)
+
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_console)
+
 DB_PATH = WORKSPACE_ROOT / "data" / "memory" / "agent-server.db"
 PROPOSALS_DIR = WORKSPACE_ROOT / "data" / "recovery-proposals"
 RATE_LIMIT_STATE_PATH = WORKSPACE_ROOT / "data" / "recovery-agent-rate-limits.json"
@@ -397,10 +424,9 @@ def _acquire_singleton_lock():
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print(
-            "recovery-agent: another instance already holds the lock — "
-            "refusing to start as a duplicate.",
-            file=sys.stderr,
+        log.error(
+            "another instance already holds the lock — refusing to start "
+            "as a duplicate."
         )
         sys.exit(1)
     fd.write(str(os.getpid()))
@@ -410,12 +436,16 @@ def _acquire_singleton_lock():
 
 def main():
     _lock_fd = _acquire_singleton_lock()
-    print(f"recovery-agent: starting, dry_run={DRY_RUN}, sweep_interval={SWEEP_INTERVAL_SEC}s")
+    log.info(f"starting, dry_run={DRY_RUN}, sweep_interval={SWEEP_INTERVAL_SEC}s")
     while True:
         try:
             run_sweep()
-        except Exception as e:
-            print(f"recovery-agent: sweep error: {e}", file=sys.stderr)
+        except Exception:
+            # log.exception (not str(e)) so a future sweep-time crash
+            # leaves a full traceback in logs/recovery-agent.log instead
+            # of just a one-line message — the gap that made tonight's
+            # exit-status-2 crash-loop undiagnosable from in-container.
+            log.exception("sweep error")
         time.sleep(SWEEP_INTERVAL_SEC)
 
 
