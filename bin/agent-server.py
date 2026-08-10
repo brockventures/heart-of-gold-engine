@@ -2807,6 +2807,27 @@ async def handle_agent_reload(request):
     return web.json_response({"status": "reloaded"})
 
 
+async def handle_agent_compact(request):
+    """POST /agents/{name}/compact - Manual trigger for the same
+    finalize-then-fresh-session action the automatic compaction triggers
+    use (see compact_session() / maybe_compact_session()). Added
+    2026-08-10, Ian's ask, prompted by seeing high context utilization
+    and wanting to bring it down on demand rather than waiting for the
+    token-target/topic-change/rate-limit triggers to fire on their own."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if agent not in agent_config:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    ok = await compact_session(agent, reason="manual (/compact)")
+    if not ok:
+        return web.json_response({"status": "failed"}, status=500)
+    return web.json_response({"status": "compacted"})
+
+
 async def handle_rate_limit_override_set(request):
     """POST /agents/{name}/rate-limit-override - Owner-set, auto-expiring
     bypass of is_rate_limit_paused() (2026-08-10). Body:
@@ -3189,6 +3210,7 @@ def main():
     app.router.add_get("/agents", handle_agents)
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
     app.router.add_post("/agents/{name}/reload", handle_agent_reload)
+    app.router.add_post("/agents/{name}/compact", handle_agent_compact)
     app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/agents/{name}/rate-limit-override", handle_rate_limit_override_set)
     app.router.add_post("/agents/{name}/rate-limit-override/clear", handle_rate_limit_override_clear)

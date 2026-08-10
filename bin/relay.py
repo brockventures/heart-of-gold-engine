@@ -289,7 +289,7 @@ class DiscordAdapter(discord.Client):
         # CommandTree is the better call for us: officially supported,
         # handles registration and interaction dispatch itself, one less
         # hand-rolled REST surface to get subtly wrong. Registers
-        # status/usage/clear/reload/override/override-clear — every /sys
+        # status/usage/clear/reload/compact/override/override-clear — every /sys
         # command with a real handler. Amos's explicit warning, taken
         # seriously: a command that registers cleanly and has no matching
         # branch silently does nothing when clicked, nothing errors
@@ -344,6 +344,14 @@ class DiscordAdapter(discord.Client):
             if not await _owner_check(interaction):
                 return
             reply = await adapter._run_sys_command("reload", agent or _default_agent())
+            await interaction.response.send_message(reply)
+
+        @self.tree.command(name="compact", description="Summarize session and restart fresh (lowers context utilization)")
+        @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
+        async def compact_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
+            if not await _owner_check(interaction):
+                return
+            reply = await adapter._run_sys_command("compact", agent or _default_agent())
             await interaction.response.send_message(reply)
 
         @self.tree.command(name="override", description="Bypass rate-limit pause for an agent (owner, auto-expiring, capped)")
@@ -634,6 +642,19 @@ class DiscordAdapter(discord.Client):
                 return (f"**/sys clear** `{agent}`: "
                         f"{'done — fresh session' if ok else f'failed ({resp.status})'}")
 
+            if cmd == "compact":
+                # Manual trigger for the same finalize-then-fresh-session
+                # action the automatic compaction triggers use (see
+                # compact_session() in agent-server.py). 2026-08-10, Ian's
+                # ask, prompted by seeing high context utilization and
+                # wanting it down on demand.
+                async with self.http_session.post(
+                    f"{AGENT_SERVER_URL}/agents/{agent}/compact", headers=headers
+                ) as resp:
+                    ok = resp.status == 200
+                return (f"**/sys compact** `{agent}`: "
+                        f"{'done — summarized and restarted with a fresh session' if ok else f'failed ({resp.status})'}")
+
             if cmd == "reload":
                 async with self.http_session.post(
                     f"{AGENT_SERVER_URL}/agents/{agent}/reload", headers=headers
@@ -695,7 +716,7 @@ class DiscordAdapter(discord.Client):
                         f"{'cleared' if had_one else 'no active override'}")
 
             return (f"Unknown /sys command: `{cmd}`. Known: status, clear, "
-                    f"reload, usage, override, override-clear")
+                    f"reload, compact, usage, override, override-clear")
         except Exception as e:
             return f"**/sys {cmd}** failed: {e}"
 
