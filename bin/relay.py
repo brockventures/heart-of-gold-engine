@@ -289,7 +289,7 @@ class DiscordAdapter(discord.Client):
         # CommandTree is the better call for us: officially supported,
         # handles registration and interaction dispatch itself, one less
         # hand-rolled REST surface to get subtly wrong. Registers
-        # status/clear/reload/override/override-clear — every /sys
+        # status/usage/clear/reload/override/override-clear — every /sys
         # command with a real handler. Amos's explicit warning, taken
         # seriously: a command that registers cleanly and has no matching
         # branch silently does nothing when clicked, nothing errors
@@ -321,6 +321,13 @@ class DiscordAdapter(discord.Client):
             if not await _owner_check(interaction):
                 return
             reply = await adapter._run_sys_command("status", None)
+            await interaction.response.send_message(reply)
+
+        @self.tree.command(name="usage", description="Rate-limit headroom for the whole install (shared across agents)")
+        async def usage_cmd(interaction: discord.Interaction):
+            if not await _owner_check(interaction):
+                return
+            reply = await adapter._run_sys_command("usage", None)
             await interaction.response.send_message(reply)
 
         @self.tree.command(name="clear", description="Clear session + restart subprocess (destructive)")
