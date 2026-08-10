@@ -343,6 +343,16 @@ class DiscordAdapter(discord.Client):
         import aiohttp
         self.http_session = aiohttp.ClientSession()
         self.server_ids = load_server_ids(channels_config)
+        # `server_ids` is a set (order isn't meaningful, and sets aren't
+        # subscriptable — `server_ids[0]` below used to raise "'set' object
+        # is not subscriptable"). The single `server_id` config field is the
+        # actual primary guild (Heart of Gold); `server_ids` (plural) only
+        # adds extra servers to accept messages from, e.g. Amos's Crab
+        # Cavern. Fall back to an arbitrary member only if `server_id` was
+        # never set.
+        self.primary_server_id = str(channels_config.get("server_id") or "") or (
+            next(iter(self.server_ids), None)
+        )
         log.info(
             "Discord adapter initialized (servers: %s)",
             ", ".join(sorted(self.server_ids)) or "none configured",
@@ -397,9 +407,9 @@ class DiscordAdapter(discord.Client):
         # to propagate, which makes iterating on it miserable. Re-synced
         # on every reconnect — idempotent, discord.py only pushes an
         # update if the command set actually changed.
-        if self.server_ids:
+        if self.primary_server_id:
             try:
-                guild = discord.Object(id=int(self.server_ids[0]))
+                guild = discord.Object(id=int(self.primary_server_id))
                 # Commands registered via @self.tree.command(...) with no
                 # explicit guild= are tracked as global in the tree's own
                 # bookkeeping — sync(guild=X) alone only pushes commands
@@ -409,7 +419,7 @@ class DiscordAdapter(discord.Client):
                 # without this — found live, not assumed.
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
-                log.info(f"Synced {len(synced)} slash command(s) to guild {self.server_ids[0]}")
+                log.info(f"Synced {len(synced)} slash command(s) to guild {self.primary_server_id}")
             except Exception as e:
                 log.error(f"Slash command sync failed: {e}")
 
