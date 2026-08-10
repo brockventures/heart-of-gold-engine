@@ -310,6 +310,19 @@ agent_rate_limit_warning_notified: Dict[str, bool] = {}
 # doesn't require flipping that behavior on. In-memory only, one entry per
 # agent, always overwritten — "how full is the session right now."
 agent_context_usage: Dict[str, Dict[str, Any]] = {}
+# Rate-limit override (2026-08-10, Ian's ask: "bugfixes regardless of
+# session limits, at my discretion"). An owner-set, auto-expiring bypass
+# of is_rate_limit_paused() for exactly one agent at a time — for the
+# rare case where Ian wants to push a fix through during a pause instead
+# of waiting for the window to reset. Deliberately NOT a permanent
+# setting: every override has a hard expiry (capped at
+# RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC even if a longer duration is
+# requested) so a forgotten override can't quietly disable the circuit
+# breaker forever. In-memory cache backed by the rate_limit_overrides
+# DB table (see init_db / _load_rate_limit_overrides_from_db) so it
+# survives a restart instead of silently clearing one mid-use.
+agent_rate_limit_overrides: Dict[str, Dict[str, Any]] = {}
+RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC = 3600  # 1 hour hard cap, non-negotiable
 # Per-(agent, channel_id) last-turn bookkeeping for the topic-change
 # compaction trigger (maybe_topic_change_compact, 2026-08-07) — "at" is
 # epoch seconds, "text" is that turn's formatted message content, used
@@ -447,6 +460,20 @@ async def init_db():
         await db.commit()
     except Exception:
         pass  # column already exists
+
+    # Rate-limit override table (2026-08-10) — see agent_rate_limit_overrides
+    # comment above and is_rate_limit_override_active(). One row per agent,
+    # always overwritten on a fresh /sys override (INSERT OR REPLACE), same
+    # single-row-per-agent shape as rate_limits above.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limit_overrides (
+            agent TEXT PRIMARY KEY,
+            enabled_by TEXT NOT NULL,
+            reason TEXT,
+            enabled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL NOT NULL
+        )
+    """)
 
     await db.commit()
     log.info("Database initialized")
@@ -681,6 +708,97 @@ async def _load_rate_limits_from_db() -> None:
     except Exception as e:
         log.warning(f"Failed to preload rate_limits from DB (non-fatal): {e}")
 
+async def _load_rate_limit_overrides_from_db() -> None:
+    """Preload any still-active rate-limit override at startup, same
+    reasoning as _load_rate_limits_from_db() above — a restart mid-override
+    (e.g. a /sys reload while Ian's mid-fix) must not silently drop it and
+    re-impose a pause he already explicitly bypassed. Skips rows that have
+    already expired rather than trusting stale data; an expired override
+    is just deleted, not resurrected."""
+    if db is None:
+        return
+    try:
+        now = time.time()
+        async with db.execute(
+            "SELECT agent, enabled_by, reason, expires_at FROM rate_limit_overrides"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        expired = []
+        for row in rows:
+            if row["expires_at"] <= now:
+                expired.append(row["agent"])
+                continue
+            agent_rate_limit_overrides[row["agent"]] = {
+                "enabled_by": row["enabled_by"],
+                "reason": row["reason"],
+                "expires_at": row["expires_at"],
+            }
+            log.warning(
+                f"{row['agent']} restored active rate-limit override from DB "
+                f"on startup (by {row['enabled_by']}, expires "
+                f"{datetime.fromtimestamp(row['expires_at']).strftime('%H:%M UTC')})"
+            )
+        for agent in expired:
+            await db.execute("DELETE FROM rate_limit_overrides WHERE agent = ?", (agent,))
+        if expired:
+            await db.commit()
+    except Exception as e:
+        log.warning(f"Failed to preload rate_limit_overrides from DB (non-fatal): {e}")
+
+def is_rate_limit_override_active(agent: str) -> bool:
+    """True if a non-expired owner override exists for this agent.
+    Auto-expires lazily on read — no background sweep needed, evicted
+    from the in-memory cache the moment anything checks it past its
+    expiry, same shape as the rest of the rate-limit gate."""
+    info = agent_rate_limit_overrides.get(agent)
+    if not info:
+        return False
+    if time.time() >= info["expires_at"]:
+        agent_rate_limit_overrides.pop(agent, None)
+        return False
+    return True
+
+async def set_rate_limit_override(agent: str, enabled_by: str, duration_sec: float, reason: str = "") -> float:
+    """Owner-set bypass of is_rate_limit_paused() for one agent, capped at
+    RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC no matter what duration is
+    requested. Returns the actual expires_at (epoch seconds) so the
+    caller can report it back accurately even when the cap kicked in."""
+    duration_sec = max(0.0, min(duration_sec, RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC))
+    expires_at = time.time() + duration_sec
+    if db is not None:
+        await db.execute(
+            "INSERT INTO rate_limit_overrides (agent, enabled_by, reason, enabled_at, expires_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?) "
+            "ON CONFLICT(agent) DO UPDATE SET "
+            "enabled_by=excluded.enabled_by, reason=excluded.reason, "
+            "enabled_at=CURRENT_TIMESTAMP, expires_at=excluded.expires_at",
+            (agent, enabled_by, reason, expires_at),
+        )
+        await db.commit()
+    agent_rate_limit_overrides[agent] = {
+        "enabled_by": enabled_by,
+        "reason": reason,
+        "expires_at": expires_at,
+    }
+    log.warning(
+        f"Rate-limit override SET for {agent} by {enabled_by} "
+        f"(reason: {reason or 'none given'}), expires "
+        f"{datetime.fromtimestamp(expires_at).strftime('%H:%M UTC')} — "
+        f"is_rate_limit_paused() will return False for this agent until then"
+    )
+    return expires_at
+
+async def clear_rate_limit_override(agent: str) -> bool:
+    """Cancel an active override early. Returns whether one existed."""
+    existed = agent in agent_rate_limit_overrides
+    if db is not None:
+        await db.execute("DELETE FROM rate_limit_overrides WHERE agent = ?", (agent,))
+        await db.commit()
+    agent_rate_limit_overrides.pop(agent, None)
+    if existed:
+        log.warning(f"Rate-limit override CLEARED for {agent}")
+    return existed
+
 def rate_limit_window_progress(info: Optional[Dict[str, Any]], now: Optional[float] = None) -> Optional[float]:
     """Fraction (0.0-1.0) of the current rate-limit window that has elapsed.
 
@@ -782,7 +900,17 @@ def is_rate_limit_paused(agent: str) -> bool:
     jammed a real session with plenty of window left (2026-08-08, Ian:
     'we shouldn't stop work just at 90%'). Empty/missing info (e.g. right
     after a startup with nothing yet loaded from the DB and no turn
-    completed) is NOT paused by default."""
+    completed) is NOT paused by default.
+
+    2026-08-10: checked before either of the above — an active, owner-set
+    override (see is_rate_limit_override_active / set_rate_limit_override)
+    makes this return False regardless of status or utilization. This does
+    NOT change what Anthropic will actually accept; a genuinely rejected
+    request still gets rejected at the API layer either way. All this
+    bypasses is our own app-level queue hold, for the rare case Ian wants
+    a fix pushed through immediately instead of waiting for the window."""
+    if is_rate_limit_override_active(agent):
+        return False
     info = agent_rate_limits.get(agent, {})
     if info.get("status") == RATE_LIMIT_REJECTED_STATUS:
         return True
@@ -2679,6 +2807,58 @@ async def handle_agent_reload(request):
     return web.json_response({"status": "reloaded"})
 
 
+async def handle_rate_limit_override_set(request):
+    """POST /agents/{name}/rate-limit-override - Owner-set, auto-expiring
+    bypass of is_rate_limit_paused() (2026-08-10). Body:
+    {"enabled_by": "...", "duration_sec": 900, "reason": "..."}
+    duration_sec is optional (defaults to 15 minutes) and is silently
+    capped at RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC — see
+    set_rate_limit_override(). enabled_by is required so an override is
+    always attributable, same principle as the recovery-agent's
+    always-attributed #signals posts."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if agent not in agent_config:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    data = await request.json() if request.can_read_body else {}
+    enabled_by = (data.get("enabled_by") or "").strip()
+    if not enabled_by:
+        return web.json_response({"error": "enabled_by is required"}, status=400)
+    try:
+        duration_sec = float(data.get("duration_sec", 900))
+    except (TypeError, ValueError):
+        return web.json_response({"error": "duration_sec must be a number"}, status=400)
+    reason = data.get("reason") or ""
+
+    expires_at = await set_rate_limit_override(agent, enabled_by, duration_sec, reason)
+    return web.json_response({
+        "status": "override_set",
+        "agent": agent,
+        "enabled_by": enabled_by,
+        "expires_at": expires_at,
+        "capped": duration_sec > RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC,
+    })
+
+
+async def handle_rate_limit_override_clear(request):
+    """POST /agents/{name}/rate-limit-override/clear - Cancel an active
+    override early."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if agent not in agent_config:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    existed = await clear_rate_limit_override(agent)
+    return web.json_response({"status": "override_cleared" if existed else "no_active_override", "agent": agent})
+
+
 # Agent name validator — same surface as bin/create-agent.sh's check, used
 # to reject path traversal / shell metachars before we touch disk.
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -2922,6 +3102,10 @@ async def startup(app):
     # silently resume processing.
     await _load_rate_limits_from_db()
 
+    # Restore any still-active rate-limit override (2026-08-10) — see
+    # _load_rate_limit_overrides_from_db() docstring.
+    await _load_rate_limit_overrides_from_db()
+
     # Initialize locks and state
     for agent in agent_config:
         agent_locks[agent] = asyncio.Lock()
@@ -3006,6 +3190,8 @@ def main():
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
     app.router.add_post("/agents/{name}/reload", handle_agent_reload)
     app.router.add_post("/agents/{name}/register", handle_agent_register)
+    app.router.add_post("/agents/{name}/rate-limit-override", handle_rate_limit_override_set)
+    app.router.add_post("/agents/{name}/rate-limit-override/clear", handle_rate_limit_override_clear)
     app.router.add_post("/cost", handle_cost)
     app.router.add_get("/cost/{agent}", handle_cost_get)
     app.router.add_get("/usage", handle_usage)

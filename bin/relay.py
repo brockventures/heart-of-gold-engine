@@ -502,6 +502,7 @@ class DiscordAdapter(discord.Client):
         parts = content.split()
         cmd = parts[1] if len(parts) > 1 else "status"
         target_agent = parts[2] if len(parts) > 2 else None
+        extra_args = parts[3:] if len(parts) > 3 else []
         if not target_agent:
             target_agent = next(
                 (name for name, cfg in agent_config.items()
@@ -509,14 +510,20 @@ class DiscordAdapter(discord.Client):
                 next(iter(agent_config), None)
             )
 
-        reply = await self._run_sys_command(cmd, target_agent)
+        reply = await self._run_sys_command(
+            cmd, target_agent, extra_args, str(message.author)
+        )
         await message.channel.send(reply)
         return True
 
-    async def _run_sys_command(self, cmd: str, agent: Optional[str]) -> str:
+    async def _run_sys_command(
+        self, cmd: str, agent: Optional[str],
+        extra_args: Optional[List[str]] = None, author: str = "unknown",
+    ) -> str:
         """Talk to agent-server's existing /agents endpoints directly —
         not adding a mechanism, just a Discord surface for what already
         exists (GET /agents, POST /agents/{name}/reset|reload)."""
+        extra_args = extra_args or []
         headers = {"Authorization": f"Bearer {AGENT_SERVER_TOKEN}"}
         try:
             if cmd == "status":
@@ -583,7 +590,60 @@ class DiscordAdapter(discord.Client):
                 return (f"**/sys reload** `{agent}`: "
                         f"{'done — session preserved' if ok else f'failed ({resp.status})'}")
 
-            return f"Unknown /sys command: `{cmd}`. Known: status, clear, reload, usage"
+            if cmd == "override":
+                # /sys override <agent> <minutes> [reason...] — owner-set,
+                # auto-expiring bypass of is_rate_limit_paused() for one
+                # agent. 2026-08-10, Ian's ask: "bugfixes regardless of
+                # session limits, at my discretion." Server-side caps the
+                # duration regardless of what's requested here (see
+                # RATE_LIMIT_OVERRIDE_MAX_DURATION_SEC in agent-server.py)
+                # so a typo (or a forgotten override) can't disable the
+                # circuit breaker indefinitely.
+                if not extra_args:
+                    return "**/sys override** `<agent>` `<minutes>` `[reason...]` — minutes required"
+                try:
+                    minutes = float(extra_args[0])
+                except ValueError:
+                    return f"**/sys override**: `{extra_args[0]}` isn't a number of minutes"
+                reason = " ".join(extra_args[1:])
+                payload = {
+                    "enabled_by": author,
+                    "duration_sec": minutes * 60,
+                    "reason": reason,
+                }
+                async with self.http_session.post(
+                    f"{AGENT_SERVER_URL}/agents/{agent}/rate-limit-override",
+                    headers=headers, json=payload,
+                ) as resp:
+                    data = await resp.json() if resp.status == 200 else {}
+                    ok = resp.status == 200
+                if not ok:
+                    return f"**/sys override** `{agent}`: failed ({resp.status})"
+                expires = data.get("expires_at")
+                expires_str = (
+                    datetime.fromtimestamp(expires).strftime("%H:%M UTC")
+                    if isinstance(expires, (int, float)) else "?"
+                )
+                capped_note = " (capped — requested duration was longer)" if data.get("capped") else ""
+                return (f"**/sys override** `{agent}`: rate-limit pause bypassed until "
+                        f"{expires_str}{capped_note}. Anthropic can still reject calls "
+                        f"for real — this only lifts our own queue hold.")
+
+            if cmd == "override-clear":
+                async with self.http_session.post(
+                    f"{AGENT_SERVER_URL}/agents/{agent}/rate-limit-override/clear",
+                    headers=headers,
+                ) as resp:
+                    data = await resp.json() if resp.status == 200 else {}
+                    ok = resp.status == 200
+                if not ok:
+                    return f"**/sys override-clear** `{agent}`: failed ({resp.status})"
+                had_one = data.get("status") == "override_cleared"
+                return (f"**/sys override-clear** `{agent}`: "
+                        f"{'cleared' if had_one else 'no active override'}")
+
+            return (f"Unknown /sys command: `{cmd}`. Known: status, clear, "
+                    f"reload, usage, override, override-clear")
         except Exception as e:
             return f"**/sys {cmd}** failed: {e}"
 
