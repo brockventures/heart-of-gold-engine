@@ -280,16 +280,17 @@ class DiscordAdapter(discord.Client):
         self._health_task: Optional[asyncio.Task] = None
         self._deferred_poke_task: Optional[asyncio.Task] = None
 
-        # Native Discord slash commands for the three /sys commands that
-        # already have a real handler (Task #12, 2026-08-07). We're a
-        # single bare discord.Client, unlike Amos's five-bots-per-process
-        # setup — his reason for staying on raw REST registration instead
-        # of discord.py's CommandTree (avoiding a restructure across all
-        # five) doesn't apply here, so CommandTree is the better call for
-        # us: officially supported, handles registration and interaction
-        # dispatch itself, one less hand-rolled REST surface to get
-        # subtly wrong. Registers only status/clear/reload — the ones
-        # with a real handler already. Amos's explicit warning, taken
+        # Native Discord slash commands for the /sys commands that have a
+        # real handler (Task #12, 2026-08-07; override/override-clear
+        # added 2026-08-10). We're a single bare discord.Client, unlike
+        # Amos's five-bots-per-process setup — his reason for staying on
+        # raw REST registration instead of discord.py's CommandTree
+        # (avoiding a restructure across all five) doesn't apply here, so
+        # CommandTree is the better call for us: officially supported,
+        # handles registration and interaction dispatch itself, one less
+        # hand-rolled REST surface to get subtly wrong. Registers
+        # status/clear/reload/override/override-clear — every /sys
+        # command with a real handler. Amos's explicit warning, taken
         # seriously: a command that registers cleanly and has no matching
         # branch silently does nothing when clicked, nothing errors
         # anywhere. The text `/sys` intercept stays as-is, unchanged,
@@ -336,6 +337,32 @@ class DiscordAdapter(discord.Client):
             if not await _owner_check(interaction):
                 return
             reply = await adapter._run_sys_command("reload", agent or _default_agent())
+            await interaction.response.send_message(reply)
+
+        @self.tree.command(name="override", description="Bypass rate-limit pause for an agent (owner, auto-expiring, capped)")
+        @discord.app_commands.describe(
+            minutes="Duration in minutes (server caps this regardless)",
+            agent="Target agent (default: the channel's owning agent)",
+            reason="Optional reason, logged with the override",
+        )
+        async def override_cmd(
+            interaction: discord.Interaction, minutes: float,
+            agent: Optional[str] = None, reason: Optional[str] = None,
+        ):
+            if not await _owner_check(interaction):
+                return
+            extra_args = [str(minutes)] + ([reason] if reason else [])
+            reply = await adapter._run_sys_command(
+                "override", agent or _default_agent(), extra_args, str(interaction.user)
+            )
+            await interaction.response.send_message(reply)
+
+        @self.tree.command(name="override-clear", description="Clear an active rate-limit override")
+        @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
+        async def override_clear_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
+            if not await _owner_check(interaction):
+                return
+            reply = await adapter._run_sys_command("override-clear", agent or _default_agent())
             await interaction.response.send_message(reply)
 
     async def setup_hook(self):
