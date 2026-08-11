@@ -9,6 +9,7 @@ Port: 18791 (configurable via AGENT_SERVER_PORT env var)
 """
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import logging
@@ -1479,25 +1480,51 @@ async def kill_agent_subprocess(agent: str):
     log.info(f"{agent} subprocess terminated")
 
 async def restart_agent(agent: str):
-    """Restart agent subprocess"""
+    """Restart agent subprocess.
+
+    Gated on agent_locks[agent] (2026-08-11) — process_agent_queue() holds
+    that lock for the full duration of an in-flight turn, including the
+    blocking proc.stdout.readline() loop in read_agent_response(). Killing
+    the subprocess out from under that readline() closes stdout, which
+    returns EOF immediately: the turn's response comes back empty, gets
+    marked STATUS_COMPLETE anyway, and nothing posts to Discord — silent,
+    no exception, no log line calling it an error. Real incident: a manual
+    /compact landed in the same instant as a real message, ate it, and the
+    sender (reasonably) thought Marvin just didn't respond. The automatic
+    compaction triggers (maybe_compact_session etc.) were never affected —
+    they already only fire after process_agent_queue's lock is released —
+    but the manual /compact and /restart /reload HTTP endpoints call this
+    directly, with no relationship to whatever turn might be mid-flight.
+    Acquiring the lock here just makes restart wait for the current turn
+    to actually finish first, same as it always implicitly did for the
+    automatic paths.
+    """
     log.info(f"Restarting {agent}")
-    await kill_agent_subprocess(agent)
-    await clear_session(agent)
-    agent_last_cost.pop(agent, None)
-    response_buffers[agent] = ""
-    await start_agent_subprocess(agent)
+    lock = agent_locks.get(agent)
+    async with (lock if lock else contextlib.nullcontext()):
+        await kill_agent_subprocess(agent)
+        await clear_session(agent)
+        agent_last_cost.pop(agent, None)
+        response_buffers[agent] = ""
+        await start_agent_subprocess(agent)
 
 
 async def reload_agent(agent: str):
     """Bounce the subprocess but keep the session — used to pick up new
     SYSTEM_PROMPT / persona / MCP config without dropping conversation
     context. The respawn calls --resume on the existing session_id.
+
+    Same lock-gating as restart_agent() above and for the same reason —
+    this hits kill_agent_subprocess() too, so it's exposed to the identical
+    mid-turn race.
     """
     log.info(f"Reloading {agent} (preserving session)")
-    await kill_agent_subprocess(agent)
-    agent_last_cost.pop(agent, None)
-    response_buffers[agent] = ""
-    await start_agent_subprocess(agent)
+    lock = agent_locks.get(agent)
+    async with (lock if lock else contextlib.nullcontext()):
+        await kill_agent_subprocess(agent)
+        agent_last_cost.pop(agent, None)
+        response_buffers[agent] = ""
+        await start_agent_subprocess(agent)
 
 # =============================================================================
 # Cost Tracking
