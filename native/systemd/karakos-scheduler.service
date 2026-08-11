@@ -6,15 +6,15 @@ BindsTo=karakos-agent-server.service
 
 [Service]
 Type=simple
-User=@@KARAKOS_USER@@
-Group=@@KARAKOS_USER@@
+User=karakos
+Group=karakos
 
-WorkingDirectory=@@INSTALL_DIR@@
-Environment=HOME=@@INSTALL_DIR_PARENT@@
-Environment=WORKSPACE_ROOT=@@INSTALL_DIR@@
-EnvironmentFile=@@INSTALL_DIR@@/config/.env
+WorkingDirectory=/opt/karakos
+Environment=HOME=/home/karakos
+Environment=WORKSPACE_ROOT=/opt/karakos
+EnvironmentFile=/opt/karakos/config/.env
 
-ExecStart=@@INSTALL_DIR@@/.venv/bin/python3 @@INSTALL_DIR@@/bin/scheduler.py
+ExecStart=/opt/karakos/.venv/bin/python3 /opt/karakos/bin/scheduler.py
 
 Restart=always
 RestartSec=2

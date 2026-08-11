@@ -6,15 +6,15 @@ BindsTo=karakos-agent-server.service
 
 [Service]
 Type=simple
-User=@@KARAKOS_USER@@
-Group=@@KARAKOS_USER@@
+User=karakos
+Group=karakos
 
-WorkingDirectory=@@INSTALL_DIR@@
-Environment=HOME=@@INSTALL_DIR_PARENT@@
-Environment=WORKSPACE_ROOT=@@INSTALL_DIR@@
-EnvironmentFile=@@INSTALL_DIR@@/config/.env
+WorkingDirectory=/opt/karakos
+Environment=HOME=/home/karakos
+Environment=WORKSPACE_ROOT=/opt/karakos
+EnvironmentFile=/opt/karakos/config/.env
 
-ExecStart=@@INSTALL_DIR@@/.venv/bin/python3 @@INSTALL_DIR@@/bin/relay.py
+ExecStart=/opt/karakos/.venv/bin/python3 /opt/karakos/bin/relay.py
 
 # Amos's correction (2026-08-10): on-failure is wrong here. A clean Discord
 # gateway close / main() falling off the end is exit 0 — on-failure would

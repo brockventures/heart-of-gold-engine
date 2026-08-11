@@ -9,16 +9,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=@@KARAKOS_USER@@
-Group=@@KARAKOS_USER@@
+User=karakos
+Group=karakos
 
-WorkingDirectory=@@INSTALL_DIR@@
-Environment=HOME=@@INSTALL_DIR_PARENT@@
-Environment=WORKSPACE_ROOT=@@INSTALL_DIR@@
-EnvironmentFile=@@INSTALL_DIR@@/config/.env
+WorkingDirectory=/opt/karakos
+Environment=HOME=/home/karakos
+Environment=WORKSPACE_ROOT=/opt/karakos
+EnvironmentFile=/opt/karakos/config/.env
 
 # Absolute interpreter + script path — no shell, so no venv activate.
-ExecStart=@@INSTALL_DIR@@/.venv/bin/python3 @@INSTALL_DIR@@/bin/agent-server.py
+ExecStart=/opt/karakos/.venv/bin/python3 /opt/karakos/bin/agent-server.py
 
 # Deliberately excluded from the auto-reload-on-commit hook (same as the
 # container setup) — this is the process that would be delivering a live
