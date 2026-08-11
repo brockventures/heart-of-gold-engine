@@ -8,6 +8,7 @@ required headers, and outputs to checkpoint file for next session re-injection.
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import subprocess
@@ -16,7 +17,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-WORKSPACE_ROOT = Path("/workspace")
+WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 # NOTE (2026-08-06): this used to point at logs/agent-streams/, which
 # nothing has ever written to — see cost-model-migration.md. Real
 # per-turn history lives in the Claude Code CLI's own transcript files,
