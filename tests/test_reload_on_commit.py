@@ -8,6 +8,8 @@ restarted it. These tests exercise the pure changed-files -> bounce-plan
 mapping (plan_reloads) without touching real processes or git.
 """
 
+import json
+
 from conftest import import_script
 
 reload_on_commit = import_script("reload-on-commit")
@@ -67,3 +69,50 @@ def test_empty_changeset_is_a_noop():
     to_bounce, warnings = reload_on_commit.plan_reloads([])
     assert to_bounce == {}
     assert warnings == []
+
+
+def test_main_dispatches_bounce_asynchronously(tmp_path, monkeypatch):
+    """2026-08-11: per Amos's report of two live outages from this same
+    shape of bug on his side, the fix moved to relay.py's own graceful
+    drain on SIGTERM (see _graceful_shutdown) — but the old synchronous
+    subprocess.run in this hook (blocking the post-commit hook, and
+    therefore `git commit` itself, on the bounce completing) was still
+    worth removing on its own merits. Confirms main() now uses Popen
+    (fire-and-forget, detached) rather than run (blocking-until-complete)
+    for the actual signal dispatch, and logs an 'auto_reload_dispatched'
+    event without waiting on a returncode."""
+    monkeypatch.setattr(reload_on_commit, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(reload_on_commit, "EVENTS_LOG", tmp_path / "logs" / "git-events.jsonl")
+    monkeypatch.setattr(reload_on_commit, "get_committed_files", lambda: ["bin/relay.py"])
+
+    popen_calls = []
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            popen_calls.append((args, kwargs))
+
+    def fake_run(args, **kwargs):
+        # Only subprocess.run left in main() is `git rev-parse HEAD`.
+        class Result:
+            stdout = "deadbeef\n"
+        return Result()
+
+    monkeypatch.setattr(reload_on_commit.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(reload_on_commit.subprocess, "run", fake_run)
+
+    reload_on_commit.main()
+
+    assert len(popen_calls) == 1
+    args, kwargs = popen_calls[0]
+    assert kwargs.get("start_new_session") is True, (
+        "must detach from git's process group so the hook returning "
+        "doesn't affect signal delivery"
+    )
+
+    events_log = tmp_path / "logs" / "git-events.jsonl"
+    assert events_log.exists()
+    events = [json.loads(line) for line in events_log.read_text().splitlines()]
+    assert any(e.get("event") == "auto_reload_dispatched" for e in events)
+    assert not any(e.get("event") == "auto_reload" for e in events), (
+        "old synchronous event name should be gone, not just supplemented"
+    )

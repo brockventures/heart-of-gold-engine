@@ -1,25 +1,6 @@
 services:
   karakos:
-    # 2026-08-10: switched from pulling upstream's ghcr.io/mcarmody/karakos:latest
-    # to a locally-built image from iacoley/heart-of-gold's main branch. Reason:
-    # bin/, mcp/, system/, tests/, dashboard/ are baked into the image (see the
-    # comment on the bind mounts below) and upstream's published image never
-    # contains this install's customizations (recovery-agent, the rate-limit
-    # rejected-status/warning-vs-hard-stop fix, etc.) no matter what's merged
-    # into heart-of-gold's git history — those only take effect once actually
-    # built into an image this compose file points at. Previously those files
-    # were being hand-patched into the running container's writable layer,
-    # which a Docker-Desktop/WSL2 bind-mount staleness issue (stale
-    # docker-desktop-bind-mounts shim for ${HOME}/.claude.json, which gets
-    # rewritten routinely and forces a full `down`+`up` to fix) can wipe at any
-    # time — confirmed happening live on 2026-08-10. `image:` names the tag so
-    # `docker compose up` reuses the cached local image without rebuilding;
-    # `build:` is there so `docker compose build` (after a `git pull` in
-    # ~/karakos-heart-of-gold) picks up future changes on demand. Original
-    # pull-from-ghcr config preserved in docker-compose.yml.bak-2026-08-10-pre-local-build.
-    image: karakos-heart-of-gold:main
-    build:
-      context: /home/iacoley/karakos-heart-of-gold
+    image: ghcr.io/mcarmody/karakos:latest
     env_file: .env
     volumes:
       # Bind-mount config + agents from the host so setup.sh's output (the

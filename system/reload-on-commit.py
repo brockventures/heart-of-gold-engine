@@ -100,26 +100,30 @@ def main():
     ).stdout.strip()
 
     for label, pattern in to_bounce.items():
-        print(f"reload-on-commit: {label} code changed in {commit_sha[:8]} — bouncing via safe-pkill.sh")
-        result = subprocess.run(
-            ["bash", str(SAFE_PKILL), "-TERM", pattern],
-            capture_output=True, text=True, cwd=str(WORKSPACE_ROOT),
-        )
+        print(f"reload-on-commit: {label} code changed in {commit_sha[:8]} — bouncing via safe-pkill.sh (async)")
+        # 2026-08-11, per Amos's report of two live outages caused by this
+        # same shape of bug on his side: dispatch the bounce and return
+        # immediately rather than blocking `git commit` on the outcome.
+        # The target process (relay) now owns its own graceful drain (see
+        # _graceful_shutdown in bin/relay.py) — this hook doesn't need to
+        # wait for or verify that, just fire the signal. start_new_session
+        # detaches the child from git's process group so it isn't affected
+        # if git itself exits/is reaped before the signal lands.
+        bounce_log = WORKSPACE_ROOT / "logs" / f"reload-on-commit-{label}.log"
+        bounce_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(bounce_log, "a") as logf:
+            subprocess.Popen(
+                ["bash", str(SAFE_PKILL), "-TERM", pattern],
+                stdout=logf, stderr=subprocess.STDOUT,
+                cwd=str(WORKSPACE_ROOT), start_new_session=True,
+            )
         _log({
             "ts": datetime.now(timezone.utc).isoformat(),
-            "event": "auto_reload",
+            "event": "auto_reload_dispatched",
             "commit": commit_sha,
             "process": label,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "returncode": result.returncode,
+            "note": f"fired async, see {bounce_log.name} for safe-pkill.sh output",
         })
-        if result.returncode != 0:
-            print(
-                f"reload-on-commit: WARNING — bounce of {label} may not "
-                f"have succeeded: {result.stderr.strip()}",
-                file=sys.stderr,
-            )
 
     for w in warnings:
         print(f"reload-on-commit: NOTE — {w}")

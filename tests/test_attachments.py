@@ -193,10 +193,15 @@ def test_relay_downloads_attachments_before_posting():
 def test_relay_download_happens_in_send_not_on_message():
     """Downloads must be triggered from send_to_agent_server, not
     on_message — a message the reply gates are about to drop should never
-    touch disk. Checked by confirming on_message itself never calls
-    download_attachments directly."""
+    touch disk. Checked by confirming the actual routing logic never calls
+    download_attachments directly.
+
+    2026-08-11: on_message itself is now a thin in-flight-tracking wrapper
+    (see _graceful_shutdown / _INFLIGHT_COUNT) that just calls
+    _on_message_impl — that's where the real routing logic (and the
+    invariant this test checks) now lives."""
     src = RELAY.read_text()
-    on_message_start = src.index("async def on_message")
+    on_message_start = src.index("async def _on_message_impl")
     on_message_end = src.index("\n    async def ", on_message_start + 1)
     body = src[on_message_start:on_message_end]
     assert "download_attachments" not in body

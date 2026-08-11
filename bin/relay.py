@@ -11,10 +11,12 @@ Adapters:
 import asyncio
 import discord
 import fcntl
+import functools
 import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import textwrap
@@ -26,6 +28,69 @@ from logging.handlers import RotatingFileHandler
 
 from reply_gate import Decision, GateMessage, ReplyGate, SCORER_PROMPT
 from handoff import parse_handoff
+
+# =============================================================================
+# Graceful shutdown / in-flight tracking
+# =============================================================================
+# 2026-08-11: Amos flagged a real gap in reload-on-commit.py's relay bounce —
+# a change to bin/relay.py or bin/reply_gate.py sends this process SIGTERM
+# with no grace period, so a commit landing mid-handler (an in-flight
+# Discord reply, a /sys command response, a dispatch to agent-server) can be
+# torn down mid-flight and silently lost. bin/agent-server.py already has an
+# equivalent gap covered by simply being excluded from auto-bounce entirely
+# (see reload-on-commit.py's SELF_PROCESS_WARN) — that option isn't
+# available here since relay *needs* to pick up its own code changes.
+#
+# Fix: track how many handler coroutines are currently running
+# (_INFLIGHT_COUNT, safe as a plain int — asyncio is single-threaded, no
+# handler can preempt another's read-modify-write of it), and on SIGTERM,
+# drain up to GRACEFUL_SHUTDOWN_TIMEOUT_SEC before actually closing the
+# client, instead of dying instantly. This is "idle-gating" done from the
+# inside (the process finishing its own work) rather than an external
+# fixed sleep guessing how long that takes — reload-on-commit.py's kill
+# doesn't need to know; it just signals and moves on.
+GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 10
+_INFLIGHT_COUNT = 0
+
+
+def _inflight_tracked(fn):
+    """Decorator for Discord-facing handler entry points (on_message, slash
+    command callbacks). Increments/decrements the module-level in-flight
+    counter around the full handler body so a SIGTERM shutdown knows
+    whether it's safe to close the client yet."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        global _INFLIGHT_COUNT
+        _INFLIGHT_COUNT += 1
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _INFLIGHT_COUNT -= 1
+    return wrapper
+
+
+async def _graceful_shutdown(discord_client) -> None:
+    """SIGTERM handler: wait for in-flight handlers to finish (bounded),
+    then close the client so main()'s await returns and the process exits
+    cleanly for supervisor's autorestart to pick up. Never blocks forever —
+    a stuck handler gets logged and overridden, not allowed to wedge a
+    restart indefinitely."""
+    log.warning(
+        "relay: SIGTERM received, %d handler(s) in flight — draining up to %ss "
+        "before shutdown", _INFLIGHT_COUNT, GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
+    )
+    deadline = time.monotonic() + GRACEFUL_SHUTDOWN_TIMEOUT_SEC
+    while _INFLIGHT_COUNT > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    if _INFLIGHT_COUNT > 0:
+        log.warning(
+            "relay: shutdown proceeding with %d handler(s) still in flight "
+            "after %ss grace period — that work is being dropped, not waited "
+            "on further", _INFLIGHT_COUNT, GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
+        )
+    else:
+        log.info("relay: drained cleanly, closing client")
+    await discord_client.close()
 
 # =============================================================================
 # Utilities
@@ -318,41 +383,66 @@ class DiscordAdapter(discord.Client):
 
         @self.tree.command(name="status", description="Agent server status")
         async def status_cmd(interaction: discord.Interaction):
-            if not await _owner_check(interaction):
-                return
-            reply = await adapter._run_sys_command("status", None)
-            await interaction.response.send_message(reply)
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command("status", None)
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
 
         @self.tree.command(name="usage", description="Rate-limit headroom for the whole install (shared across agents)")
         async def usage_cmd(interaction: discord.Interaction):
-            if not await _owner_check(interaction):
-                return
-            reply = await adapter._run_sys_command("usage", None)
-            await interaction.response.send_message(reply)
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command("usage", None)
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
 
         @self.tree.command(name="clear", description="Clear session + restart subprocess (destructive)")
         @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
         async def clear_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
-            if not await _owner_check(interaction):
-                return
-            reply = await adapter._run_sys_command("clear", agent or _default_agent())
-            await interaction.response.send_message(reply)
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command("clear", agent or _default_agent())
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
 
         @self.tree.command(name="reload", description="Restart subprocess, keep session")
         @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
         async def reload_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
-            if not await _owner_check(interaction):
-                return
-            reply = await adapter._run_sys_command("reload", agent or _default_agent())
-            await interaction.response.send_message(reply)
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command("reload", agent or _default_agent())
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
 
         @self.tree.command(name="compact", description="Summarize session and restart fresh (lowers context utilization)")
         @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
         async def compact_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
-            if not await _owner_check(interaction):
-                return
-            reply = await adapter._run_sys_command("compact", agent or _default_agent())
-            await interaction.response.send_message(reply)
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command("compact", agent or _default_agent())
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
 
         @self.tree.command(name="override", description="Bypass rate-limit pause for an agent (owner, auto-expiring, capped)")
         @discord.app_commands.describe(
@@ -364,21 +454,31 @@ class DiscordAdapter(discord.Client):
             interaction: discord.Interaction, minutes: float,
             agent: Optional[str] = None, reason: Optional[str] = None,
         ):
-            if not await _owner_check(interaction):
-                return
-            extra_args = [str(minutes)] + ([reason] if reason else [])
-            reply = await adapter._run_sys_command(
-                "override", agent or _default_agent(), extra_args, str(interaction.user)
-            )
-            await interaction.response.send_message(reply)
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                extra_args = [str(minutes)] + ([reason] if reason else [])
+                reply = await adapter._run_sys_command(
+                    "override", agent or _default_agent(), extra_args, str(interaction.user)
+                )
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
 
         @self.tree.command(name="override-clear", description="Clear an active rate-limit override")
         @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
         async def override_clear_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
-            if not await _owner_check(interaction):
-                return
-            reply = await adapter._run_sys_command("override-clear", agent or _default_agent())
-            await interaction.response.send_message(reply)
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command("override-clear", agent or _default_agent())
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
 
     async def setup_hook(self):
         """Initialize HTTP session"""
@@ -721,6 +821,20 @@ class DiscordAdapter(discord.Client):
             return f"**/sys {cmd}** failed: {e}"
 
     async def on_message(self, message: discord.Message):
+        """Thin in-flight-tracking wrapper — see _on_message_impl for the
+        actual routing logic. Kept separate so a SIGTERM mid-handling
+        (reload-on-commit.py bouncing this process for a relay.py/
+        reply_gate.py change) can be detected and waited out by
+        _graceful_shutdown() instead of silently dropping whatever this
+        message was in the middle of doing."""
+        global _INFLIGHT_COUNT
+        _INFLIGHT_COUNT += 1
+        try:
+            await self._on_message_impl(message)
+        finally:
+            _INFLIGHT_COUNT -= 1
+
+    async def _on_message_impl(self, message: discord.Message):
         """Route Discord message to agent"""
         # Ignore own messages
         if message.author == self.user:
@@ -1327,6 +1441,29 @@ async def main():
     # Start Discord bot
     token = os.environ.get(agent_config[primary_agent]["discord_bot_token_env"])
     discord_client = DiscordAdapter()
+
+    # Graceful SIGTERM: reload-on-commit.py's safe-pkill.sh sends this when
+    # relay.py/reply_gate.py changes land, so it needs an actual handler
+    # rather than the default (immediate termination) — see
+    # _graceful_shutdown for the drain logic. discord_client.start() is
+    # called directly here rather than via Client.run(), which is the
+    # sync wrapper that would normally install this signal handling for
+    # us; doing it explicitly since we bypass that wrapper.
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(
+            signal.SIGTERM,
+            lambda: asyncio.ensure_future(_graceful_shutdown(discord_client)),
+        )
+    except NotImplementedError:
+        # add_signal_handler is Unix-only; every deployment target so far
+        # (container, native systemd) is Unix, so this is a defensive
+        # fallback, not an expected path — logged so it's visible if that
+        # ever changes rather than silently losing the whole fix.
+        log.warning(
+            "relay: loop.add_signal_handler unavailable on this platform — "
+            "SIGTERM will fall back to immediate termination, no graceful drain"
+        )
 
     try:
         # Run Discord bot (blocks until closed)
