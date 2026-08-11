@@ -1868,6 +1868,26 @@ async def read_agent_response(
     config = agent_config.get(agent, {})
     tool_streaming = config.get("tool_streaming", False)
     stream_to_channel = config.get("stream_to_channel", False)
+
+    # Per-channel quiet mode (2026-08-11, Ian: keep #agent-chat clean of
+    # tool-call/interim "thinking" noise). agents.json's `quiet_channels`
+    # lists channel *names* (per channels.json), not IDs, since that's
+    # what a human actually edits. Only silences tool lines and interim
+    # italics for this turn — the real final answer (pending_final in
+    # process_agent_queue) is never gated by either flag and always
+    # posts regardless, so a quiet channel still gets its answer, just
+    # without the play-by-play.
+    quiet_channels = config.get("quiet_channels", [])
+    if quiet_channels:
+        channel_name = next(
+            (name for name, cfg in channels_config.get("channels", {}).items()
+             if cfg.get("id") == channel_id),
+            None,
+        )
+        if channel_name in quiet_channels:
+            tool_streaming = False
+            stream_to_channel = False
+
     msg_ids = message_ids or []
 
     final_text = ""
