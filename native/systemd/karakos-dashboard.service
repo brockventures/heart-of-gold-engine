@@ -5,20 +5,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=@@KARAKOS_USER@@
-Group=@@KARAKOS_USER@@
+User=karakos
+Group=karakos
 
-WorkingDirectory=@@INSTALL_DIR@@/dashboard
-Environment=HOME=@@INSTALL_DIR_PARENT@@
-Environment=PORT=@@DASHBOARD_PORT@@
-EnvironmentFile=@@INSTALL_DIR@@/config/.env
+WorkingDirectory=/opt/karakos/dashboard
+Environment=HOME=/home/karakos
+Environment=PORT=3000
+EnvironmentFile=/opt/karakos/config/.env
 
 # `next start` does not work with `output: standalone` (next.config.ts) —
 # it ignores the trimmed standalone bundle and warns on every start. To
 # rebuild after code changes: cd dashboard && npm run build, then
 # `systemctl restart karakos-dashboard`. Same manual-rebuild requirement as
 # the container had; native doesn't remove that step.
-ExecStart=/usr/bin/node @@INSTALL_DIR@@/dashboard/.next/standalone/server.js
+ExecStart=/usr/bin/node /opt/karakos/dashboard/.next/standalone/server.js
 
 # Amos's port-reclamation correction (2026-08-10): npm/node spawns
 # next-server as a child. Docker gave us free cleanup here because the
@@ -29,7 +29,7 @@ ExecStart=/usr/bin/node @@INSTALL_DIR@@/dashboard/.next/standalone/server.js
 # (leading "-" means a nonzero exit here, e.g. nothing was listening,
 # doesn't fail the unit).
 KillMode=mixed
-ExecStartPre=-/usr/bin/fuser -k @@DASHBOARD_PORT@@/tcp
+ExecStartPre=-/usr/bin/fuser -k 3000/tcp
 
 # A clean exit here plausibly does mean "should stay stopped" rather than
 # "crashed" (per Amos — keep on-failure for dashboard specifically, unlike

@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "postbuild": "cp -r .next/static .next/standalone/.next/static && mkdir -p .next/standalone/public && cp -r public/. .next/standalone/public/",
     "start": "next start -p ${DASHBOARD_PORT:-3000}"
   },
   "dependencies": {
