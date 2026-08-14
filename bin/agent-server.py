@@ -1877,13 +1877,25 @@ async def read_agent_response(
     # process_agent_queue) is never gated by either flag and always
     # posts regardless, so a quiet channel still gets its answer, just
     # without the play-by-play.
-    quiet_channels = config.get("quiet_channels", [])
-    if quiet_channels:
-        channel_name = next(
-            (name for name, cfg in channels_config.get("channels", {}).items()
-             if cfg.get("id") == channel_id),
-            None,
-        )
+    #
+    # 2026-08-14: flipped from a pure blocklist to allowlist-then-blocklist.
+    # A channel_id not found in our own channels_config (e.g. one that
+    # lives in a foreign guild, reached via a direct @mention) used to
+    # fail OPEN here — full tool/interim streaming into a channel we don't
+    # even recognize as ours. Found comparing notes with Amos, whose
+    # equivalent path defaults to posting nowhere unless told otherwise.
+    # Paired with relay.py's guild gate, which should stop that traffic
+    # even earlier now — this is the second layer, not the only one.
+    channel_name = next(
+        (name for name, cfg in channels_config.get("channels", {}).items()
+         if cfg.get("id") == channel_id),
+        None,
+    )
+    if channel_name is None:
+        tool_streaming = False
+        stream_to_channel = False
+    else:
+        quiet_channels = config.get("quiet_channels", [])
         if channel_name in quiet_channels:
             tool_streaming = False
             stream_to_channel = False

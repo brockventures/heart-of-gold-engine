@@ -840,7 +840,7 @@ class DiscordAdapter(discord.Client):
         if message.author == self.user:
             return
 
-        # Ignore messages from other servers
+        # Ignore messages from servers we aren't configured for
         if message.guild and str(message.guild.id) not in self.server_ids:
             return
 
@@ -951,7 +951,24 @@ class DiscordAdapter(discord.Client):
             if not decision.wake:
                 return
 
-        # Determine target agent
+        # Determine target agent. Per #82's own stated invariant ("a
+        # channel in a newly-permitted server routes nothing until it's
+        # listed [in channels.json]"), no routing should happen for a
+        # channel we haven't explicitly configured -- regardless of guild.
+        # Before 2026-08-14 that invariant only held for the channel-
+        # default-agent fallback below; the bot-mention branch skipped it
+        # entirely, so a direct @mention of my own bot ID from any
+        # server_ids-permitted guild (including Amos's Crab Cavern, added
+        # by #82 for the shared-server case) routed a full turn -- and,
+        # upstream in agent-server.py, streamed tool/interim text -- into
+        # a channel that was never actually listed. Found comparing notes
+        # with Amos on cross-server posting boundaries; paired with the
+        # quiet-channel allowlist flip in agent-server.py, which covers
+        # the same gap for any turn that still gets through some other way.
+        channel_name = self.get_channel_name(str(message.channel.id))
+        if not channel_name:
+            return  # Not a listed channel; no routing regardless of mentions.
+
         target_agent = None
 
         # Check for bot mention
@@ -962,10 +979,8 @@ class DiscordAdapter(discord.Client):
 
         # Fall back to channel default agent
         if not target_agent:
-            channel_name = self.get_channel_name(str(message.channel.id))
-            if channel_name:
-                channel_config = channels_config.get("channels", {}).get(channel_name, {})
-                target_agent = channel_config.get("default_agent")
+            channel_config = channels_config.get("channels", {}).get(channel_name, {})
+            target_agent = channel_config.get("default_agent")
 
         if not target_agent:
             return  # No routing
