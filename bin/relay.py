@@ -28,6 +28,7 @@ from logging.handlers import RotatingFileHandler
 
 from reply_gate import Decision, GateMessage, ReplyGate, SCORER_PROMPT
 from handoff import parse_handoff
+from outbox import add_pending
 
 # =============================================================================
 # Graceful shutdown / in-flight tracking
@@ -197,6 +198,23 @@ AGENT_SERVER_URL = os.environ.get("AGENT_SERVER_URL", f"http://localhost:{AGENT_
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = int(os.environ.get("OWNER_DISCORD_ID", "0"))
 
+# `/sys restart-server` (design: agents/Marvin/journal/sys-restart-server-
+# spec-2026-08-16.md, decided 2026-08-16). SAFE_PKILL is the same script
+# recovery-agent.py already uses for its own autonomous agent-server
+# bounce — one source of truth for "how do we bounce agent-server.py"
+# rather than two scripts that can drift.
+SAFE_PKILL = WORKSPACE_ROOT / "bin" / "safe-pkill.sh"
+RESTART_SERVER_CONFIRM_WINDOW_SEC = 30  # second invocation within this window actually acts
+RESTART_SERVER_COOLDOWN_SEC = 60  # guards a fat-fingered double-SIGTERM into one RestartSec=2 window
+# How long to wait for every agent to go IDLE before giving up. Ian,
+# 2026-08-16 19:50 #general ("Escalate and stop"): no force-past-ceiling
+# variant like Amos's — on timeout this posts to #signals (with the
+# required direct ping, see facts/signals-decisions-need-a-direct-ping-
+# 2026-08-16.md) and stops. A human decides whether to force it from there.
+RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC = int(os.environ.get("RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC", "300"))
+RESTART_SERVER_STATUS_INTERVAL_SEC = 30  # interim "still waiting, won't force it" pushes while idle-waiting
+RESTART_SERVER_POST_RESTART_TIMEOUT_SEC = 30  # bound on polling for agent-server to come back after SIGTERM
+
 # Dispatch config
 DISPATCH_INBOX_DIR = WORKSPACE_ROOT / "inbox"
 DISPATCH_POLL_INTERVAL = 30
@@ -345,6 +363,13 @@ class DiscordAdapter(discord.Client):
         self._health_task: Optional[asyncio.Task] = None
         self._deferred_poke_task: Optional[asyncio.Task] = None
 
+        # /sys restart-server confirm-arm + cooldown state, see
+        # _sys_restart_server(). Plain instance attrs are safe here for the
+        # same reason _INFLIGHT_COUNT is safe as a plain int — asyncio is
+        # single-threaded, no handler can preempt another's read/write.
+        self._restart_server_pending: Optional[dict] = None
+        self._restart_server_last_run: Optional[float] = None
+
         # Native Discord slash commands for the /sys commands that have a
         # real handler (Task #12, 2026-08-07; override/override-clear
         # added 2026-08-10). We're a single bare discord.Client, unlike
@@ -477,6 +502,26 @@ class DiscordAdapter(discord.Client):
                     return
                 reply = await adapter._run_sys_command("override-clear", agent or _default_agent())
                 await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
+
+        @self.tree.command(name="restart-server", description="Bounce agent-server.py itself (whole install, waits for idle, confirm required)")
+        async def restart_server_cmd(interaction: discord.Interaction):
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                # Defer immediately — the idle-wait alone can run up to
+                # RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC, and the interaction
+                # token expires long before that (Discord's 3s ack window
+                # for the initial response, ~15min for the deferred one).
+                await interaction.response.defer()
+                reply = await adapter._run_sys_command(
+                    "restart-server", None, author=str(interaction.user),
+                    channel=interaction.channel,
+                )
+                await interaction.followup.send(reply)
             finally:
                 _INFLIGHT_COUNT -= 1
 
@@ -671,7 +716,8 @@ class DiscordAdapter(discord.Client):
             )
 
         reply = await self._run_sys_command(
-            cmd, target_agent, extra_args, str(message.author)
+            cmd, target_agent, extra_args, str(message.author),
+            channel=message.channel,
         )
         await message.channel.send(reply)
         return True
@@ -679,6 +725,7 @@ class DiscordAdapter(discord.Client):
     async def _run_sys_command(
         self, cmd: str, agent: Optional[str],
         extra_args: Optional[List[str]] = None, author: str = "unknown",
+        channel: Optional["discord.abc.Messageable"] = None,
     ) -> str:
         """Talk to agent-server's existing /agents endpoints directly —
         not adding a mechanism, just a Discord surface for what already
@@ -730,6 +777,10 @@ class DiscordAdapter(discord.Client):
                 lines = [f"`{name}` — {(agents[name] or {}).get('summary', 'no reading')}"
                          for name in sorted(agents)]
                 return "**/sys usage**\n" + "\n".join(lines)
+
+            if cmd == "restart-server":
+                # Whole-process action like status/usage, no agent target.
+                return await self._sys_restart_server(author, channel)
 
             if not agent:
                 return "**/sys**: no agent configured to target"
@@ -816,9 +867,171 @@ class DiscordAdapter(discord.Client):
                         f"{'cleared' if had_one else 'no active override'}")
 
             return (f"Unknown /sys command: `{cmd}`. Known: status, clear, "
-                    f"reload, compact, usage, override, override-clear")
+                    f"reload, compact, usage, override, override-clear, "
+                    f"restart-server")
         except Exception as e:
             return f"**/sys {cmd}** failed: {e}"
+
+    async def _sys_restart_server(
+        self, author: str, channel: Optional["discord.abc.Messageable"],
+    ) -> str:
+        """/sys restart-server — bounce agent-server.py itself (not this
+        process, not scheduler.py — see spec's "Scope" decision). Full
+        design writeup: agents/Marvin/journal/sys-restart-server-spec-
+        2026-08-16.md. Runs from relay because relay's process tree has no
+        ancestry relationship to agent-server's — the same reasoning that
+        already put reload/clear here rather than routing through
+        agent-server's own HTTP API (which is served *by* the process
+        being restarted, and would die along with the thing it's trying
+        to report on).
+
+        Flow: confirm (two invocations within a short window) -> wait for
+        every agent to go IDLE with queue_depth 0 (bounded, no forcing —
+        Ian, 2026-08-16 "Escalate and stop") -> snapshot session_ids ->
+        SIGTERM via safe-pkill.sh (systemd's Restart=always relaunches it,
+        ~2s per RestartSec) -> poll until it's back and confirm sessions
+        survived.
+        """
+        now = time.time()
+
+        if self._restart_server_last_run is not None:
+            since = now - self._restart_server_last_run
+            if since < RESTART_SERVER_COOLDOWN_SEC:
+                remaining = RESTART_SERVER_COOLDOWN_SEC - since
+                return (f"**/sys restart-server**: cooldown active, "
+                        f"{remaining:.0f}s left since the last attempt.")
+
+        pending = self._restart_server_pending
+        if pending is None or (now - pending["armed_at"]) > RESTART_SERVER_CONFIRM_WINDOW_SEC:
+            self._restart_server_pending = {"armed_at": now, "author": author}
+            return (
+                "**/sys restart-server**: this bounces `agent-server.py` for "
+                "the whole install — every agent, every session (sessions are "
+                "preserved across the restart, this doesn't clear them). Run "
+                f"`/sys restart-server` again within "
+                f"{RESTART_SERVER_CONFIRM_WINDOW_SEC}s to confirm."
+            )
+        self._restart_server_pending = None  # consumed, one shot
+
+        headers = {"Authorization": f"Bearer {AGENT_SERVER_TOKEN}"}
+
+        async def _fetch_health() -> dict:
+            async with self.http_session.get(
+                f"{AGENT_SERVER_URL}/health", headers=headers
+            ) as resp:
+                return await resp.json()
+
+        # Pre-flight: wait for every agent to actually be idle. Restarting
+        # mid-turn has caused real damage before (kill_agent_subprocess() /
+        # ProcessLookupError incident, see
+        # facts/hog-main-push-complete-2026-08-11.md) — this is the one
+        # substantive addition Ian made to the original draft, and it's
+        # non-optional.
+        wait_start = time.time()
+        last_status_push = wait_start
+        snapshot: Optional[dict] = None
+        while True:
+            try:
+                health = await _fetch_health()
+            except Exception as e:
+                return (f"**/sys restart-server**: couldn't reach agent-server "
+                        f"to check idle state, nothing sent: {e}")
+
+            agents = health.get("agents", {})
+            not_idle = {
+                name: a for name, a in agents.items()
+                if a.get("state") != "IDLE" or a.get("queue_depth", 0) > 0
+            }
+            if not not_idle:
+                snapshot = agents
+                break
+
+            elapsed = time.time() - wait_start
+            detail = ", ".join(
+                f"`{name}` state={a.get('state')} queue_depth={a.get('queue_depth', 0)}"
+                for name, a in not_idle.items()
+            )
+
+            if elapsed > RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC:
+                # Ian, 2026-08-16 19:50 #general: "Escalate and stop" — no
+                # force-past-ceiling. Post full context to #signals with a
+                # direct ping (facts/signals-decisions-need-a-direct-ping-
+                # 2026-08-16.md — a #signals post needing a decision back
+                # is not sufficient on its own) and leave it to a human.
+                add_pending(
+                    "signals",
+                    f"**/sys restart-server** timed out after {int(elapsed)}s "
+                    f"waiting for idle ({detail}). Not forcing it — needs a "
+                    f"human call on whether to force a restart anyway. "
+                    f"<@{OWNER_DISCORD_ID}>",
+                )
+                return (
+                    f"**/sys restart-server**: stopped — {detail} never went "
+                    f"idle within {RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC}s. "
+                    f"Posted to #signals with a direct ping, no restart sent."
+                )
+
+            if channel is not None and (time.time() - last_status_push) > RESTART_SERVER_STATUS_INTERVAL_SEC:
+                try:
+                    await channel.send(
+                        f"**/sys restart-server**: still waiting on {detail} "
+                        f"({int(elapsed)}s elapsed, won't force it)."
+                    )
+                except Exception as e:
+                    log.warning(f"restart-server status push failed: {e}")
+                last_status_push = time.time()
+
+            await asyncio.sleep(2)
+
+        pre_sessions = {name: a.get("session_id") for name, a in snapshot.items()}
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bash", str(SAFE_PKILL), "-TERM", "bin/agent-server.py",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception as e:
+            return f"**/sys restart-server**: failed to invoke safe-pkill.sh: {e}"
+
+        self._restart_server_last_run = time.time()
+        if proc.returncode != 0:
+            output = (stderr or stdout or b"").decode(errors="ignore").strip()
+            return f"**/sys restart-server**: safe-pkill.sh failed ({output})"
+
+        # Poll until agent-server is back, then confirm sessions survived
+        # (new PID, same session_ids — the same guarantee /sys reload
+        # already relies on) rather than just "it responded".
+        poll_start = time.time()
+        while time.time() - poll_start < RESTART_SERVER_POST_RESTART_TIMEOUT_SEC:
+            await asyncio.sleep(1)
+            try:
+                health = await _fetch_health()
+            except Exception:
+                continue
+            agents = health.get("agents", {})
+            if not agents:
+                continue
+            post_sessions = {name: a.get("session_id") for name, a in agents.items()}
+            preserved = all(
+                post_sessions.get(name) == sid for name, sid in pre_sessions.items()
+            )
+            return (
+                f"**/sys restart-server**: done in {int(time.time() - poll_start)}s — "
+                f"agent-server back up, sessions "
+                f"{'preserved' if preserved else 'CHANGED (unexpected — check manually, do not assume this is fine)'}."
+            )
+
+        # No response within the timeout: this now has the same external
+        # signature as a crash-loop, not a clean bounce — say so plainly
+        # rather than a soft "might still be starting" (spec's step 6).
+        return (
+            f"**/sys restart-server**: sent SIGTERM but agent-server hasn't "
+            f"responded within {RESTART_SERVER_POST_RESTART_TIMEOUT_SEC}s — "
+            f"this looks like a crash-loop, not a clean bounce. Check "
+            f"`journalctl -u karakos-agent-server` directly."
+        )
 
     async def on_message(self, message: discord.Message):
         """Thin in-flight-tracking wrapper — see _on_message_impl for the
