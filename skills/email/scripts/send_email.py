@@ -11,8 +11,14 @@ this. Reading the file directly sidesteps that entirely and keeps this
 script correct regardless of when the container is next restarted.
 
 The MCP tool server calls this script with TOOL_ARGS as a JSON environment
-variable (to/subject/body/from_name). Output JSON to stdout; non-zero exit
-+ stderr text is treated as an error by the caller.
+variable (to/subject/body/from_name, optional attachments: list of absolute
+file paths). Output JSON to stdout; non-zero exit + stderr text is treated
+as an error by the caller.
+
+Attachment support added 2026-08-13: switches to Mailgun's multipart form
+endpoint (via `requests`, already present in the venv) whenever attachments
+are supplied. Text-only sends still use the original urlencoded urllib path
+unchanged, so existing behavior/callers are untouched.
 """
 
 import json
@@ -47,6 +53,7 @@ def main():
     subject = args.get("subject", "")
     body = args.get("body", "")
     from_name = args.get("from_name", "Marvin")
+    attachments = args.get("attachments") or []
 
     if not to or not subject or not body:
         print(json.dumps({"error": "to, subject, and body are all required"}))
@@ -69,6 +76,49 @@ def main():
     mailgun_api_domain = domain if domain.startswith("mg.") else f"mg.{domain}"
     from_domain = domain[3:] if domain.startswith("mg.") else domain
     from_address = f"{from_name} <marvin@{from_domain}>"
+    url = f"https://api.mailgun.net/v3/{mailgun_api_domain}/messages"
+
+    if attachments:
+        missing = [p for p in attachments if not Path(p).is_file()]
+        if missing:
+            print(json.dumps({"error": f"attachment(s) not found: {missing}"}))
+            sys.exit(1)
+
+        import requests
+
+        opened = [open(p, "rb") for p in attachments]
+        try:
+            files = [
+                ("attachment", (Path(p).name, fh))
+                for p, fh in zip(attachments, opened)
+            ]
+            resp = requests.post(
+                url,
+                auth=("api", api_key),
+                data={"from": from_address, "to": to, "subject": subject, "text": body},
+                files=files,
+                timeout=30,
+            )
+        finally:
+            for fh in opened:
+                fh.close()
+
+        if resp.ok:
+            result = resp.json()
+            print(json.dumps({
+                "status": "sent",
+                "message_id": result.get("id", ""),
+                "mailgun_response": result.get("message", ""),
+                "from": from_address,
+                "to": to,
+                "attachments": [Path(p).name for p in attachments],
+            }))
+        else:
+            print(json.dumps({
+                "error": f"Mailgun API error {resp.status_code}: {resp.text}"
+            }))
+            sys.exit(1)
+        return
 
     payload = urllib.parse.urlencode({
         "from": from_address,
@@ -77,7 +127,6 @@ def main():
         "text": body,
     }).encode()
 
-    url = f"https://api.mailgun.net/v3/{mailgun_api_domain}/messages"
     request = urllib.request.Request(url, data=payload, method="POST")
     credentials = f"api:{api_key}".encode()
     import base64
