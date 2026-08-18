@@ -2,7 +2,12 @@
 Description=Karakos scheduler (cron-style task dispatch)
 After=network-online.target karakos-agent-server.service
 Wants=network-online.target
-BindsTo=karakos-agent-server.service
+# Requires=, not BindsTo= (changed 2026-08-18) — see karakos-relay.service
+# for the full incident writeup. Same bug, same fix: BindsTo= forcibly
+# stopped this unit on every agent-server bounce and never restarted it,
+# leaving it dead for ~9h after the 09:34 restart-server test until
+# manually started.
+Requires=karakos-agent-server.service
 
 [Service]
 Type=simple

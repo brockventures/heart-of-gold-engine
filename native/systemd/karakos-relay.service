@@ -2,7 +2,17 @@
 Description=Karakos relay (Discord I/O)
 After=network-online.target karakos-agent-server.service
 Wants=network-online.target
-BindsTo=karakos-agent-server.service
+# Requires=, not BindsTo= (changed 2026-08-18): BindsTo= propagates STOPS
+# too, not just start ordering — any agent-server bounce (including the
+# designed /sys restart-server path) forcibly stopped this unit as a
+# side effect, and nothing brings it back afterward (a systemd-issued
+# stop from a dependency chain doesn't trigger Restart=always the way a
+# crash would). Real incident: the 09:34 restart-server test bounced
+# agent-server cleanly in ~2s as designed, but relay and scheduler both
+# got yanked down with it and sat dead for ~9h until manually started.
+# relay already tolerates agent-server being briefly unreachable (durable
+# outbox queue, retry spooling) — it doesn't need to die with it.
+Requires=karakos-agent-server.service
 
 [Service]
 Type=simple
