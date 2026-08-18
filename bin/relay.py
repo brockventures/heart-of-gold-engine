@@ -810,6 +810,12 @@ class DiscordAdapter(discord.Client):
                             f" — {rl.get('status', '?')} ({rl.get('rateLimitType', '?')}, "
                             f"resets {resets_str}){overage}"
                         )
+                    # Monthly account spend cap (2026-08-18) — distinct from
+                    # rate_limit above: doesn't self-clear on a timer, needs
+                    # Ian to raise it at claude.ai/settings/usage. See
+                    # agent-server.py's CLI_SPEND_LIMIT_SIGNATURE.
+                    if a.get("spend_limit_blocked"):
+                        line += " **[SPEND LIMIT BLOCKED — raise at claude.ai/settings/usage]**"
                     lines.append(line)
                 return "**/sys status**\n" + "\n".join(lines) if lines else "No agents found."
 

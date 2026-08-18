@@ -188,6 +188,20 @@ RATE_LIMIT_HEARTBEAT_AUTHOR = "heartbeat"
 # QUEUED_ACK_SWEEP_INTERVAL_SEC above.
 RATE_LIMIT_GATE_SWEEP_INTERVAL_SEC = 60
 
+# Claude CLI's own hard-stop when the Anthropic *account's* monthly spend
+# cap is hit — a different failure mode than everything else in this
+# block, which is all about the five-hour/seven-day rate-limit window.
+# This one doesn't self-resolve on a timer; it needs Ian to raise the cap
+# at claude.ai/settings/usage. Real incident 2026-08-18: the CLI subprocess
+# returned this as a bare `result`/`error` string with no assistant
+# content at all, and before this fix it went straight through the normal
+# reply path and got posted to #signals verbatim, once per 30-minute
+# heartbeat, for ~2.5h before anyone caught it (05:56-08:27 UTC). Matched
+# on this URL fragment from Anthropic's own raise-limit link rather than
+# the surrounding prose, which could plausibly appear in ordinary
+# conversation about spend/limits (this codebase's own comments included).
+CLI_SPEND_LIMIT_SIGNATURE = "cc_cli_limit_message"
+
 # Headroom tracking (2026-08-09, ported/adapted from
 # mcarmody/karakos-package#128) — `cost_events`/`/cost` track dollars;
 # dollars are not what stops an agent mid-sentence, the rate limit is,
@@ -311,6 +325,13 @@ agent_rate_limit_warning_notified: Dict[str, bool] = {}
 # doesn't require flipping that behavior on. In-memory only, one entry per
 # agent, always overwritten — "how full is the session right now."
 agent_context_usage: Dict[str, Dict[str, Any]] = {}
+# Whether the agent's most recent turn hit the monthly spend cap (see
+# CLI_SPEND_LIMIT_SIGNATURE) — cleared the moment a subsequent turn
+# produces a real response. agent_spend_limit_notified dedupes the
+# #signals alert the same way agent_rate_limit_pause_notified does, so a
+# blocked agent gets one alert per block episode, not one per heartbeat.
+agent_spend_limit_blocked: Dict[str, bool] = {}
+agent_spend_limit_notified: Dict[str, bool] = {}
 # Rate-limit override (2026-08-10, Ian's ask: "bugfixes regardless of
 # session limits, at my discretion"). An owner-set, auto-expiring bypass
 # of is_rate_limit_paused() for exactly one agent at a time — for the
@@ -339,6 +360,17 @@ active_todo_messages: Dict[str, Dict] = {}
 # persisted — a restart clearing this is fine, worst case one channel
 # gets an extra ack sooner than it strictly needed to.
 channel_last_ack: Dict[str, float] = {}
+# Which message_id each channel's last ack was actually *for* (2026-08-18).
+# The 10min cooldown above was designed for back-to-back busy turns, where
+# the oldest queued message changes between acks — it was never meant to
+# let the SAME stuck message get re-acked every 10 minutes indefinitely.
+# During a multi-hour rate-limit pause the oldest message doesn't change,
+# so the cooldown alone let one queued message rack up ten near-identical
+# "-# ⏳ queued — paused..." posts in #agent-chat over 05:56-08:27 UTC.
+# Keying on message_id caps it at one ack per distinct queued message —
+# a new message still gets its own ack (subject to the existing cooldown),
+# but a message that's still the same one 10 minutes later doesn't.
+channel_last_acked_message_id: Dict[str, str] = {}
 
 # Discord token mapping
 AGENT_TOKENS: Dict[str, str] = {}
@@ -987,6 +1019,34 @@ async def _notify_rate_limit_warning(agent: str, warning: bool) -> None:
         await post_to_discord(agent, signals_channel, msg)
     except Exception as e:
         log.warning(f"Rate-limit warning notice failed (non-fatal): {e}")
+
+async def _notify_spend_limit(agent: str, blocked: bool) -> None:
+    """#signals alert when the Claude CLI subprocess reports the
+    Anthropic account's monthly spend cap hit or cleared (see
+    CLI_SPEND_LIMIT_SIGNATURE). Unlike the five-hour rate-limit window's
+    _notify_rate_limit_pause, this doesn't self-resolve on a timer — pings
+    the owner directly (same convention as relay.py's /sys restart-server:
+    a #signals post needing action, not just an FYI, gets a direct ping)
+    since clearing it requires Ian to actually raise the limit. Fires once
+    per block episode via agent_spend_limit_notified, same dedup pattern
+    as the rate-limit notifiers above."""
+    try:
+        signals_channel = (channels_config.get("channels", {}).get("signals", {}) or {}).get("id")
+        if not signals_channel:
+            return
+        if blocked:
+            msg = (
+                f"-# 🚫 {agent} hit the Anthropic account's monthly spend limit — "
+                f"blocked, not just paused. Raise it at "
+                f"claude.ai/settings/usage to clear (won't resolve on its own). "
+                f"Heartbeats will keep showing up here but real replies are held "
+                f"until then. <@{OWNER_DISCORD_ID}>"
+            )
+        else:
+            msg = f"-# {agent} spend-limit block cleared — processing normally again."
+        await post_to_discord(agent, signals_channel, msg)
+    except Exception as e:
+        log.warning(f"Spend-limit notice failed (non-fatal): {e}")
 
 async def compact_session(agent: str, reason: str) -> bool:
     """Shared compaction action — finalize (summarize-session.py writes a
@@ -2161,6 +2221,15 @@ async def read_agent_response(
                 # the result's flat `result` string (success) or `error`.
                 if not final_text:
                     final_text = event.get("result", "") or event.get("error", "")
+                # Monthly-spend-cap hard-stop (2026-08-18) — arrives
+                # exactly this way: no assistant content, just this flat
+                # fallback string. Flag it for process_agent_queue and
+                # clear final_text so it never gets treated as a real
+                # reply and posted to Discord (see CLI_SPEND_LIMIT_SIGNATURE
+                # above for why this incident mattered).
+                if CLI_SPEND_LIMIT_SIGNATURE in final_text:
+                    metadata["spend_limit_blocked"] = True
+                    final_text = ""
                 break
 
     except Exception as e:
@@ -2259,6 +2328,12 @@ async def check_queued_acks():
 
         if waited_sec < QUEUED_ACK_WAIT_THRESHOLD_SEC:
             continue
+        if channel_last_acked_message_id.get(channel_id) == row["message_id"]:
+            # Already sent an ack for this exact queued message — the
+            # cooldown below is for spacing acks about *different*
+            # messages, not for repeating one about the same message
+            # that just hasn't moved yet (e.g. a rate-limit pause).
+            continue
         last_ack = channel_last_ack.get(channel_id, 0)
         if now - last_ack < QUEUED_ACK_COOLDOWN_SEC:
             continue
@@ -2309,6 +2384,7 @@ async def check_queued_acks():
                 f"-# ⏳ queued — {reason}"
             )
             channel_last_ack[channel_id] = now
+            channel_last_acked_message_id[channel_id] = row["message_id"]
 
 async def process_agent_queue(agent: str):
     """Process pending messages for agent"""
@@ -2439,10 +2515,30 @@ async def process_agent_queue(agent: str):
         channel_name = next(
             (name for name, cfg in channels_config.get("channels", {}).items()
              if cfg.get("id") == channel_id),
-            channel_id,
+            None,
         )
+        if channel_name:
+            channel_label = f"#{channel_name}"
+        else:
+            # Not a real Discord channel — e.g. the dashboard's silent
+            # chat, which deliberately uses channel_id sentinel "0" and
+            # has no Discord channel to cross-post to at all (see
+            # dashboard/app/api/chat/route.ts). Falls back to the channel
+            # name already resolved and stored at insert time
+            # (messages[0]["channel"]) instead of the raw channel_id,
+            # which for this case is literally the string "0" — found
+            # live 2026-08-18 rendering as a nonsense "#0" header when
+            # Ian tested via the dashboard mid-incident.
+            fallback_name = messages[0]["channel"] or channel_id
+            if messages[0]["server"] == "discord":
+                # A real Discord channel_id that just isn't in our own
+                # channels_config (foreign guild, etc.) — still phrase it
+                # as a channel, best effort.
+                channel_label = f"#{fallback_name}"
+            else:
+                channel_label = f"the {fallback_name} chat (not Discord — nothing to cross-post to)"
         formatted_parts = [
-            f"[This turn posts ONLY to #{channel_name} — regardless of who "
+            f"[This turn posts ONLY to {channel_label} — regardless of who "
             f"the conversation is about, your response goes here and "
             f"nowhere else. If this content is meant for someone in a "
             f"different channel, say so explicitly rather than writing as "
@@ -2467,7 +2563,11 @@ async def process_agent_queue(agent: str):
         # "replying in #x" always; batch size and other-channels-waiting
         # only appended when true, so an ordinary single-message turn in
         # one channel reads as just "replying in #x", not padded noise.
-        activity_bits = [f"replying in #{channel_name}"]
+        # Reuses channel_label (not the bare channel_name, which is None
+        # for non-Discord origins like the dashboard's silent chat — see
+        # the channel_label derivation above) so this never renders
+        # "replying in #None".
+        activity_bits = [f"replying in {channel_label}"]
         if len(messages) > 1:
             activity_bits.append(f"batch of {len(messages)}")
         if waiting_channel_ids:
@@ -2489,6 +2589,23 @@ async def process_agent_queue(agent: str):
         if metadata:
             await post_cost_update(agent, metadata)
             await update_session_tokens(agent, metadata.get("input_tokens", 0))
+
+        # Monthly spend-cap block/clear (2026-08-18) — see
+        # CLI_SPEND_LIMIT_SIGNATURE / _notify_spend_limit(). Only checked
+        # when a turn actually completed (metadata present); a turn that
+        # errored out of read_agent_response before reaching the result
+        # event leaves metadata empty, and this deliberately no-ops rather
+        # than guessing at either state from an incomplete turn.
+        if metadata:
+            if metadata.get("spend_limit_blocked"):
+                agent_spend_limit_blocked[agent] = True
+                if not agent_spend_limit_notified.get(agent):
+                    agent_spend_limit_notified[agent] = True
+                    asyncio.create_task(_notify_spend_limit(agent, blocked=True))
+            elif agent_spend_limit_blocked.get(agent):
+                agent_spend_limit_blocked[agent] = False
+                agent_spend_limit_notified[agent] = False
+                asyncio.create_task(_notify_spend_limit(agent, blocked=False))
 
         # Post whatever's left to Discord. When stream_to_channel is on,
         # most (or all) of response_text already went out incrementally
@@ -2912,6 +3029,13 @@ async def handle_agents(request):
             # as rate_limit: empty until this agent's subprocess has
             # completed at least one turn since agent-server last started.
             "context_usage": agent_context_usage.get(agent, {}),
+            # Monthly account spend cap, added 2026-08-18 — see
+            # CLI_SPEND_LIMIT_SIGNATURE. Distinct from rate_limit above:
+            # that's the five-hour/seven-day window and self-clears on a
+            # timer, this is the account-level cap and needs Ian to raise
+            # it manually. False until this agent's subprocess has hit it
+            # at least once since agent-server last started.
+            "spend_limit_blocked": agent_spend_limit_blocked.get(agent, False),
         })
 
     return web.json_response({"agents": agents_list})
