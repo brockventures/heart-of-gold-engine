@@ -1,0 +1,28 @@
+{
+  "skill_name": "outbox",
+  "version": "1.0.0",
+  "description": "Queue a message for delivery to a Discord channel other than the one the current turn is scoped to. This is the fix for the 'jumbling' failure mode: a turn's reply covering two audiences/channels getting blended into one in-turn post instead of split.",
+  "tools": [
+    {
+      "name": "queue_outbox_message",
+      "description": "Queue `content` for delivery to `channel`, a Discord channel different from the one this turn is already posting to. Call this the moment a turn's reply would otherwise cover two audiences (e.g. a line for Ian folded into a technical reply meant for another agent) — queue the other channel's message here FIRST, then write this turn's in-channel reply covering only its own channel. Never write one message intended to cover both. Delivered durably by scheduler.py's outbox flush (~1 min cadence), independent of whether this turn is still running.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string",
+            "enum": ["general", "signals", "staff-comms", "agent-chat", "lounge"],
+            "description": "Destination channel name, no leading #. Must be a different channel than the one this turn is scoped to — this tool is for the *other* audience, not a duplicate of the in-turn reply."
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "description": "The message body to deliver to that channel."
+          }
+        },
+        "required": ["channel", "content"]
+      }
+    }
+  ]
+}
