@@ -14,6 +14,15 @@ already watches.
 thinking AND the other bot can read it (and so can I)" — this is the
 write side of that. Presence read side (reading Amos's status) already
 existed via DiscordAdapter's presence intent + data/presence.json.
+
+2026-08-18, later same day: agent-server.py now also writes this file
+automatically at turn start/end (_write_mechanical_status), mirroring
+Amos's mechanical idle/busy-per-turn presence layer. The "source" field
+below is how the two writers stay out of each other's way — this script
+always stamps "manual", the mechanical layer stamps "auto" and never
+overwrites an active manual idle/dnd declaration. Calling this with
+state="online" (the documented "Done" step) also relinquishes control
+back to the mechanical layer, not just clears the dot.
 """
 
 import json
@@ -54,6 +63,7 @@ def main():
     payload = {
         "state": state,
         "activity": activity or None,
+        "source": "manual",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 

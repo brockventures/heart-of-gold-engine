@@ -1724,7 +1724,68 @@ async def stop_typing(channel_id: str):
 # Message Processing
 # =============================================================================
 
-async def send_to_agent(agent: str, content: str, message_ids: List[str]):
+# Mechanical presence layer (2026-08-18) — stolen from Amos per #agent-chat:
+# "our relay already writes presence automatically, it flips me idle/busy
+# per turn state and tags batch work in the activity text." We didn't have
+# that half — presence only ever moved when the agent explicitly called
+# set_status (skills/set-status/), the intentional "going dark" layer. This
+# is the mechanical half: on every turn we write an activity string saying
+# what's in flight (channel, batch size, other channels queued behind it),
+# and clear it back to the resting state when the turn ends. Deliberately
+# does NOT flip the status dot itself (state always stays "online" here) —
+# idle/dnd are already claimed by the intentional four-tier taxonomy
+# (SKILL.md), and reusing them mechanically would make "idle" mean two
+# different things depending on who set it.
+#
+# Same file relay.py already polls (STATUS_FILE == data/status/marvin.json
+# there) — no new IPC needed, just another writer. Only wired for Marvin:
+# that file and relay's poll loop are single-agent today (agents.json has
+# no equivalent for "relay"), so this is a no-op for any other agent key.
+#
+# A manual set_status call always wins over this. Distinguished by a
+# "source" field written by both sides: set_status.py stamps "manual",
+# this stamps "auto". While a manual entry is an *active declaration*
+# (state idle or dnd — "I'm mid checkpoint" / "I'm dark"), mechanical
+# writes are skipped entirely rather than clobbering it. Once the agent
+# calls set_status(state="online") to clear (SKILL.md's documented "Done"
+# step), that's a relinquish signal — state back to online hands control
+# back to the mechanical layer, same as if no manual entry existed.
+STATUS_FILE = WORKSPACE_ROOT / "data" / "status" / "marvin.json"
+
+
+def _write_mechanical_status(agent: str, activity: Optional[str]) -> None:
+    if agent != "Marvin":
+        return
+
+    try:
+        if STATUS_FILE.exists():
+            with open(STATUS_FILE) as f:
+                current = json.load(f)
+            if current.get("source") == "manual" and current.get("state") in ("idle", "dnd"):
+                return  # active intentional declaration in effect — hands off
+    except (json.JSONDecodeError, OSError):
+        pass  # unreadable/corrupt — fine to overwrite with a clean auto write
+
+    if activity and len(activity) > 128:
+        activity = activity[:128]
+
+    payload = {
+        "state": "online",
+        "activity": activity or None,
+        "source": "auto",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = STATUS_FILE.with_suffix(".json.tmp")
+        with open(tmp_file, "w") as f:
+            json.dump(payload, f, indent=2)
+        tmp_file.replace(STATUS_FILE)
+    except OSError:
+        log.exception("Failed to write mechanical status to %s", STATUS_FILE)
+
+
+async def send_to_agent(agent: str, content: str, message_ids: List[str], activity: Optional[str] = None):
     """Send message to agent subprocess"""
     proc = agent_processes.get(agent)
     if not proc or not proc.stdin:
@@ -1732,6 +1793,7 @@ async def send_to_agent(agent: str, content: str, message_ids: List[str]):
         return
 
     agent_states[agent] = "PROCESSING"
+    _write_mechanical_status(agent, activity)
     response_buffers[agent] = ""
 
     # Send message — Claude Code stream-json input envelope.
@@ -2123,6 +2185,7 @@ async def read_agent_response(
         pending_final = final_text
 
     agent_states[agent] = "IDLE"
+    _write_mechanical_status(agent, None)
     return final_text, metadata, pending_final, last_discord_msg_id
 
 async def queued_ack_sweep_loop():
@@ -2400,8 +2463,19 @@ async def process_agent_queue(agent: str):
         # Start typing indicator
         await start_typing(agent, channel_id)
 
+        # Mechanical presence activity text — see _write_mechanical_status.
+        # "replying in #x" always; batch size and other-channels-waiting
+        # only appended when true, so an ordinary single-message turn in
+        # one channel reads as just "replying in #x", not padded noise.
+        activity_bits = [f"replying in #{channel_name}"]
+        if len(messages) > 1:
+            activity_bits.append(f"batch of {len(messages)}")
+        if waiting_channel_ids:
+            activity_bits.append(f"+{len(waiting_channel_ids)} channel(s) queued")
+        activity_text = ", ".join(activity_bits)
+
         # Send to agent
-        await send_to_agent(agent, formatted_content, message_ids)
+        await send_to_agent(agent, formatted_content, message_ids, activity=activity_text)
 
         # Read response
         response_text, metadata, pending_final, discord_msg_id = await read_agent_response(
