@@ -17,7 +17,7 @@ reload_on_commit = import_script("reload-on-commit")
 
 def test_relay_change_bounces_relay():
     to_bounce, warnings = reload_on_commit.plan_reloads(["bin/relay.py"])
-    assert to_bounce == {"relay": "bin/relay.py"}
+    assert to_bounce == {"relay": "karakos-relay.service"}
     assert warnings == []
 
 
@@ -25,12 +25,12 @@ def test_reply_gate_change_bounces_relay():
     """reply_gate.py has no process of its own — it's imported by
     relay.py, so a change there should bounce relay too."""
     to_bounce, warnings = reload_on_commit.plan_reloads(["bin/reply_gate.py"])
-    assert to_bounce == {"relay": "bin/relay.py"}
+    assert to_bounce == {"relay": "karakos-relay.service"}
 
 
 def test_scheduler_change_bounces_scheduler():
     to_bounce, warnings = reload_on_commit.plan_reloads(["bin/scheduler.py"])
-    assert to_bounce == {"scheduler": "bin/scheduler.py"}
+    assert to_bounce == {"scheduler": "karakos-scheduler.service"}
     assert warnings == []
 
 
@@ -54,14 +54,14 @@ def test_multiple_watched_files_bounce_each_process_once():
     to_bounce, warnings = reload_on_commit.plan_reloads(
         ["bin/relay.py", "bin/reply_gate.py", "bin/scheduler.py"]
     )
-    assert to_bounce == {"relay": "bin/relay.py", "scheduler": "bin/scheduler.py"}
+    assert to_bounce == {"relay": "karakos-relay.service", "scheduler": "karakos-scheduler.service"}
 
 
 def test_mixed_watched_and_self_process_change():
     to_bounce, warnings = reload_on_commit.plan_reloads(
         ["bin/relay.py", "bin/agent-server.py"]
     )
-    assert to_bounce == {"relay": "bin/relay.py"}
+    assert to_bounce == {"relay": "karakos-relay.service"}
     assert len(warnings) == 1
 
 
@@ -106,7 +106,18 @@ def test_main_dispatches_bounce_asynchronously(tmp_path, monkeypatch):
     args, kwargs = popen_calls[0]
     assert kwargs.get("start_new_session") is True, (
         "must detach from git's process group so the hook returning "
-        "doesn't affect signal delivery"
+        "doesn't affect the restart landing"
+    )
+    cmd = args[0]
+    assert cmd[:2] == ["sudo", str(reload_on_commit.RESTART_SERVICE)], (
+        "must go through the allowlisted restart-service.sh wrapper, not "
+        "a raw systemctl call or a pattern-matching pkill — 2026-08-18: "
+        "the old safe-pkill.sh dispatch pattern-matched and killed "
+        "Marvin's own subprocess as collateral, see module docstring"
+    )
+    assert cmd[2:] == ["restart", "karakos-relay.service"], (
+        "must target the exact unit by name — no cmdline substring for "
+        "an unrelated process to accidentally match"
     )
 
     events_log = tmp_path / "logs" / "git-events.jsonl"
