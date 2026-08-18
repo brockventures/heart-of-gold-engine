@@ -11,6 +11,20 @@ Strategy:
 Slow tests (those that intentionally trigger the 10-second timeout) are marked
 @pytest.mark.slow and excluded from the default pytest run via:
     pytest tests/ -m "not slow"
+
+2026-08-18: TestDockerEngineReachable and TestDockerComposeV2 were removed
+here — this repo has run native systemd since 2026-08-11 (see
+native-migration-complete-2026-08-11 in memory), so those two checks in
+preflight.sh itself no longer describe a real prerequisite for how this
+install actually runs. The rest of this suite (WSL integration, arch,
+CRLF line endings, required env vars, port/disk checks, output flags)
+stayed — none of it is Docker-specific, and preflight.sh itself wasn't
+touched, so it still runs those checks for real; only the two dead-weight
+docker checks lost coverage. The mock docker in make_full_mock_bin below
+stays too — every other check still needs a passing docker stub to reach
+the checks actually under test, since preflight.sh runs docker_engine_
+reachable/docker_compose_v2 first and aggregates exit status across all
+checks.
 """
 
 import json
@@ -173,92 +187,6 @@ def run(tmp_path: Path, mock_bin: Path | None = None,
         cwd=cwd or str(PACKAGE_ROOT),
         timeout=60,
     )
-
-
-# =============================================================================
-# Check 1: docker_engine_reachable
-# =============================================================================
-
-class TestDockerEngineReachable:
-    def test_docker_ok(self, tmp_path):
-        mock = make_full_mock_bin(tmp_path)
-        result = run(tmp_path, mock)
-        assert "✓ docker_engine_reachable" in result.stdout or result.returncode == 0
-        assert "docker_engine_reachable" in result.stdout
-
-    def test_docker_not_reachable(self, tmp_path):
-        """docker exits with non-zero (simulating not installed / not reachable)."""
-        mock = make_full_mock_bin(tmp_path)
-        # exit 127 is how bash signals "command not found"; any non-0 non-124 triggers
-        # the "not reachable" branch in the script.
-        write_mock(mock, "docker", "#!/bin/bash\nexit 127\n")
-        result = run(tmp_path, mock)
-        assert result.returncode == 1
-        assert "docker_engine_reachable" in result.stdout
-        assert "not reachable" in result.stdout
-
-    def test_docker_exits_nonzero(self, tmp_path):
-        """docker info exits non-zero (not timeout) → not-reachable message."""
-        mock = make_full_mock_bin(tmp_path)
-        write_mock(mock, "docker", """\
-#!/bin/bash
-if [ "$1" = "info" ]; then exit 1; fi
-echo "Docker Compose version v2.27.0"
-""")
-        result = run(tmp_path, mock)
-        assert result.returncode == 1
-        assert "not reachable" in result.stdout
-
-    @pytest.mark.slow
-    def test_docker_info_hangs(self, tmp_path):
-        """docker info hangs → fail with 'timed out' message after ~10s."""
-        mock = make_full_mock_bin(tmp_path)
-        write_mock(mock, "docker", """\
-#!/bin/bash
-if [ "$1" = "info" ]; then
-    sleep 30
-fi
-echo "Docker Compose version v2.27.0"
-""")
-        result = run(tmp_path, mock, cwd="/tmp")
-        assert result.returncode == 1
-        assert "timed out" in result.stdout
-
-
-# =============================================================================
-# Check 2: docker_compose_v2
-# =============================================================================
-
-class TestDockerComposeV2:
-    def test_compose_v2_pass(self, tmp_path):
-        mock = make_full_mock_bin(tmp_path)
-        result = run(tmp_path, mock)
-        assert "✓ docker_compose_v2" in result.stdout
-
-    def test_compose_not_found(self, tmp_path):
-        """docker compose subcommand not found → fail."""
-        mock = make_full_mock_bin(tmp_path)
-        write_mock(mock, "docker", """\
-#!/bin/bash
-if [ "$1" = "info" ]; then
-    echo "Docker Root Dir: /var/lib/docker"
-    exit 0
-elif [ "$1" = "compose" ]; then
-    exit 1
-fi
-""")
-        result = run(tmp_path, mock)
-        assert result.returncode == 1
-        assert "docker_compose_v2" in result.stdout
-        assert "not found" in result.stdout
-
-    def test_compose_v1_fails(self, tmp_path):
-        """Docker Compose v1.x is reported → fail."""
-        mock = make_full_mock_bin(tmp_path, compose_version="1.29.2")
-        result = run(tmp_path, mock)
-        assert result.returncode == 1
-        assert "docker_compose_v2" in result.stdout
-        assert "not found" in result.stdout
 
 
 # =============================================================================
