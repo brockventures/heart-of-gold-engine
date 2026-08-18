@@ -169,6 +169,20 @@ CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 MESSAGES_DIR = WORKSPACE_ROOT / "data" / "messages"
 ATTACHMENTS_DIR = WORKSPACE_ROOT / "data" / "attachments"
 HEALTH_FILE = WORKSPACE_ROOT / "data" / "health" / "relay.json"
+PRESENCE_FILE = WORKSPACE_ROOT / "data" / "presence.json"
+
+# Self-presence: the mirror image of PRESENCE_FILE above. That one is
+# relay reading *other* members' presence (Amos et al); this one is the
+# set-status skill (run from agent-server, a different process than the
+# one holding the Discord websocket) writing what Marvin's own presence
+# should be, for relay to actually apply. See skills/set-status/.
+STATUS_FILE = WORKSPACE_ROOT / "data" / "status" / "marvin.json"
+STATUS_POLL_INTERVAL_SEC = int(os.environ.get("STATUS_POLL_INTERVAL_SEC", "10"))
+_STATUS_TO_DISCORD = {
+    "online": discord.Status.online,
+    "idle": discord.Status.idle,
+    "dnd": discord.Status.dnd,
+}
 
 # Attachments the relay will pull down before handing a message to an agent
 # (2026-08-09, ported from mcarmody/karakos-package#127 — posting an image
@@ -355,6 +369,18 @@ class DiscordAdapter(discord.Client):
         intents.message_content = True
         intents.guilds = True
         intents.reactions = True
+        # Presence intent (2026-08-18, Ian): read online/idle/dnd status
+        # and custom activity text for other members/bots, e.g. Amos, so
+        # a busy-on-a-long-task signal can eventually be read instead of
+        # guessed. Both this flag AND the "Presence Intent" toggle in the
+        # Discord Developer Portal are required — Discord rejects the
+        # gateway handshake with PrivilegedIntentsRequired if the portal
+        # side isn't also on. members is needed alongside it for presence
+        # to resolve to real member objects rather than IDs only; both
+        # confirmed enabled portal-side via a standalone test connection
+        # before wiring this in live.
+        intents.presences = True
+        intents.members = True
         super().__init__(intents=intents, *args, **kwargs)
 
         self.http_session = None
@@ -362,6 +388,8 @@ class DiscordAdapter(discord.Client):
         self.gate: Optional[ReplyGate] = None
         self._health_task: Optional[asyncio.Task] = None
         self._deferred_poke_task: Optional[asyncio.Task] = None
+        self._status_task: Optional[asyncio.Task] = None
+        self._last_applied_status: Optional[tuple] = None
 
         # /sys restart-server confirm-arm + cooldown state, see
         # _sys_restart_server(). Plain instance attrs are safe here for the
@@ -580,6 +608,13 @@ class DiscordAdapter(discord.Client):
         )
         await self.write_health_heartbeat()
 
+        # Initial presence snapshot. Member/presence caches aren't
+        # guaranteed fully populated the instant on_ready fires (chunking
+        # is async), so this runs as a short-delayed background task
+        # rather than blocking the rest of on_ready — on_presence_update
+        # keeps it current from here on regardless.
+        asyncio.create_task(self._initial_presence_snapshot())
+
         # health-monitor.py checks relay.json's age against a 5-minute
         # threshold, but write_health_heartbeat() used to only fire once
         # here in on_ready — so a relay that's been happily connected for
@@ -594,6 +629,13 @@ class DiscordAdapter(discord.Client):
         # and send_to_agent_server()/_flush_deferred_pokes() below.
         if self._deferred_poke_task is None or self._deferred_poke_task.done():
             self._deferred_poke_task = asyncio.create_task(self._deferred_poke_flush_loop())
+
+        # 2026-08-18, Ian: self-presence, so status reflects current
+        # thinking state and is readable by both him and other bots
+        # (Amos), not just narrated in chat. See STATUS_FILE / set-status
+        # skill above.
+        if self._status_task is None or self._status_task.done():
+            self._status_task = asyncio.create_task(self._status_poll_loop())
 
         # Task #12, 2026-08-07: sync the native slash commands to the
         # primary guild only (server_ids[0] — Heart of Gold, not Amos's
@@ -628,6 +670,16 @@ class DiscordAdapter(discord.Client):
                     await self.write_health_heartbeat()
         except asyncio.CancelledError:
             pass
+
+    async def _initial_presence_snapshot(self):
+        """Give member/presence chunking a moment, then write the first
+        data/presence.json so it isn't empty until the next live change."""
+        try:
+            await asyncio.sleep(3)
+            self.write_presence_snapshot()
+            log.info("Initial presence snapshot written (%d guild(s))", len(self.guilds))
+        except Exception:
+            log.exception("Initial presence snapshot failed")
 
     async def _deferred_poke_flush_loop(self):
         """Periodically retry spooled messages for as long as the client is
@@ -1468,10 +1520,108 @@ class DiscordAdapter(discord.Client):
                 "status": "healthy"
             }, f)
 
+    def write_presence_snapshot(self):
+        """Full rewrite of data/presence.json from current member cache.
+
+        2026-08-18: called on_ready (initial population) and on every
+        presence_update (member counts here are small — a handful of
+        real users/bots across two guilds — so a full rewrite per event
+        is simpler and safer than patching one entry in place, no risk of
+        the file drifting from actual gateway state.
+        """
+        members = {}
+        for guild in self.guilds:
+            for member in guild.members:
+                activity = None
+                if member.activity is not None:
+                    activity = {
+                        "type": type(member.activity).__name__,
+                        "name": getattr(member.activity, "name", None),
+                    }
+                key = f"{guild.name}:{member.name}"
+                members[key] = {
+                    "user_id": str(member.id),
+                    "name": member.name,
+                    "bot": member.bot,
+                    "status": str(member.status),
+                    "activity": activity,
+                }
+        PRESENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(PRESENCE_FILE, "w") as f:
+            json.dump({
+                "updated_at": datetime.now().isoformat(),
+                "members": members,
+            }, f, indent=2)
+
+    async def on_presence_update(self, before, after):
+        """Live presence changes — keep data/presence.json current."""
+        self.write_presence_snapshot()
+
+    async def _status_poll_loop(self):
+        """Poll STATUS_FILE and apply it to the live gateway connection.
+
+        Polling rather than an inotify-style watch because the writer
+        (set_status.py) runs in agent-server, a separate process — a
+        plain poll is the simplest thing that can't miss an update
+        regardless of which process wrote it or when. 10s default is
+        fast enough that a 'going dark' post and the presence change
+        land close enough together to read as the same event, cheap
+        enough not to matter at this frequency.
+        """
+        try:
+            # Apply immediately on connect too, not just after the first
+            # sleep — a relay restart mid-dark-session (e.g. the
+            # sanctioned admin restart path) should re-show the saved
+            # state right away rather than default back to Online and
+            # silently misrepresent an in-progress dark stretch for up
+            # to STATUS_POLL_INTERVAL_SEC.
+            await self._apply_status_file()
+            while not self.is_closed():
+                await asyncio.sleep(STATUS_POLL_INTERVAL_SEC)
+                if not self.is_closed():
+                    await self._apply_status_file()
+        except asyncio.CancelledError:
+            pass
+
+    async def _apply_status_file(self):
+        """Read STATUS_FILE and call change_presence() iff it changed
+        since the last poll. No file yet == leave Discord's own default
+        (Online, no activity) alone, which is already the right resting
+        state for quick-think/short-task work."""
+        if not STATUS_FILE.exists():
+            return
+        try:
+            with open(STATUS_FILE) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            log.exception("Failed to read %s", STATUS_FILE)
+            return
+
+        state = data.get("state")
+        activity_text = data.get("activity")
+        discord_status = _STATUS_TO_DISCORD.get(state)
+        if discord_status is None:
+            log.warning("Unknown status state %r in %s, ignoring", state, STATUS_FILE)
+            return
+
+        key = (state, activity_text)
+        if key == self._last_applied_status:
+            return  # unchanged since last poll, don't spam change_presence
+
+        activity = discord.CustomActivity(name=activity_text) if activity_text else None
+        try:
+            await self.change_presence(status=discord_status, activity=activity)
+            self._last_applied_status = key
+            log.info("Applied presence: status=%s activity=%r", state, activity_text)
+        except Exception:
+            log.exception("Failed to apply presence from %s", STATUS_FILE)
+
     async def close(self):
         """Cleanup on shutdown"""
         if self._health_task and not self._health_task.done():
             self._health_task.cancel()
+        if self._status_task and not self._status_task.done():
+            self._status_task.cancel()
         if self.http_session:
             await self.http_session.close()
         await super().close()

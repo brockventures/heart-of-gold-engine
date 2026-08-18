@@ -1,0 +1,27 @@
+{
+  "skill_name": "set-status",
+  "version": "1.0.0",
+  "description": "Set Marvin's live Discord presence (status + activity text) so Ian and other bots (e.g. Amos) can read what state a session is in without guessing — relay.py polls this and calls change_presence().",
+  "tools": [
+    {
+      "name": "set_status",
+      "description": "Update Marvin's Discord presence. 'online' is the default resting state (short tasks don't need to call this at all). 'idle' is for a long autonomous session posting periodic checkpoints — pair it with an activity string summarizing the current step. 'dnd' is for going dark on uninterrupted work — pair it with an activity string stating the task and rough ETA. Call again with state=online and no activity when the work finishes to clear it.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["online", "idle", "dnd"],
+            "description": "Discord presence status to show."
+          },
+          "activity": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Short free-text status line shown next to the presence dot (e.g. 'heads-down: presence refactor, back ~30m'). Omit or pass empty string to clear."
+          }
+        },
+        "required": ["state"]
+      }
+    }
+  ]
+}
