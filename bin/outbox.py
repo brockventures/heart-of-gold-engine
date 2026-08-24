@@ -25,9 +25,16 @@ doesn't replace that delivery mechanism, it just makes calling it durable
 and scheduled instead of ad hoc and turn-dependent.
 
 Storage: one JSON object per line —
-    {id, channel, content, created_at, delivered_at}
+    {id, channel, content, attachments, created_at, delivered_at}
 Delivered rows are kept (not deleted) with delivered_at set, for audit;
 flush only acts on rows where delivered_at is still null.
+
+Attachments (2026-08-24): `attachments` is a list of absolute local file
+paths, resolved at add-time (not delivery-time) so a later change of cwd
+can't silently break the reference. discord-notify.sh does the actual
+upload; if a path has gone missing by the time flush runs, that surfaces
+as an ordinary delivery failure (row stays pending, error goes to
+stderr) rather than a silent text-only fallback.
 """
 
 import argparse
@@ -65,14 +72,16 @@ def _save_rows(rows: list[dict]) -> None:
     tmp.replace(OUTBOX_PATH)
 
 
-def add_pending(channel: str, content: str) -> str:
-    """Queue a message for delivery to `channel`. Returns the row id."""
+def add_pending(channel: str, content: str, attachments: list[str] | None = None) -> str:
+    """Queue a message for delivery to `channel`, optionally with local
+    file attachments. Returns the row id."""
     rows = _load_rows()
     row_id = str(uuid.uuid4())
     rows.append({
         "id": row_id,
         "channel": channel,
         "content": content,
+        "attachments": [str(Path(p).resolve()) for p in (attachments or [])],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "delivered_at": None,
     })
@@ -95,7 +104,7 @@ def flush_pending() -> list[str]:
             continue
         try:
             subprocess.run(
-                [str(NOTIFY_SCRIPT), row["channel"], row["content"]],
+                [str(NOTIFY_SCRIPT), row["channel"], row["content"], *row.get("attachments", [])],
                 check=True, capture_output=True, text=True,
             )
             row["delivered_at"] = datetime.now(timezone.utc).isoformat()
@@ -118,6 +127,10 @@ def main():
     add_p = sub.add_parser("add", help="Queue a message for a channel")
     add_p.add_argument("channel")
     add_p.add_argument("content")
+    add_p.add_argument(
+        "--file", action="append", dest="files", default=[],
+        help="Local file path to attach; repeat for multiple attachments",
+    )
 
     sub.add_parser("flush", help="Attempt delivery of all pending rows")
     sub.add_parser("list", help="Show pending (undelivered) rows")
@@ -125,8 +138,9 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "add":
-        row_id = add_pending(args.channel, args.content)
-        print(f"Queued {row_id} -> #{args.channel}")
+        row_id = add_pending(args.channel, args.content, attachments=args.files)
+        suffix = f" with {len(args.files)} attachment(s)" if args.files else ""
+        print(f"Queued {row_id} -> #{args.channel}{suffix}")
     elif args.cmd == "flush":
         delivered = flush_pending()
         print(f"Delivered {len(delivered)} message(s)" if delivered else "Nothing to deliver")
@@ -135,7 +149,9 @@ def main():
         if not pending:
             print("Outbox empty")
         for r in pending:
-            print(f"{r['id']} [{r['created_at']}] -> #{r['channel']}: {r['content'][:80]}")
+            atts = r.get("attachments") or []
+            att_note = f" ({len(atts)} attachment(s))" if atts else ""
+            print(f"{r['id']} [{r['created_at']}] -> #{r['channel']}{att_note}: {r['content'][:80]}")
 
 
 if __name__ == "__main__":
