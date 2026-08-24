@@ -1,0 +1,9 @@
+{
+  "name": "karakos-browser-mcp",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright MCP server for browser-rendered page access (Marvin)",
+  "dependencies": {
+    "@playwright/mcp": "^0.0.79"
+  }
+}

@@ -9,6 +9,11 @@
       "command": "python3",
       "args": ["mcp/tools-server.py"],
       "env": {}
+    },
+    "browser": {
+      "command": "node",
+      "args": ["mcp/browser/node_modules/@playwright/mcp/cli.js", "--headless", "--browser", "chromium"],
+      "env": {}
     }
   }
 }

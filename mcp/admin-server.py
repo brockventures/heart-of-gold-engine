@@ -35,7 +35,7 @@ SERVER_URL = os.environ.get("AGENT_SERVER_URL", f"http://127.0.0.1:{os.environ.g
 TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 CREATE_AGENT_SH = WORKSPACE_ROOT / "bin" / "create-agent.sh"
 
-NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
 PROTOCOL_VERSION = "2024-11-05"
 
 
