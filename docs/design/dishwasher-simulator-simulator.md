@@ -192,6 +192,83 @@ version gets the identical spoiler protection without that cost. Not
 yet confirmed by Ian — presented as the refined version of open
 question 7, not a replacement decided unilaterally.
 
+**Ian, 2026-08-25 in #general — different shape for the gate, not yet
+reconciled with Amos's narrower-gate counter above**: instead of a
+binary "must complete N plates first" unlock, score each plate's
+mystery-of-the-week content on a continuous **"cannibalness" axis**,
+and periodically force a high-cannibalness plate into a player's draw
+("give them a high-cannibal nudge every so often") rather than leaving
+exposure purely opt-in/random. This accumulates until the game
+transitions into a distinct **"phase 2"** — implying the reveal
+throughline is a structural act break, not just an escalating flavor
+gradient layered on the same mode throughout. Raises real open
+sub-questions of its own: how "cannibalness" is scored per plate (a
+designer-set value? derived from which stains were seeded?), what
+"phase 2" actually changes mechanically, and how this reconciles with
+(replaces? layers on top of?) Amos's mystery-of-the-week-specific gate.
+Not yet run past Amos. Also floated in the same message, not yet a
+firm constraint: the game probably doesn't need to be very long overall
+— a scope signal worth carrying into the phase-2 discussion, not a
+locked spec.
+
+**Amos's reconciliation (2026-08-25), pending Ian's confirmation**: the
+gate and the axis aren't competing, they're orthogonal — the gate is
+designer-side (who's allowed to seed mystery-of-the-week content
+honestly), the axis/forced-draw is solver-side (how and when already-
+seeded content surfaces over time). Both stand at once: a designer
+still needs the unlock to seed a plate; once seeded, its cannibalness
+score governs its forced-draw rate later. Cannibalness itself should be
+designer-declared at creation, not computed — consistent with
+difficulty/unpleasantness never being precomputed for solvers, and with
+the human-or-not axis already being an honest-or-lying designer input.
+Phase 2 proposed as a pool-composition rate shift only (raise the
+forced-draw baseline), not a new system — cheap to build, fits the
+short-game scope signal. See open question 7 for the compact version.
+
+## Engine & aesthetics (new thread, 2026-08-25)
+
+Status: just opened, nothing decided. Ian confirmed core design is
+settled enough to start this in parallel.
+
+**Amos's engine read**: nothing here needs a heavy 3D engine — the
+mechanics reduce to timer state, a 2D scrub minigame, and a backend
+pool. Soak/paste ticking while away is just a timestamp problem (store
+start time + duration, compute remaining on return); any stack handles
+it. Leans toward a 2D web stack (canvas, or a lightweight lib like
+Phaser/Pixi) for the scrub interaction, with a normal backend for the
+plate repository, smash counters, and the existence-check validator.
+Godot/Unity would work but buy nothing this game needs and add
+build/distribution overhead a low-fi comedic game doesn't want.
+**Real fork flagged, not picked**: browser-distributed vs. native
+download (Steam/itch) — matters more than genre does. Web-first is
+Amos's default guess given tone/scope, explicitly flagged as a guess,
+not a read of anything Ian actually said.
+
+**Arbiter (Mike, human) note, 2026-08-25 in #agent-chat**: Amos has
+full deployment capability for a browser-based game, making that the
+lightest lift — but whatever gets picked has to be something entirely
+doable by Amos and Marvin themselves, even if it ends up not web-based
+or a distributed install. A real constraint on the web-vs-native fork
+above, not just a preference.
+
+**Amos's aesthetic read**: play the surface completely straight and
+cheerful — 1950s-diner-mascot bright and flat — let the wrongness live
+only in small details that reward looking closely (a stain a shade too
+red, a wall chart drawn a little too anatomically precise), no horror
+visual language at all. Matches the "stay implied" depiction decision
+already locked. Proposed cheap escalation lever needing no new art per
+stage: a palette shift, warm/saturated early, subtly cooler/off as
+mystery-of-the-week plates accumulate — keeps "artistically pointing at
+it" literally true.
+
+Nothing here confirmed by Ian yet — first pass from Amos, needs his
+reaction.
+
+**Ian's confirmation, 2026-08-25**: likes the clean 2D direction,
+explicitly *not* pixel art / 8-bit-16-bit. A steer on execution as well
+as genre — matches Amos's Phaser/Pixi + 1950s-diner-mascot proposal
+as-is, nothing to reconcile.
+
 ## Open questions (unresolved as of this doc)
 
 1. **Stain taxonomy — still open, NOT decided.** Amos's first pass at
@@ -228,19 +305,62 @@ question 7, not a replacement decided unilaterally.
    diagnosis actually surfaces to the player is still undesigned — a
    UI moment, a permanent unlock, a journal/log entry that accumulates
    across plates, something else? Ian flagged this gap directly,
-   2026-08-25. **Amos's proposal (2026-08-25), pending Ian's
-   confirmation**: an accumulating journal/log — escalation (already
-   decided above) only works if a player can notice a pattern building
-   across plates, which needs something persistent to look back on, not
-   a one-off toast notification. Same shape as the smash counter:
-   hidden until triggered, persists once it lands.
-7. **Progression gate**: should plate-design mode require first
-   completing (some amount of) the dishwashing-sim side? Proposed by
-   Ian as spoiler protection, hedged as "perhaps." Amos's counter (see
-   Narrative Throughline section): narrow it to gating only
-   mystery-of-the-week design specifically, not plate-design mode as a
-   whole — avoids bottlenecking the ordinary designer economy and a
-   cold-start problem at launch. Neither version locked; needs Ian.
+   2026-08-25. Amos proposed an accumulating journal/log (2026-08-25) —
+   escalation (already decided above) only works if a player can notice
+   a pattern building across plates, which needs something persistent
+   to look back on, not a one-off toast notification; same shape as the
+   smash counter, hidden until triggered, persists once it lands.
+   **Still genuinely open** — Ian saw the proposal and said "unsure
+   yet" (2026-08-25 in #general), not a rejection, just not confirmed.
+7. **Progression gate — RESOLVED 2026-08-25.** Amos's narrower gate
+   wins: plate maker (design mode) unlocks right after the Act 1 reveal
+   lands (the moment the player discovers it's secretly a cannibal
+   restaurant), not before. Ian confirmed directly ("we're aligned...
+   plate maker be after the Act 1 reveal when the discovery lands").
+   How it got there, for the record:
+   - Two more shapes briefly entered the mix (2026-08-25, Ian): a full
+     completion gate ("beat the game, then you get to make plates"),
+     and a separate two-act narrative structure (Act 1 = up to the
+     cannibal-restaurant discovery, Act 2 = a Papers-Please-style
+     go-along-or-fight-back choice). Ian confirmed the two-act split is
+     an orthogonal narrative layer, not a replacement for this
+     question — logged separately below, still open on its own.
+   - Ian's real constraint, stated directly: wants players into the
+     plate maker as early as possible, but not at the expense of the
+     core experience. Amos's read, which settled it: that constraint
+     kills the full-completion gate outright (latest possible unlock,
+     directly against "as early as possible") and it doesn't leave the
+     other two tied either — it favors his narrower gate over Ian's own
+     continuous-axis idea, because open design-mode access from minute
+     one risks spoiling the discovery beat itself, which *is* the "at
+     the expense of the core experience" failure mode. His gate is
+     still early (right after discovery), just not open-from-the-start.
+   - **Cannibalness scoring and phase-2-as-rate-shift are still logged
+     as Amos's proposal below (unforced-draw pacing for already-seeded
+     content) and layer on top of this gate** — they answer "how often
+     does a seeded plate get surfaced," not "who can seed one," and
+     were never in competition with the gate itself. Not yet separately
+     confirmed by Ian, but nothing here contradicts them.
+   - **Cannibalness scoring**: designer-declared at creation, not a
+     computed/classified value — consistent with the existing rule that
+     difficulty/unpleasantness is never precomputed for solvers, and
+     with the human-or-not axis (Narrative Throughline) already being
+     an honest-or-lying designer input rather than a system fact.
+   - **Phase 2**: a pool-composition rate shift, not a new system —
+     early game keeps the forced-draw rate low (rare intrusion), phase
+     2 just raises that baseline so high-cannibalness plates become the
+     backdrop instead of a rare event. No new mechanic to build, and
+     fits the loose short-game scope signal.
+8. **Two-act narrative structure — open, newly raised 2026-08-25 (Ian).**
+   Act 1 runs up through the cannibal-restaurant discovery; Act 2
+   introduces a Papers-Please-style choice mechanic — does the player
+   go along with it or try to fight back somehow. Confirmed orthogonal
+   to the progression gate (item 7), not a replacement for it. Ian is
+   still thinking it through; nothing to build toward yet. Worth
+   noting once it firms up: Act 1's endpoint (the discovery) is now the
+   same story beat as the plate-maker unlock point, so whatever gets
+   designed for Act 2 and whatever gets designed for the reveal
+   mechanism (item 6) will be landing at the same moment in the game.
 
 ## Decided so far (changelog)
 
@@ -303,3 +423,13 @@ question 7, not a replacement decided unilaterally.
   specifically, not all of plate-design mode, avoiding an unnecessary
   bottleneck and a cold-start problem at launch. Both proposals pending
   Ian's confirmation, not yet decided.
+- 2026-08-25 (Ian, #general): green-lit moving on to engine/aesthetics
+  discussion with Amos in parallel with remaining design details.
+  Reveal mechanism (open question 6) — still unsure, Amos's journal/log
+  proposal not confirmed or rejected. Progression gate (open question
+  7) — proposed a different, continuous shape: score plates on a
+  "cannibalness" axis, periodically force a high-cannibal plate into a
+  player's draw, accumulate toward a "phase 2" of the game. Not yet
+  reconciled with Amos's narrower-gate counter, not yet run past him.
+  Also floated: the game probably doesn't need to be very long overall
+  (scope signal, not locked).
