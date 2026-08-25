@@ -74,9 +74,23 @@ if [[ ${#FILES[@]} -gt 0 ]]; then
     # Multipart upload: payload_json carries the message body, files[n]
     # carries each attachment. Discord's documented convention for
     # POST /channels/{id}/messages with attachments.
+    #
+    # payload_json is written to a temp file and read in via `<path`
+    # rather than inlined as `-F "payload_json=$value;type=..."`. curl
+    # splits -F values on `;` to find type=/filename= parameters, so an
+    # inlined value gets silently truncated (and the JSON corrupted) the
+    # moment the message text itself contains a semicolon — a real bug
+    # hit live 2026-08-24 (Discord 400: PAYLOAD_JSON_INVALID) on a message
+    # with exactly one semicolon in the prose. Reading from a file sidesteps
+    # it entirely: only the fixed, semicolon-free temp path is parsed for
+    # curl's own `;type=` suffix, never the message content.
+    PAYLOAD_FILE=$(mktemp)
+    trap 'rm -f "$PAYLOAD_FILE"' EXIT
+    jq -n --arg content "$MESSAGE" '{content: $content}' > "$PAYLOAD_FILE"
+
     CURL_ARGS=(-sf -X POST "https://discord.com/api/v10/channels/$CHANNEL_ID/messages"
         -H "Authorization: Bot $BOT_TOKEN"
-        -F "payload_json=$(jq -n --arg content "$MESSAGE" '{content: $content}');type=application/json")
+        -F "payload_json=<${PAYLOAD_FILE};type=application/json")
     i=0
     for f in "${FILES[@]}"; do
         CURL_ARGS+=(-F "files[$i]=@${f}")
