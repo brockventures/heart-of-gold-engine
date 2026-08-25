@@ -394,7 +394,29 @@ wrongness reads as a small detail, not a horror-genre signal."
    one had — and (b) the same state change that trips the plate-maker
    unlock (item 7). One trigger, two payoffs.
 
-## Decided so far (changelog)
+   **Act 2 escalation + fingerprinting moral-choice mechanic — new, open,
+   2026-08-25 (Ian).** Deliberate clarity reversal after the Act 1→2
+   transition: Act 1 stays subtle/implied (the ring, discovered only via
+   diagnostic action), but Act 2 should get *obvious* — more
+   identifiable objects start turning up, and it should be unmistakable
+   what's going on rather than staying at Act 1's level of ambiguity.
+   Concrete proposal: a fingertip (or similar identifiable object) feeds
+   a fingerprinting mechanic tied to the Act 2 go-along-or-fight-back
+   choice (item 8 above) — likely identifying *whose* remains a plate
+   holds, giving the moral choice something concrete to hang on rather
+   than staying abstract.
+   **Flagging one real ambiguity before this goes to Amos**: "very
+   obvious" could mean two different things that lead to different
+   builds — (a) *narratively/mechanically* unambiguous (the player
+   already knows post-reveal, so the game stops hiding the state from
+   them, but objects could still render the same implied way the ring
+   did), or (b) *visually* explicit (objects and depiction actually get
+   more graphic as Act 2 escalates, a real change to the "stay implied"
+   depiction rule that's been locked since the Narrative Throughline
+   section — not necessarily wrong for Act 2 specifically, but a
+   deliberate call to make, not an assumed one). Not resolved yet —
+   needs Ian's steer on which one he means before Amos designs toward
+   either.
 
 - 2026-08-24: Adversarial, pool-based (not live exchange). Real-time
   soak/paste timers, live steel-wool/sponge scrubbing. Always
