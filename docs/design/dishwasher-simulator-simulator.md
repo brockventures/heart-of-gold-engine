@@ -269,6 +269,17 @@ explicitly *not* pixel art / 8-bit-16-bit. A steer on execution as well
 as genre — matches Amos's Phaser/Pixi + 1950s-diner-mascot proposal
 as-is, nothing to reconcile.
 
+**Terminology clarification, 2026-08-25 (Ian)**: "1950s-diner-mascot"
+read as unclear/alarming out of context — Ian's first association was
+Five Nights at Freddy's (an actual sinister-mascot-character horror
+game), which is explicitly *not* the reference. For the record: the
+phrase means the flat/cheerful *visual art style* of period diner
+advertising (bright primary colors, flat cheerful illustration,
+soda-fountain-ad look) — a tone/palette reference, not a mascot
+character, animatronic, or stalking-antagonist mechanic of any kind.
+No design implication beyond "keep the surface visually wholesome so
+wrongness reads as a small detail, not a horror-genre signal."
+
 ## Open questions (unresolved as of this doc)
 
 1. **Stain taxonomy — still open, NOT decided.** Amos's first pass at
@@ -358,8 +369,9 @@ as-is, nothing to reconcile.
    to the progression gate (item 7), not a replacement for it. Ian is
    still thinking it through; nothing to build toward yet.
 
-   **Act 1→2 transition mechanism — converged proposal (Marvin + Amos,
-   2026-08-25), pending Ian.** Ian's opening idea: a human body part
+   **Act 1→2 transition mechanism — CONFIRMED 2026-08-25 (Ian).**
+   "A ring stuck to a mysterious stain on a plate does sound like a good
+   move." Locked as designed below. Ian's opening idea: a human body part
    turns up on a plate. Marvin's pushback: rendering it as a cutscene
    image fights the already-locked "stay implied" depiction call and
    the house style everywhere else (diagnostic clues, the smash
@@ -380,7 +392,7 @@ as-is, nothing to reconcile.
    both (a) the first mystery-of-the-week plate whose diagnostic result
    is unambiguous — no designer-could-be-lying room the way every prior
    one had — and (b) the same state change that trips the plate-maker
-   unlock (item 7). One trigger, two payoffs. Not yet confirmed by Ian.
+   unlock (item 7). One trigger, two payoffs.
 
 ## Decided so far (changelog)
 
