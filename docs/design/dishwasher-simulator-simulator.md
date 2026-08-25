@@ -405,18 +405,20 @@ wrongness reads as a small detail, not a horror-genre signal."
    choice (item 8 above) — likely identifying *whose* remains a plate
    holds, giving the moral choice something concrete to hang on rather
    than staying abstract.
-   **Flagging one real ambiguity before this goes to Amos**: "very
-   obvious" could mean two different things that lead to different
-   builds — (a) *narratively/mechanically* unambiguous (the player
-   already knows post-reveal, so the game stops hiding the state from
-   them, but objects could still render the same implied way the ring
-   did), or (b) *visually* explicit (objects and depiction actually get
-   more graphic as Act 2 escalates, a real change to the "stay implied"
-   depiction rule that's been locked since the Narrative Throughline
-   section — not necessarily wrong for Act 2 specifically, but a
-   deliberate call to make, not an assumed one). Not resolved yet —
-   needs Ian's steer on which one he means before Amos designs toward
-   either.
+   **RESOLVED 2026-08-25 (Ian): option (b), depiction itself escalates.**
+   "A little more graphic does make sense — the plates get a little
+   yuckier, whatever the grounding narrative gets a little more
+   sinister." This amends "stay implied," but scoped specifically to
+   Act 2 — Act 1 keeps the ring-style implied treatment intact (that's
+   what makes the Act break register as a shift at all), and Act 2
+   escalates depiction gradually alongside the narrative getting
+   darker, not a hard cut into graphic content. Ties directly to Amos's
+   palette-shift escalation lever (Engine & Aesthetics section above) —
+   that was already proposed as a *gradual* warm-to-cool shift across
+   accumulating plates, so a gradually-more-graphic depiction curve for
+   Act 2 fits the same shape rather than needing a separate mechanism.
+   Needs Amos's read on how far "a little more graphic" should go before
+   it actually breaks the comedic tone rather than just deepening it.
 
 - 2026-08-24: Adversarial, pool-based (not live exchange). Real-time
   soak/paste timers, live steel-wool/sponge scrubbing. Always
