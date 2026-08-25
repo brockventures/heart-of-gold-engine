@@ -356,11 +356,31 @@ as-is, nothing to reconcile.
    introduces a Papers-Please-style choice mechanic — does the player
    go along with it or try to fight back somehow. Confirmed orthogonal
    to the progression gate (item 7), not a replacement for it. Ian is
-   still thinking it through; nothing to build toward yet. Worth
-   noting once it firms up: Act 1's endpoint (the discovery) is now the
-   same story beat as the plate-maker unlock point, so whatever gets
-   designed for Act 2 and whatever gets designed for the reveal
-   mechanism (item 6) will be landing at the same moment in the game.
+   still thinking it through; nothing to build toward yet.
+
+   **Act 1→2 transition mechanism — converged proposal (Marvin + Amos,
+   2026-08-25), pending Ian.** Ian's opening idea: a human body part
+   turns up on a plate. Marvin's pushback: rendering it as a cutscene
+   image fights the already-locked "stay implied" depiction call and
+   the house style everywhere else (diagnostic clues, the smash
+   counter, mystery-of-the-week verbs — all discovered through play,
+   never shown upfront). Amos agreed and sharpened why: the diner-
+   mascot tone only works if wrongness is something the player notices
+   themselves, not something staged for them — a rendered body part
+   plays as a jump-scare, and jump-scares aren't this game's register.
+   Converged shape: the player's own diagnostic action (the sniff/wipe/
+   tap sequence) is what surfaces it — scrubbing or soaking reveals it
+   physically, in-hand, rather than the game cutting to an image.
+   Amos's refinement: make the recognized object a **ring**, not a
+   fingernail — a mundane object recognized in the wrong context does
+   more work than raw anatomy, same principle the whole aesthetic
+   already runs on (a stain a shade too red, a wall chart a little too
+   precise — ordinary thing, wrong context, not horror imagery).
+   Also folds two mechanics into one event rather than two: this is
+   both (a) the first mystery-of-the-week plate whose diagnostic result
+   is unambiguous — no designer-could-be-lying room the way every prior
+   one had — and (b) the same state change that trips the plate-maker
+   unlock (item 7). One trigger, two payoffs. Not yet confirmed by Ian.
 
 ## Decided so far (changelog)
 
