@@ -858,13 +858,18 @@ class DiscordAdapter(discord.Client):
 
             if cmd == "context":
                 # Whole-install board like status/usage — no real agent
-                # target, but `target_agent`/`extra_args` may have caught
-                # a stray "--all" from the raw command text since this
-                # command doesn't take a target. Renders context_box.py's
-                # board directly — the "check without entering #agent-chat"
-                # surface Ian asked for 2026-08-27, reachable on demand
-                # rather than only when a new message triggers a mirror.
-                all_flag = "--all" in ({target_agent} | set(extra_args))
+                # target, but `agent`/`extra_args` may have caught a stray
+                # "--all" from the raw command text since this command
+                # doesn't take a target (handle_sys_command's positional
+                # parsing has no way to know that ahead of time — the
+                # text form defaults `agent` to some real agent name when
+                # nothing follows "context", which is harmless here since
+                # it's just one more thing "--all" isn't equal to).
+                # Renders context_box.py's board directly — the "check
+                # without entering #agent-chat" surface Ian asked for
+                # 2026-08-27, reachable on demand rather than only when a
+                # new message triggers a mirror.
+                all_flag = "--all" in ({agent} | set(extra_args))
                 return context_box.render_board(open_only=not all_flag)
 
             if not agent:
