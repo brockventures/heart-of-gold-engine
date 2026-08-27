@@ -420,6 +420,26 @@ wrongness reads as a small detail, not a horror-genre signal."
    Needs Amos's read on how far "a little more graphic" should go before
    it actually breaks the comedic tone rather than just deepening it.
 
+   **Reveal-object sequencing + Act 2 choice content — new, 2026-08-27
+   (Ian).** Two pieces:
+   1. The ring (already locked as the Act 1→2 transition object) is
+      explicitly framed as the *earlier* reveal — suspicious, not
+      definitive. A particularly nasty stain that reveals a finger is
+      the *later*, definitive reveal — the identifiable object that
+      feeds Act 2's fingerprinting mechanic. Confirms the ring→finger
+      progression as the concrete shape of the already-decided
+      ambiguous→obvious clarity reversal between the two Acts, rather
+      than two disconnected object ideas.
+   2. Concrete stakes for the Act 2 go-along-or-fight-back choice (item
+      8 below): pocket what's found and bring it home to turn in to the
+      police (expose/fight-back branch) vs. dispose of the human
+      remains (go-along/cover-up branch). Gives the moral choice an
+      actual mechanical shape — ties directly to the fingerprinting-
+      identifies-whose-remains proposal above — instead of staying
+      abstract. Not yet run past Amos; what each branch actually
+      *changes* mechanically (ending, plate pool, consequences) is still
+      open.
+
 - 2026-08-24: Adversarial, pool-based (not live exchange). Real-time
   soak/paste timers, live steel-wool/sponge scrubbing. Always
   solvable, "unpleasant" allowed.
@@ -489,3 +509,8 @@ wrongness reads as a small detail, not a horror-genre signal."
   reconciled with Amos's narrower-gate counter, not yet run past him.
   Also floated: the game probably doesn't need to be very long overall
   (scope signal, not locked).
+- 2026-08-27 (Ian, #general): ring/finger reveal sequencing confirmed
+  (ring = earlier/ambiguous, finger via a nasty stain = later/
+  definitive), and concrete Act 2 choice stakes proposed — pocket
+  evidence and turn it in to the police vs. dispose of the remains.
+  Not yet run past Amos.
