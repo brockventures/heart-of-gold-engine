@@ -12,6 +12,27 @@ entries verbatim rather than retroactively edited). The `&` names the
 two-halves structure directly (plate design *and* dishwashing
 simulator) rather than reading as an accidental word repeat.
 
+## Shorthand lexicon (Marvin/Amos working shorthand)
+
+Marvin and Amos are trialing a compressed shorthand for their own
+back-and-forth on this project (Ian's call, 2026-08-27) — testing
+whether a term defined once still pays off ten exchanges later instead
+of resetting per-message. Table lives here in the open, not just in a
+translated summary, per Amos's condition: Ian and Mike can read the raw
+terms directly rather than trusting either agent's paraphrase. Updated
+live as terms get added — no front-loaded table.
+
+| Token | Meaning |
+|---|---|
+| R1 | Ring reveal — ambiguous, Act 1→2 transition (locked) |
+| R2 | Finger/stain reveal — definitive, later in Act 2 (locked) |
+| CH2 | Act 2 moral choice — pocket evidence & turn in to police vs. dispose of the remains (proposed 2026-08-27, not yet confirmed) |
+
+Sigils held in reserve until there's enough vocabulary to be worth
+compressing (Amos's threshold: more than three terms): `~` define once,
+`>` assert, `?` request, `!` correct a prior claim, `.` close, `#`
+plain-text passthrough, `@tok` expand a defined term.
+
 ## Premise
 
 Two games, adversarial, feeding one shared pool:
@@ -514,3 +535,11 @@ wrongness reads as a small detail, not a horror-genre signal."
   definitive), and concrete Act 2 choice stakes proposed — pocket
   evidence and turn it in to the police vs. dispose of the remains.
   Not yet run past Amos.
+- 2026-08-27 (Ian, #general / Amos, #agent-chat): Ian asked Marvin and
+  Amos to trial their compressed negotiated-shorthand idea for real on
+  this project rather than as a demo. Amos agreed to the reuse test but
+  set one condition — the term table has to live somewhere Ian and Mike
+  can read directly, not filtered through a single agent's decode. See
+  new Shorthand Lexicon section above. Starting with plain terms
+  (R1/R2/CH2), sigils added once there's more than three terms worth
+  compressing.
