@@ -112,6 +112,58 @@ move as not trusting his own digest that stated `inferred` as `observed`.
 Not enforced by parse_handoff — this module only parses the envelope, it
 doesn't gate on it. The caller decides what "verify" means per message
 kind.
+
+`context_box` — optional object, extended additively 2026-08-27 (Ian's
+ask: "we shouldn't need to enter that chat" to find out where an
+agent-chat thread stalled). Problem it's aimed at: `facts/decisions-need-
+explicit-flag-2026-08-27.md` established that a decision buried in prose
+reads as FYI, not a pending ask; `facts/agent-chat-replies-also-outbox-to-
+general.md` shows the same failure recurring three times even with a
+standing rule, because "remember to mirror this" is a judgment call made
+fresh every turn. `context_box` moves the state Ian/Mike actually need
+(is this thread stuck, and on whom) out of prose and into a field, same
+move as `reply`, so it can be mirrored mechanically instead of by
+recall:
+
+    "context_box": {"state": "blocked", "blocked_on": "...",
+                     "waiting_on": "..."}
+
+    ```handoff
+    {"v": 0, "kind": "status", "reply": "none", "subject": "outbox-parity",
+     "context_box": {"state": "blocked",
+                      "blocked_on": "discord_post.py has no durable retry queue yet",
+                      "waiting_on": "amos"}}
+    ```
+
+`state` — closed enum, four values: `active` (in progress, nothing
+blocking), `blocked` (stuck on something other than a person — a bug, a
+missing piece, an unresolved design fork), `waiting-human` (stuck on a
+decision only Ian or Mike can make), `resolved` (thread closed). An
+invalid or missing `state` degrades the whole `context_box` to `None` —
+same fail-open rule as everything else additive in this schema — it does
+NOT invalidate the envelope itself.
+
+`blocked_on` / `waiting_on` — both optional free-text strings, no schema
+beyond "non-empty string." Deliberately not structured further (e.g. no
+enum of blocker types) — the lesson from the shorthand-lexicon table
+(`docs/design/dishwasher-simulator-simulator.md`) is that terms earn
+structure only once there's real repeated vocabulary to compress, not
+up front.
+
+What actually happens with it: `state in {blocked, waiting-human}` is
+the trigger a caller mirrors to a channel Ian/Mike actually watch — see
+`bin/context_box.py` for the persistent board and `bin/relay.py`'s
+inbound wiring for the auto-mirror-to-#general side. `active`/`resolved`
+are still recorded (so the board reflects a thread closing out) but
+don't trigger a mirror push.
+
+Known gap, not yet closed: this only auto-mirrors *inbound* messages
+(relay.py sees Amos's or a human's messages, not Marvin's own outgoing
+replies — `if message.author == self.user: return` skips those before
+parsing ever runs). Marvin's own blockers still need the outbound half
+wired into agent-server.py's `post_to_discord` (or a `context_box.record`
+call at compose time) before this is symmetric. Filed as a follow-up, not
+done yet — see `bin/context_box.py`'s module docstring.
 """
 
 from __future__ import annotations
@@ -129,12 +181,20 @@ _FENCE_RE = re.compile(r"```handoff\s*\n(.*?)\n```", re.DOTALL)
 VALID_REPLY = {"required", "optional", "none"}
 VALID_KINDS = {"finding", "question", "answer", "handoff", "correction", "status"}
 VALID_CONFIDENCE = {"observed", "inferred", "reported"}
+VALID_CONTEXT_STATE = {"active", "blocked", "waiting-human", "resolved"}
 
 
 @dataclass(frozen=True)
 class Supersedes:
     subject: str
     msg_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ContextBox:
+    state: str  # "active" | "blocked" | "waiting-human" | "resolved"
+    blocked_on: Optional[str] = None
+    waiting_on: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +208,7 @@ class Envelope:
     confidence: Optional[str] = None  # "observed" | "inferred" | "reported"
     stale_after: Optional[str] = None  # ISO-8601 timestamp, sender-declared
     id: Optional[str] = None  # sender-namespaced stable id, e.g. "marvin-2026-08-09-1"
+    context_box: Optional[ContextBox] = None
     raw: dict = field(default_factory=dict)
 
 
@@ -242,10 +303,36 @@ def parse_handoff(content: str) -> Optional[Envelope]:
     if not isinstance(env_id, str) or not env_id:
         env_id = None
 
+    # context_box: same degrade-don't-invalidate rule as confidence/
+    # stale_after/id above. An invalid or missing `state` drops the whole
+    # object to None rather than failing the envelope — this field isn't
+    # load-bearing for the gate, only for the mirror-to-#general decision
+    # a caller makes downstream (see context_box.py).
+    context_box = None
+    raw_context_box = data.get("context_box")
+    if isinstance(raw_context_box, dict):
+        cb_state = raw_context_box.get("state")
+        if cb_state in VALID_CONTEXT_STATE:
+            cb_blocked_on = raw_context_box.get("blocked_on")
+            if not isinstance(cb_blocked_on, str) or not cb_blocked_on:
+                cb_blocked_on = None
+            cb_waiting_on = raw_context_box.get("waiting_on")
+            if not isinstance(cb_waiting_on, str) or not cb_waiting_on:
+                cb_waiting_on = None
+            context_box = ContextBox(
+                state=cb_state, blocked_on=cb_blocked_on, waiting_on=cb_waiting_on,
+            )
+        else:
+            log.warning(
+                f"handoff envelope: unrecognized context_box.state={cb_state!r} "
+                f"— dropping context_box, envelope otherwise unaffected"
+            )
+
     return Envelope(
         v=v, kind=kind, reply=reply, subject=subject,
         evidence=evidence, supersedes=supersedes,
         confidence=confidence, stale_after=stale_after, id=env_id,
+        context_box=context_box,
         raw=data,
     )
 
@@ -372,6 +459,60 @@ def _selftest() -> int:
           (e3.confidence, e3.stale_after, e3.id), (None, None, None))
     check("non-string id degrades to None",
           parse_handoff('```handoff\n{"v":0,"kind":"finding","reply":"none","id":5}\n```').id,
+          None)
+
+    # -- 2026-08-27 additive field: context_box --
+    e5 = parse_handoff(
+        '```handoff\n{"v":0,"kind":"status","reply":"none","subject":"outbox-parity",'
+        '"context_box":{"state":"blocked","blocked_on":"no durable retry queue yet",'
+        '"waiting_on":"amos"}}\n```'
+    )
+    check("context_box parsed", e5.context_box is not None, True)
+    check("context_box.state parsed", e5.context_box.state if e5.context_box else None, "blocked")
+    check("context_box.blocked_on parsed",
+          e5.context_box.blocked_on if e5.context_box else None, "no durable retry queue yet")
+    check("context_box.waiting_on parsed",
+          e5.context_box.waiting_on if e5.context_box else None, "amos")
+
+    for s in ("active", "blocked", "waiting-human", "resolved"):
+        check(f"context_box.state={s} accepted",
+              parse_handoff(
+                  f'```handoff\n{{"v":0,"kind":"status","reply":"none",'
+                  f'"context_box":{{"state":"{s}"}}}}\n```'
+              ).context_box.state,
+              s)
+
+    check("missing context_box defaults to None", e3.context_box, None)
+    e5b = parse_handoff(
+        '```handoff\n{"v":0,"kind":"status","reply":"none",'
+        '"context_box":{"state":"blocked"}}\n```'
+    )
+    check("context_box with no blocked_on/waiting_on still parses",
+          (e5b.context_box.blocked_on, e5b.context_box.waiting_on) if e5b.context_box else "MISSING",
+          (None, None))
+    check("invalid context_box.state drops context_box, not the envelope",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"status","reply":"none",'
+              '"context_box":{"state":"stalled"}}\n```'
+          ) is not None,
+          True)
+    check("invalid context_box.state -> context_box is None",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"status","reply":"none",'
+              '"context_box":{"state":"stalled"}}\n```'
+          ).context_box,
+          None)
+    check("non-dict context_box degrades to None, not a parse failure",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"status","reply":"none",'
+              '"context_box":"blocked"}\n```'
+          ).context_box,
+          None)
+    check("non-string blocked_on degrades to None",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"status","reply":"none",'
+              '"context_box":{"state":"blocked","blocked_on":5}}\n```'
+          ).context_box.blocked_on,
           None)
 
     print("PASS  fails open on every malformed case" if not fails else f"FAIL  {fails} case(s)")

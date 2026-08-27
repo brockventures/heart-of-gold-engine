@@ -29,6 +29,7 @@ from logging.handlers import RotatingFileHandler
 from reply_gate import Decision, GateMessage, ReplyGate, SCORER_PROMPT
 from handoff import parse_handoff
 from outbox import add_pending
+import context_box
 
 # =============================================================================
 # Graceful shutdown / in-flight tracking
@@ -840,6 +841,17 @@ class DiscordAdapter(discord.Client):
                 # Whole-process action like status/usage, no agent target.
                 return await self._sys_restart_server(author, channel)
 
+            if cmd == "context":
+                # Whole-install board like status/usage — no real agent
+                # target, but `target_agent`/`extra_args` may have caught
+                # a stray "--all" from the raw command text since this
+                # command doesn't take a target. Renders context_box.py's
+                # board directly — the "check without entering #agent-chat"
+                # surface Ian asked for 2026-08-27, reachable on demand
+                # rather than only when a new message triggers a mirror.
+                all_flag = "--all" in ({target_agent} | set(extra_args))
+                return context_box.render_board(open_only=not all_flag)
+
             if not agent:
                 return "**/sys**: no agent configured to target"
 
@@ -926,7 +938,7 @@ class DiscordAdapter(discord.Client):
 
             return (f"Unknown /sys command: `{cmd}`. Known: status, clear, "
                     f"reload, compact, usage, override, override-clear, "
-                    f"restart-server")
+                    f"restart-server, context")
         except Exception as e:
             return f"**/sys {cmd}** failed: {e}"
 
@@ -1157,6 +1169,38 @@ class DiscordAdapter(discord.Client):
             # measured reasoning (a full turn costs ~1000x a compressed
             # message, so the only real lever is whether a turn happens).
             envelope = parse_handoff(message.content or "")
+
+            # context_box (handoff.py, added 2026-08-27): record it on the
+            # board regardless of reply value — a blocker declared with
+            # reply:none still needs to be visible — and, for state in
+            # {blocked, waiting-human} only, auto-mirror one line to
+            # #general via outbox. This replaces a per-turn judgment call
+            # ("is this worth mirroring?") that recurred as a miss three
+            # times (see facts/agent-chat-replies-also-outbox-to-general.md)
+            # with an unconditional trigger keyed off the field, same
+            # move `reply` already made for the wake/quiet decision.
+            # Inbound-only for now — see context_box.py's module docstring
+            # for the outbound (Marvin's own replies) gap that's still open.
+            if envelope and envelope.context_box:
+                cb = envelope.context_box
+                row = context_box.record(
+                    subject=envelope.subject,
+                    state=cb.state,
+                    blocked_on=cb.blocked_on,
+                    waiting_on=cb.waiting_on,
+                    sender=message.author.display_name,
+                    channel=channel_name or str(message.channel.id),
+                )
+                if context_box.should_mirror(cb.state):
+                    add_pending(
+                        "general",
+                        context_box.render_mirror_line(envelope.subject or "(no subject)", row),
+                    )
+                    log.info(
+                        f"[context_box] {channel_name} subject={envelope.subject!r} "
+                        f"state={cb.state} -> mirrored to #general"
+                    )
+
             if envelope and envelope.reply == "none":
                 # Sender's declared intent still wins — silence stays free,
                 # no scorer call either way — but a '?' in the prose next to
