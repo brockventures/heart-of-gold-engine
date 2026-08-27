@@ -408,8 +408,8 @@ class DiscordAdapter(discord.Client):
         # CommandTree is the better call for us: officially supported,
         # handles registration and interaction dispatch itself, one less
         # hand-rolled REST surface to get subtly wrong. Registers
-        # status/usage/clear/reload/compact/override/override-clear — every /sys
-        # command with a real handler. Amos's explicit warning, taken
+        # status/usage/context/clear/reload/compact/override/override-clear
+        # — every /sys command with a real handler. Amos's explicit warning, taken
         # seriously: a command that registers cleanly and has no matching
         # branch silently does nothing when clicked, nothing errors
         # anywhere. The text `/sys` intercept stays as-is, unchanged,
@@ -455,6 +455,21 @@ class DiscordAdapter(discord.Client):
                 if not await _owner_check(interaction):
                     return
                 reply = await adapter._run_sys_command("usage", None)
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
+
+        @self.tree.command(name="context", description="Show the #agent-chat blocker/status board (context_box) — no need to open the channel")
+        @discord.app_commands.describe(include_resolved="Include resolved threads too (default: open only)")
+        async def context_cmd(interaction: discord.Interaction, include_resolved: Optional[bool] = False):
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command(
+                    "context", None, extra_args=["--all"] if include_resolved else []
+                )
                 await interaction.response.send_message(reply)
             finally:
                 _INFLIGHT_COUNT -= 1
