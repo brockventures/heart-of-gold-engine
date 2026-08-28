@@ -1991,14 +1991,20 @@ async def read_agent_response(
     tool_streaming = config.get("tool_streaming", False)
     stream_to_channel = config.get("stream_to_channel", False)
 
-    # Per-channel quiet mode (2026-08-11, Ian: keep #agent-chat clean of
-    # tool-call/interim "thinking" noise). agents.json's `quiet_channels`
-    # lists channel *names* (per channels.json), not IDs, since that's
-    # what a human actually edits. Only silences tool lines and interim
-    # italics for this turn — the real final answer (pending_final in
-    # process_agent_queue) is never gated by either flag and always
-    # posts regardless, so a quiet channel still gets its answer, just
-    # without the play-by-play.
+    # Per-guild quiet mode (2026-08-11, Ian: keep #agent-chat clean of
+    # tool-call/interim "thinking" noise; extended 2026-08-28 to a general
+    # rule — full personality everywhere, but tool/gear-line streaming
+    # only in the home guild). Originally a hand-maintained channel *name*
+    # list (`agents.json`'s `quiet_channels`), which meant a new channel
+    # in a foreign guild stayed noisy until someone remembered to add its
+    # name. Replaced with an actual guild check: only the primary guild
+    # (`channels_config["server_ids"][0]` — Heart of Gold) gets tool
+    # lines and interim italics; every other guild a configured channel
+    # lives in is quiet by construction, no list maintenance needed. Only
+    # silences tool lines and interim italics for this turn — the real
+    # final answer (pending_final in process_agent_queue) is never gated
+    # by either flag and always posts regardless, so a quiet channel
+    # still gets its answer, just without the play-by-play.
     #
     # 2026-08-14: flipped from a pure blocklist to allowlist-then-blocklist.
     # A channel_id not found in our own channels_config (e.g. one that
@@ -2008,19 +2014,18 @@ async def read_agent_response(
     # equivalent path defaults to posting nowhere unless told otherwise.
     # Paired with relay.py's guild gate, which should stop that traffic
     # even earlier now — this is the second layer, not the only one.
-    channel_name = next(
-        (name for name, cfg in channels_config.get("channels", {}).items()
+    # Preserved under the guild-check rewrite: an unrecognized channel
+    # has no known guild_id either, so it still fails closed below.
+    channel_cfg = next(
+        (cfg for cfg in channels_config.get("channels", {}).values()
          if cfg.get("id") == channel_id),
         None,
     )
-    if channel_name is None:
+    primary_guild_ids = channels_config.get("server_ids", [])
+    primary_guild_id = primary_guild_ids[0] if primary_guild_ids else None
+    if channel_cfg is None or channel_cfg.get("guild_id") != primary_guild_id:
         tool_streaming = False
         stream_to_channel = False
-    else:
-        quiet_channels = config.get("quiet_channels", [])
-        if channel_name in quiet_channels:
-            tool_streaming = False
-            stream_to_channel = False
 
     msg_ids = message_ids or []
 

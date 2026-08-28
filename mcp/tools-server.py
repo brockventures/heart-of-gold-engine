@@ -511,7 +511,25 @@ def handle_skill_tool(tool: dict, args: dict) -> dict:
         env["TOOL_ARGS"] = json.dumps(args)
 
         if script.suffix == ".py":
-            cmd = ["python3", str(script)]
+            # Escape valve for skills with dependencies too heavy or too
+            # version-sensitive to vendor by hand (large ML packages, native
+            # extensions, etc.): if the skill ships its own skills/<name>/.venv,
+            # use that interpreter. Otherwise fall back to bare "python3",
+            # which resolves to the system interpreter — this MCP server is
+            # itself launched that way (see .mcp.json), not via the repo's
+            # own .venv, so most skills should keep vendoring small pure-Python
+            # deps into skills/<name>/vendor/ rather than assuming a shared
+            # environment exists. Pattern confirmed live and working by Amos
+            # (Mike's Karakos instance) 2026-08-28 — he uses the identical
+            # per-skill-.venv-as-escape-valve approach for three of his own
+            # skills (voice-transcribe/elevenlabs-voice/recipe-scraper) rather
+            # than one shared environment, specifically to avoid collisions
+            # between packages like faster-whisper/ctranslate2 and everything
+            # else. Deliberately not "unify everything into one venv" — that
+            # was the original plan here until his answer changed it.
+            skill_venv_python = skill_dir / ".venv" / "bin" / "python3"
+            interpreter = str(skill_venv_python) if skill_venv_python.exists() else "python3"
+            cmd = [interpreter, str(script)]
         else:
             cmd = ["bash", str(script)]
 
@@ -589,7 +607,23 @@ def main():
         method = request.get("method", "")
         params = request.get("params", {})
 
-        if method == "tools/list":
+        if method == "initialize":
+            response = {
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "system-tools", "version": "1.0.0"},
+                },
+                "id": req_id,
+            }
+
+        elif method == "notifications/initialized":
+            # Notification, not a request — no response body, and no
+            # req_id to reply to even if we wanted to.
+            continue
+
+        elif method == "tools/list":
             # write_health() previously only fired on a successful
             # tools/call, so a session that never happened to invoke a
             # tool through this server looked "missing" to health-monitor

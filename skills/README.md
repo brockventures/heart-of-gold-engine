@@ -247,6 +247,59 @@ echo "{\"status\": \"success\", \"output\": \"$RESULT\"}"
 - **Working directory**: Scripts run from the skill directory (`skills/your-skill/`).
 - **Permissions**: Scripts run as the container user (no privilege escalation).
 - **Exit code**: Exit 0 for success, non-zero for failure. Always print JSON to stdout.
+- **Interpreter**: Python scripts run under bare `python3` — which resolves
+  to the *system* interpreter, not this repo's `.venv` (the MCP server
+  itself is launched the same bare way per `.mcp.json`, with no
+  shell/activate step, so this repo's venv never enters the picture unless
+  a skill opts in — see "Third-Party Dependencies" below). Stdlib-only
+  scripts need nothing special.
+
+### Third-Party Dependencies
+
+System python3 has no pip and is Debian's externally-managed Python, so
+`pip install`-ing anything into it isn't an option without root, and some
+packages (e.g. `recurring-ical-events`) aren't in apt's repos at all
+anyway. Two supported patterns, pick based on weight:
+
+**Small, pure-Python packages** (no compiled/native extensions): vendor
+them directly into the skill.
+
+```bash
+pip install --target skills/your-skill/vendor some-pure-python-pkg
+```
+
+Then in the script, before importing:
+
+```python
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "vendor"))
+import some_pure_python_pkg
+```
+
+See `skills/calendar/` for a real example (`icalendar` +
+`recurring-ical-events`).
+
+**Heavy, native, or version-sensitive packages** (ML models, compiled
+extensions, anything that could collide with another skill's pinned
+version): give the skill its own dedicated virtualenv instead.
+
+```bash
+python3 -m venv skills/your-skill/.venv
+skills/your-skill/.venv/bin/pip install whatever-heavy-package
+```
+
+`tools-server.py` checks for `skills/<name>/.venv/bin/python3` before
+falling back to bare `python3`, and uses it automatically if present —
+no extra config needed. This is deliberately per-skill rather than one
+shared environment for every skill: it's the same pattern Amos (a sibling
+Karakos instance) uses for his own heavier skills (voice transcription,
+TTS, etc.) specifically to avoid one skill's large ML dependencies
+colliding with another's. Confirmed working 2026-08-28.
+
+Don't default to a shared venv "to keep things simple" — it works right
+up until two skills want different major versions of the same
+dependency, and per-skill isolation costs nothing but a bit of disk.
 
 ---
 

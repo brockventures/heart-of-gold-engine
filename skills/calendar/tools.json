@@ -1,0 +1,30 @@
+{
+  "skill_name": "calendar",
+  "version": "1.0.0",
+  "description": "Read-only access to Ian's personal and work calendars via their ICS feed URLs. No write capability exists — the feeds themselves are view-only.",
+  "tools": [
+    {
+      "name": "get_calendar_events",
+      "description": "List events from Ian's personal and/or work calendar for a given date (or range of days starting from that date). Expands recurring events. Times are returned in America/Los_Angeles local time, which is the timezone both calendars are authored in.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "calendar": {
+            "type": "string",
+            "enum": ["personal", "work", "both"],
+            "description": "Which calendar(s) to query (default: both)"
+          },
+          "date": {
+            "type": "string",
+            "description": "Start date as YYYY-MM-DD in America/Los_Angeles local time (default: today)"
+          },
+          "days": {
+            "type": "integer",
+            "description": "Number of consecutive days to include starting from date, e.g. 7 for 'this week' (default: 1)"
+          }
+        },
+        "required": []
+      }
+    }
+  ]
+}
