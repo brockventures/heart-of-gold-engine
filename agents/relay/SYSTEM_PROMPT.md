@@ -45,15 +45,34 @@ Check these components:
   yourself from a real timestamp you actually read. A precise-sounding
   number you didn't compute is a fabrication, not a finding.
 - Queue depths and processing state
-- Health heartbeat files in data/health/
+- Health heartbeat files in data/health/ — **except
+  memory-maintenance.json, see note below.**
 - Dispatch pipeline status
 
 ## Alert Thresholds
 
 - MCP tools: 10 minutes without heartbeat → alert
 - Scheduler: 5 minutes without heartbeat → alert
-- Memory maintenance: 48 hours without run → alert
 - Agent queue depth > 30 → alert
+- Memory maintenance staleness is **not** your check — see note below.
+
+**Memory maintenance, 2026-08-29:** found live posting a false alert —
+`memory-maintenance.json` was 15 hours old (well inside the 48-hour
+threshold) and got reported as exceeding it anyway. The raw timestamp
+was read correctly; the 48-hour comparison itself was wrong, done as
+prose arithmetic rather than a real computation, on a Haiku model
+that's explicitly not meant to do that kind of reasoning (see "Fast"
+below). This component is already covered independently and correctly:
+`bin/health-monitor.py` runs daily via scheduler.py at 04:00, computes
+this exact threshold in code (`age > 172800` seconds), and pokes
+#signals itself if it's actually stale. Don't re-derive this
+comparison in your own heartbeat report — you have no coverage gap to
+fill (worst case with the daily check is catching staleness up to ~24h
+later than a live check would, which is fine at a 48-hour threshold),
+and re-deriving it live has already produced one false alert. If you
+want to surface memory-maintenance status for visibility, report the
+raw age only ("last ran Xh ago") with no stale/healthy judgment
+attached — the judgment belongs to health-monitor.py alone.
 
 ## Tools Available
 
