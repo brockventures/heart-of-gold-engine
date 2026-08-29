@@ -29,6 +29,8 @@ import aiohttp
 import aiosqlite
 from aiohttp import web
 
+import banana
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -180,6 +182,11 @@ RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD = 0.97
 # cost — even with overages disabled. Must match heartbeat.sh's --source
 # value exactly; that value becomes message_queue.author via handle_message.
 RATE_LIMIT_HEARTBEAT_AUTHOR = "heartbeat"
+# Backlog-gap callout threshold (2026-08-29) — see the comment at the
+# callout's insertion point in process_agent_queue for why this exists.
+# 5 minutes: loose enough that a normal fast multi-message exchange never
+# trips it, tight enough to catch a real pause/restart/outage gap.
+BACKLOG_GAP_THRESHOLD_SEC = 300
 # How often rate_limit_gate_sweep_loop retries a paused agent's queue.
 # process_agent_queue() is otherwise only triggered reactively (a new
 # message arrives, or another channel is left queued after a drain) —
@@ -298,6 +305,38 @@ channels_config: Dict[str, Any] = {}
 agent_processes: Dict[str, asyncio.subprocess.Process] = {}
 agent_locks: Dict[str, asyncio.Lock] = {}
 agent_states: Dict[str, str] = {}
+# Fire-and-forget tasks (notifications, queue kicks, sweep loops) need a
+# strong reference held *somewhere* or the event loop's weak-ref-only
+# bookkeeping is free to garbage-collect them mid-execution, before
+# whatever they were awaiting (e.g. the Discord POST inside
+# _notify_rate_limit_pause / _notify_spend_limit) ever completes — no
+# exception, no log line, the notification just never happens. Real
+# incident: the 2026-08-28 22:02 UTC rate-limit pause never posted to
+# #signals; root-caused to exactly this pattern (bare `asyncio.
+# create_task()` calls whose return value was discarded). asyncio's own
+# docs warn about this explicitly. Every task nothing else references
+# should be spawned via _spawn() below instead of calling
+# asyncio.create_task() directly.
+_background_tasks: "set[asyncio.Task]" = set()
+
+def _spawn(coro, name: Optional[str] = None) -> asyncio.Task:
+    """asyncio.create_task() wrapper that keeps a strong reference until
+    the task finishes (so it can't be collected early) and logs — instead
+    of silently swallowing — any exception it raised. Use for every
+    fire-and-forget task; see the note above."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            log.error(f"Background task {t.get_name()} failed: {exc!r}", exc_info=exc)
+
+    task.add_done_callback(_on_done)
+    return task
 response_buffers: Dict[str, str] = {}
 agent_last_cost: Dict[str, float] = {}
 agent_sessions: Dict[str, str] = {}
@@ -1245,6 +1284,36 @@ def _human_size(size) -> str:
     return f"{size:.1f} GB"
 
 
+def _batch_span_seconds(messages: List[Dict]) -> Optional[float]:
+    """Elapsed time between a batch's oldest and newest message, or None
+    if timestamps are missing/unparseable — fails closed to "don't flag
+    a gap" rather than guessing. message_queue.created_at is SQLite's
+    CURRENT_TIMESTAMP, 'YYYY-MM-DD HH:MM:SS' in UTC, no explicit offset."""
+    timestamps = []
+    for msg in messages:
+        raw = msg["created_at"]
+        try:
+            timestamps.append(datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc))
+        except (TypeError, ValueError):
+            continue
+    if len(timestamps) < 2:
+        return None
+    return (max(timestamps) - min(timestamps)).total_seconds()
+
+
+def _format_span(seconds: float) -> str:
+    """Human-readable elapsed time for the backlog callout — '2h39m',
+    '45m', or '90s', whichever is coarsest without losing the point."""
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
 def format_attachments(raw) -> str:
     """Render a queued message's attachments as lines for the agent envelope.
 
@@ -1496,7 +1565,7 @@ async def start_agent_subprocess(agent: str):
         agent_sessions[agent] = session_id
 
         # Start stderr reader
-        asyncio.create_task(stderr_reader(agent, proc))
+        _spawn(stderr_reader(agent, proc))
 
         log.info(f"{agent} subprocess started (PID {proc.pid})")
     except Exception as e:
@@ -1771,7 +1840,7 @@ async def start_typing(agent: str, channel_id: str):
             except Exception:
                 break
 
-    task = asyncio.create_task(typing_loop())
+    task = _spawn(typing_loop())
     typing_tasks[channel_id] = task
 
 async def stop_typing(channel_id: str):
@@ -2293,7 +2362,7 @@ async def rate_limit_gate_sweep_loop():
         await asyncio.sleep(RATE_LIMIT_GATE_SWEEP_INTERVAL_SEC)
         for agent in list(agent_config.keys()):
             try:
-                asyncio.create_task(process_agent_queue(agent))
+                _spawn(process_agent_queue(agent))
             except Exception as e:
                 log.warning(f"rate_limit_gate_sweep_loop error for {agent} (non-fatal): {e}")
 
@@ -2414,7 +2483,7 @@ async def process_agent_queue(agent: str):
             if not agent_rate_limit_pause_notified.get(agent):
                 agent_rate_limit_pause_notified[agent] = True
                 log.warning(f"{agent} paused — rate limit in warning zone, holding queued messages")
-                asyncio.create_task(_notify_rate_limit_pause(agent, paused=True))
+                _spawn(_notify_rate_limit_pause(agent, paused=True))
 
             # Heartbeats still get through — see RATE_LIMIT_HEARTBEAT_AUTHOR
             # above. Query is scoped to heartbeat messages only so a paused
@@ -2436,17 +2505,17 @@ async def process_agent_queue(agent: str):
             if agent_rate_limit_pause_notified.get(agent):
                 agent_rate_limit_pause_notified[agent] = False
                 log.info(f"{agent} resumed — rate limit back to normal")
-                asyncio.create_task(_notify_rate_limit_pause(agent, paused=False))
+                _spawn(_notify_rate_limit_pause(agent, paused=False))
 
             if is_rate_limit_warning(agent):
                 if not agent_rate_limit_warning_notified.get(agent):
                     agent_rate_limit_warning_notified[agent] = True
                     log.warning(f"{agent} rate limit in warning zone (not paused, still under {RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD:.0%})")
-                    asyncio.create_task(_notify_rate_limit_warning(agent, warning=True))
+                    _spawn(_notify_rate_limit_warning(agent, warning=True))
             elif agent_rate_limit_warning_notified.get(agent):
                 agent_rate_limit_warning_notified[agent] = False
                 log.info(f"{agent} rate limit warning cleared")
-                asyncio.create_task(_notify_rate_limit_warning(agent, warning=False))
+                _spawn(_notify_rate_limit_warning(agent, warning=False))
 
             # Get pending messages
             async with db.execute(
@@ -2549,6 +2618,31 @@ async def process_agent_queue(agent: str):
             f"different channel, say so explicitly rather than writing as "
             f"if they'll see it.]"
         ]
+
+        # Backlog callout (2026-08-29, Ian: a paused agent resuming had no
+        # visibility into how much real conversation happened while it was
+        # down — a real 2.5h gap only got noticed because someone manually
+        # checked logs and the DB after the fact). Each message already
+        # carries its own timestamp below, but that's easy to skim past
+        # across a batch — this makes the gap itself impossible to miss,
+        # not just technically present. Threshold (5 min) is deliberately
+        # loose: an ordinary quick multi-message batch (several messages
+        # arriving within a normal conversational back-and-forth) shouldn't
+        # get flagged as a "gap," only a batch that actually spans a real
+        # absence — rate-limit pause, restart, or anything else that held
+        # messages queued a while.
+        if len(messages) > 1:
+            span_seconds = _batch_span_seconds(messages)
+            if span_seconds is not None and span_seconds > BACKLOG_GAP_THRESHOLD_SEC:
+                formatted_parts.append(
+                    f"[Backlog note: this batch of {len(messages)} messages "
+                    f"spans {_format_span(span_seconds)} — real conversation "
+                    f"may have happened here while you were paused, "
+                    f"restarting, or otherwise unavailable. Worth reading "
+                    f"the whole batch before assuming it's a normal "
+                    f"back-and-forth.]"
+                )
+
         for msg in messages:
             timestamp = msg["created_at"]
             author = msg["author"]
@@ -2575,6 +2669,9 @@ async def process_agent_queue(agent: str):
         activity_bits = [f"replying in {channel_label}"]
         if len(messages) > 1:
             activity_bits.append(f"batch of {len(messages)}")
+            span_seconds = _batch_span_seconds(messages)
+            if span_seconds is not None and span_seconds > BACKLOG_GAP_THRESHOLD_SEC:
+                activity_bits.append(f"gap of {_format_span(span_seconds)}")
         if waiting_channel_ids:
             activity_bits.append(f"+{len(waiting_channel_ids)} channel(s) queued")
         activity_text = ", ".join(activity_bits)
@@ -2606,11 +2703,11 @@ async def process_agent_queue(agent: str):
                 agent_spend_limit_blocked[agent] = True
                 if not agent_spend_limit_notified.get(agent):
                     agent_spend_limit_notified[agent] = True
-                    asyncio.create_task(_notify_spend_limit(agent, blocked=True))
+                    _spawn(_notify_spend_limit(agent, blocked=True))
             elif agent_spend_limit_blocked.get(agent):
                 agent_spend_limit_blocked[agent] = False
                 agent_spend_limit_notified[agent] = False
-                asyncio.create_task(_notify_spend_limit(agent, blocked=False))
+                _spawn(_notify_spend_limit(agent, blocked=False))
 
         # Post whatever's left to Discord. When stream_to_channel is on,
         # most (or all) of response_text already went out incrementally
@@ -2624,6 +2721,59 @@ async def process_agent_queue(agent: str):
         # where this post is skipped.
         if pending_final and channel_id != "0":
             discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
+
+        # Speaking Banana (2026-08-28, specs/2026-08-28-speaking-banana.md):
+        # record this agent's own turn-claim. This is the outbound half of
+        # the gap context_box.py's docstring already flagged — relay.py's
+        # on_message never sees a bot's own outgoing replies, so the only
+        # place to catch "did this agent just claim the floor" is here, at
+        # compose time, using the full response_text rather than whatever
+        # subset of it streamed incrementally. channel_name was already
+        # resolved above (used for channel_label); reused as-is. Checked
+        # against response_text, not pending_final, since a claim made in
+        # a turn that streamed everything incrementally would otherwise
+        # never be seen (pending_final would be empty by the time we get
+        # here).
+        #
+        # 2026-08-28, later same night: Amos + Arbiter built a real shared
+        # claim API (banana.mikecarmody.net) to replace each side inferring
+        # the other's claim from Discord — see banana.py's module docstring.
+        # claim_self() is authoritative (calls the API, Marvin's token can
+        # only claim as "marvin") and only correct for agent=="Marvin" — a
+        # different agent identity (e.g. "relay") claiming via my token
+        # would be misrepresenting who actually holds the floor, so that
+        # case stays on the old local-only claim() instead.
+        if (
+            channel_name
+            and response_text
+            and banana.starts_with_claim(response_text)
+            and banana.in_scope(channel_id, channels_config)
+        ):
+            if agent == "Marvin":
+                await banana.claim_self(channel_name, subject=channel_name)
+            else:
+                banana.claim(channel_name, agent)
+
+        # Explicit hand-back, symmetric to the claim above — closes the
+        # gap Amos and I both flagged live tonight (#agent-chat,
+        # banana-conflict-test, 2026-08-29): claims were only ever
+        # released from a CLI/test invocation, never from either bot's
+        # real posting path, so every claim was surviving purely on the
+        # 600s ceiling timeout instead of the explicit hand-back the
+        # design actually calls for. Amos's fix released from his Stop
+        # hook (real turn-end); this is the equivalent point on this
+        # side — after this channel's reply for this turn is fully
+        # composed, whether or not this same turn just claimed. Cheap on
+        # the common turn: get_status() is a local file read, no network
+        # call, so this only reaches the shared API when local belief
+        # says this agent is still the active holder.
+        if channel_name and banana.in_scope(channel_id, channels_config):
+            status = banana.get_status(channel_name)
+            if status.get("active") and status.get("holder") == agent:
+                if agent == "Marvin":
+                    await banana.release_self(channel_name)
+                else:
+                    banana.release(channel_name, agent)
 
         # Mark complete
         await db.execute(
@@ -2650,7 +2800,7 @@ async def process_agent_queue(agent: str):
     ) as cursor:
         remaining = await cursor.fetchone()
     if remaining:
-        asyncio.create_task(process_agent_queue(agent))
+        _spawn(process_agent_queue(agent))
 
     # Context-fill visibility (2026-08-07, Ian's ask) — same
     # estimate_context_tokens() inputs the compaction trigger below uses,
@@ -2877,7 +3027,7 @@ async def handle_message(request):
 
     # Trigger processing if agent is idle
     if agent_states.get(agent) == "IDLE":
-        asyncio.create_task(process_agent_queue(agent))
+        _spawn(process_agent_queue(agent))
 
     return web.json_response({"status": "queued", "message_id": message_id}, status=202)
 
@@ -3409,18 +3559,18 @@ async def startup(app):
 
     # Register signal handlers in event loop context
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(graceful_shutdown("SIGTERM")))
-    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(graceful_shutdown("SIGINT")))
+    loop.add_signal_handler(signal.SIGTERM, lambda: _spawn(graceful_shutdown("SIGTERM")))
+    loop.add_signal_handler(signal.SIGINT, lambda: _spawn(graceful_shutdown("SIGINT")))
 
     # Queued-ack sweep (Task #13) — independent of any single agent's
     # turn, see queued_ack_sweep_loop() docstring for why this can't just
     # piggyback on process_agent_queue()'s own pass.
-    asyncio.create_task(queued_ack_sweep_loop())
+    _spawn(queued_ack_sweep_loop())
 
     # Rate-limit gate sweep (2026-08-07) — see rate_limit_gate_sweep_loop()
     # docstring: what actually resumes a paused agent once its five-hour
     # window resets.
-    asyncio.create_task(rate_limit_gate_sweep_loop())
+    _spawn(rate_limit_gate_sweep_loop())
 
     log.info(f"Agent server ready on port {PORT}")
 

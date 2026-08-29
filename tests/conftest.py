@@ -32,6 +32,20 @@ def import_script(name: str, file_path: Path = None):
     if file_path is None or not file_path.exists():
         raise FileNotFoundError(f"Script not found: {name}")
 
+    # Scripts under bin/ do bare (non-package) intra-bin imports — e.g.
+    # relay.py's `import banana`/`import context_box`, agent-server.py's
+    # `import banana` — which only resolve when bin/ is actually on
+    # sys.path, true when launched normally (see supervisord.conf) but
+    # not when loaded by file path via spec_from_file_location like this.
+    # Several test files used to work around this individually (see
+    # test_attachments.py's `relay` fixture); centralized here so any
+    # script loaded through import_script() gets the same fix, instead of
+    # every new bare import breaking another batch of tests one file at a
+    # time (agent-server.py's `import banana` broke 6 of them at once).
+    bin_dir = str(PACKAGE_ROOT / "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+
     spec = importlib.util.spec_from_file_location(module_name, str(file_path))
     module = importlib.util.module_from_spec(spec)
     # Don't cache in sys.modules — allows reload with different env

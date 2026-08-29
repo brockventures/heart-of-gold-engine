@@ -30,6 +30,7 @@ from reply_gate import Decision, GateMessage, ReplyGate, SCORER_PROMPT
 from handoff import parse_handoff
 from outbox import add_pending
 import context_box
+import banana
 
 # =============================================================================
 # Graceful shutdown / in-flight tracking
@@ -1146,6 +1147,28 @@ class DiscordAdapter(discord.Client):
         # Ignore messages from servers we aren't configured for
         if message.guild and str(message.guild.id) not in self.server_ids:
             return
+
+        # Speaking Banana (2026-08-28, specs/2026-08-28-speaking-banana.md):
+        # record another bot's turn-claim. Unconditional on gate_mode (unlike
+        # the context_box/handoff parsing below, which is tier2-only and
+        # currently only covers #agent-chat) — the claim signal is a bare
+        # emoji, not an envelope, and needs to work in #lounge too, which
+        # has no gate_mode at all. Only bot authors trigger it (a human
+        # typing a banana isn't claiming a turn), and only in a channel
+        # that actually shares its floor with other bots (banana.in_scope
+        # mirrors agent-server.py's quiet-mode guild check). This only
+        # catches *other* bots' claims — Marvin's own outgoing replies
+        # never reach on_message (self-authored messages return above this
+        # point), so Marvin's side of the claim is recorded separately in
+        # agent-server.py at compose time. Watch-first: this never blocks
+        # or gates a reply, purely records for visibility.
+        if (
+            message.author.bot
+            and banana.starts_with_claim(message.content or "")
+            and banana.in_scope(str(message.channel.id), channels_config)
+        ):
+            channel_name_for_claim = self.get_channel_name(str(message.channel.id)) or str(message.channel.id)
+            banana.claim(channel_name_for_claim, message.author.display_name)
 
         # Capture message
         await self.capture_message(message)
