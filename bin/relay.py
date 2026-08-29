@@ -30,7 +30,7 @@ from reply_gate import Decision, GateMessage, ReplyGate, SCORER_PROMPT
 from handoff import parse_handoff
 from outbox import add_pending
 import context_box
-import banana
+import speaking_banana as banana
 
 # =============================================================================
 # Graceful shutdown / in-flight tracking

@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-banana.py — the Speaking Banana: turn-claim signaling for shared multi-bot
-channels. Design doc: specs/2026-08-28-speaking-banana.md.
+speaking_banana.py (renamed from banana.py, 2026-08-29) — the Speaking
+Banana: turn-claim signaling for shared multi-bot channels. Design doc:
+specs/2026-08-28-speaking-banana.md.
+
+Renamed the same night it started importing the `banana-protocol` pip
+package (see below): that package's own importable top-level name is
+also `banana`, and this file's own directory (bin/) sits ahead of
+site-packages on sys.path — so as long as this file was named banana.py,
+`import banana` from within it, or from agent-server.py/relay.py, could
+only ever resolve to itself, never to the installed package. Renaming
+was the only clean fix; matches the name Amos already independently
+landed on for his own equivalent module (lib/speaking_banana.py).
+agent-server.py and relay.py both do `import speaking_banana as banana`
+so every existing `banana.xxx` call site elsewhere is unaffected.
 
 Problem this solves: two bots sharing a channel (#agent-chat, #lounge —
 Crab Cavern, where Marvin and Amos both post) can each independently
@@ -66,6 +78,25 @@ degrade-instead-of-block posture Amos's own client uses. Claims observed
 by *watching* another bot's Discord message (relay.py's inbound hook)
 stay purely local — that's still just inference, and correctly so: only
 the bot making a claim calls the API for it, on its own authority.
+
+Transport for claim_self()/release_self() (2026-08-29, task-1788046725):
+was a hand-rolled aiohttp POST against /api/claim and /api/release, now
+delegates to `AsyncBananaClient` from the `banana-protocol` pip package
+(github.com/brockventures/banana-protocol, pinned in requirements.txt —
+see that pin's comment for why pinned-not-floating). Adopted so upstream
+fixes — e.g. the same-night `holder` default-identity footgun fix,
+commit 9298d7d — flow through automatically instead of us reimplementing
+each one by hand and quietly drifting from what Amos and Zero are
+running. Deliberately narrow adoption: only the two functions that were
+already making real network calls got swapped. get_status()/in_scope()/
+claim()/release()/heartbeat() below stay local-only exactly as before —
+they never touched the network to begin with (see GRACE_SECONDS/
+CEILING_SECONDS comment), and the external package doesn't offer an
+equivalent local-board concept to adopt there anyway. The external
+client's own exceptions (BananaBlockedError/BananaError) are caught right
+at the two call sites and translated back into this module's existing
+external contract — callers elsewhere in the codebase (agent-server.py,
+relay.py, this module's own CLI) see no behavior difference.
 """
 
 import json
@@ -75,7 +106,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import aiohttp
+from banana.client import AsyncBananaClient, BananaBlockedError, BananaError
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 BOARD_PATH = WORKSPACE_ROOT / "data" / "banana_claims.json"
@@ -84,7 +115,7 @@ CLAIM_EMOJI = "🍌"
 
 API_BASE_URL = "https://banana.mikecarmody.net"
 API_TOKEN_PATH = Path.home() / ".karakos" / "secrets" / "banana-claims-token"
-API_TIMEOUT = aiohttp.ClientTimeout(total=5)
+API_TIMEOUT_SECONDS = 5.0
 API_HOLDER_IDENTITY = "marvin"  # locked server-side to this token; can't claim as anyone else
 
 # Picked from the top of Amos's stated ranges (60-90s grace, 5-10min
@@ -272,64 +303,28 @@ def _load_api_token() -> Optional[str]:
     return _api_token_cache or None
 
 
-class BananaBlocked(Exception):
-    """Raised by _api_post when the API deliberately rejects a request
-    (409, body carries `blocked: true`) — never a transport failure.
-    Added 2026-08-29 alongside Amos's claim.js fix (conflicting unexpired
-    claim now returns 409 with the row left untouched, instead of a 200
-    with a `conflict` field). Must stay a distinct signal from every other
-    non-200: _api_post's normal fallback path ("couldn't reach the API,
-    use local-only claim()/release()") always succeeds unconditionally,
-    so folding a real "no" from the server into that same bucket would
-    make the new server-side block silently undo itself on this end —
-    exactly the failure mode Amos flagged live. Caught and handled inside
-    claim_self()/release_self() only; must never escape banana.py's
-    public functions."""
-    def __init__(self, holder: Optional[str], state: dict):
-        self.holder = holder
-        self.state = state
-        super().__init__(f"blocked by {holder}")
+_client_cache: Optional[AsyncBananaClient] = None
 
 
-async def _api_post(path: str, payload: dict) -> Optional[dict]:
-    """POST to the shared claim API. Returns the parsed response on a 200,
-    None for every transport-level failure mode (bad token, network
-    failure, timeout, an unexpected non-200) — that's still "couldn't
-    reach the API," which is all the caller needs to know before falling
-    back to local-only recording. Raises BananaBlocked instead for a 409
-    carrying `blocked: true` — that's the API answering on purpose, not
-    failing to answer at all, and the two must never be conflated (see
-    BananaBlocked's docstring)."""
+def _get_client() -> Optional[AsyncBananaClient]:
+    """The banana-protocol client for Marvin's own authoritative calls,
+    built once and reused (it's a thin, stateless wrapper — no live
+    connection held between calls, aiohttp.ClientSession is opened fresh
+    per request inside the package itself). Returns None when there's no
+    token to authenticate with, same "can't reach the API, go local"
+    signal _load_api_token()'s callers always used — preserved here so
+    claim_self()/release_self() didn't need to change their own no-token
+    handling at all."""
+    global _client_cache
     token = _load_api_token()
     if not token:
-        log.warning(f"[banana] no API token available, skipping {path}")
+        log.warning("[banana] no API token available, skipping API call")
         return None
-    try:
-        async with aiohttp.ClientSession(timeout=API_TIMEOUT) as session:
-            async with session.post(
-                f"{API_BASE_URL}{path}",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json=payload,
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                if resp.status == 409:
-                    try:
-                        body = await resp.json()
-                    except Exception:
-                        body = {}
-                    if body.get("blocked"):
-                        raise BananaBlocked(body.get("holder"), body.get("state") or {})
-                    text = json.dumps(body)
-                else:
-                    text = await resp.text()
-                log.warning(f"[banana] API {path} returned HTTP {resp.status}: {text}")
-                return None
-    except BananaBlocked:
-        raise
-    except Exception as e:
-        log.warning(f"[banana] API {path} unreachable, falling back to local: {e}")
-        return None
+    if _client_cache is None:
+        _client_cache = AsyncBananaClient(
+            API_HOLDER_IDENTITY, token=token, endpoint=f"{API_BASE_URL}/api", timeout=API_TIMEOUT_SECONDS
+        )
+    return _client_cache
 
 
 async def claim_self(channel: str, subject: Optional[str] = None) -> dict:
@@ -338,15 +333,26 @@ async def claim_self(channel: str, subject: Optional[str] = None) -> dict:
     then records the result locally either way so get_status()/
     render_board() stay fast, local, and in sync. Falls back to the local-
     only claim() if the API's genuinely unreachable, same degrade-not-block
-    posture Amos's own client uses — but a deliberate 409 (BananaBlocked)
+    posture Amos's own client uses — but a deliberate 409 (BananaBlockedError)
     is handled separately below, precisely so it can't take that fallback
     path and quietly overwrite a real rejection. This is the only path
     that should ever call the API with holder="marvin" — it's Marvin's own
     claim, made on Marvin's own authority, same rule Amos's side follows
-    for his."""
+    for his.
+
+    preflight=False on the client.claim() call below is deliberate: the
+    package's default preflight does its own client-side GET /status
+    check before the real POST and raises locally off of that, which is a
+    second, separate, TOCTOU-prone decision point. The actual authority
+    here is the server's compare-and-swap on the POST itself (see the
+    module docstring) — preflight=False skips straight to it, matching
+    exactly what the hand-rolled version this replaced always did."""
+    client = _get_client()
+    if client is None:
+        return claim(channel, "Marvin")
     try:
-        result = await _api_post("/api/claim", {"holder": API_HOLDER_IDENTITY, "subject": subject or channel})
-    except BananaBlocked as e:
+        result = await client.claim(subject=subject or channel, preflight=False)
+    except BananaBlockedError as e:
         # The API said no, on the record — do NOT fall through to the
         # local-only claim() below, that path always succeeds regardless
         # of who holds the floor and would silently manufacture a claim
@@ -355,15 +361,22 @@ async def claim_self(channel: str, subject: Optional[str] = None) -> dict:
         # /status rather than lying that Marvin holds it.
         log.warning(
             f"[banana] {channel}: Marvin's claim rejected by API — "
-            f"{e.holder} holds it (409, not a network failure)"
+            f"{e.current_holder} holds it (409, not a network failure)"
         )
         board = _load_board()
         if e.state:
             board[channel] = {**e.state, "via_api": True}
             _save_board(board)
-        return {"holder": e.holder, "blocked": True, "collision_with": e.holder, "via_api": True}
-
-    if result is None:
+        return {"holder": e.current_holder, "blocked": True, "collision_with": e.current_holder, "via_api": True}
+    except Exception as e:
+        # Anything else — a BananaError for a non-200/non-409 response, or
+        # a raw transport failure the package doesn't wrap at all
+        # (connection refused, timeout, DNS) — is "couldn't reach the
+        # API," same bucket the hand-rolled version used _api_post's
+        # broad except for. Degrade, don't block. Deliberately broad
+        # (not narrowed to BananaError) for the same reason: an unwrapped
+        # transport exception must land here too, not escape uncaught.
+        log.warning(f"[banana] API /claim unreachable, falling back to local: {e}")
         return claim(channel, "Marvin")
 
     state = result.get("state", {})
@@ -388,17 +401,22 @@ async def claim_self(channel: str, subject: Optional[str] = None) -> dict:
 async def release_self(channel: str) -> bool:
     """Explicit hand-back as Marvin, authoritatively — same API-first,
     local-fallback shape as claim_self(). No known case makes /api/release
-    return a 409 today, but _api_post can raise BananaBlocked for any
-    endpoint, so this handles it defensively rather than letting an
-    unexpected one crash the caller (agent-server.py's turn-end release
-    has no try/except around this call)."""
+    return a 409 today, but the client can raise BananaBlockedError for
+    any endpoint, so this handles it defensively rather than letting an
+    unexpected one crash the caller — agent-server.py's turn-end release
+    now runs from a `finally` (task-1788042889) precisely so a crash here
+    still gets caught one level up too, but that's a second line of
+    defense, not a reason to skip handling it cleanly at the source."""
+    client = _get_client()
+    if client is None:
+        return release(channel, "Marvin")
     try:
-        result = await _api_post("/api/release", {"holder": API_HOLDER_IDENTITY})
-    except BananaBlocked as e:
-        log.warning(f"[banana] {channel}: Marvin's release rejected by API — {e.holder} holds it (409)")
+        result = await client.release()
+    except BananaBlockedError as e:
+        log.warning(f"[banana] {channel}: Marvin's release rejected by API — {e.current_holder} holds it (409)")
         return False
-
-    if result is None:
+    except Exception as e:
+        log.warning(f"[banana] API /release unreachable, falling back to local: {e}")
         return release(channel, "Marvin")
 
     released = bool(result.get("released"))

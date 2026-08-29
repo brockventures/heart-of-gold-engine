@@ -29,7 +29,7 @@ import aiohttp
 import aiosqlite
 from aiohttp import web
 
-import banana
+import speaking_banana as banana
 import context_box
 from handoff import parse_handoff
 from outbox import add_pending

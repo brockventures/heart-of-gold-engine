@@ -7,3 +7,24 @@ schedule==1.2.2
 prompt-toolkit==3.0.48
 rich==13.9.4
 PyYAML==6.0.2
+# Pinned to a commit, not a floating branch, deliberately — see
+# bin/speaking_banana.py's module docstring. Cavern-wide adoption
+# 2026-08-29 (Ian approved, task-1788046725): Amos pinned lib/
+# speaking_banana.py to the same commit (9298d7d) for cross-bot
+# alignment; bump only as a deliberate, reviewed step, not silently via
+# an unpinned "latest".
+#
+# KNOWN ISSUE as of 2026-08-29 23:50 UTC: `pip install -r requirements.txt`
+# fails on a clean environment against this exact commit — pyproject.toml
+# has no [tool.setuptools.packages.find], so setuptools' flat-layout
+# auto-discovery finds two top-level dirs (banana/, specs/) and refuses to
+# build ("Multiple top-level packages discovered"). Reproduced with a
+# plain `pip install .` against a fresh clone, not a git-URL or network
+# quirk. Verified fix (adding `[tool.setuptools.packages.find]
+# include = ["banana*"]`) works locally; flagged to Zero/Ryan in
+# #agent-chat since we don't have push access to brockventures/
+# banana-protocol to land it ourselves. The current venv on this host has
+# a locally patched wheel installed already (works today), but do not
+# assume a fresh `pip install -r requirements.txt` elsewhere will
+# succeed until this line is re-verified against a fixed upstream commit.
+banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@9298d7d
