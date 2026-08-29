@@ -43,7 +43,7 @@ PORT = int(os.environ.get("AGENT_SERVER_PORT", "18791"))
 DB_PATH = WORKSPACE_ROOT / "data" / "memory" / "agent-server.db"
 AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.json"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
-STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
+STREAM_LOG_DIR = Path(os.environ.get("KARAKOS_LOG_DIR", str(WORKSPACE_ROOT / "logs"))) / "agent-streams"
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = os.environ.get("OWNER_DISCORD_ID", "0")
 

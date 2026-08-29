@@ -237,6 +237,12 @@ def test_run_sweep_unmatched_signature_goes_to_proposals(tmp_path, monkeypatch):
     monkeypatch.setattr(ra, "log_and_propose", lambda finding: proposals_calls.append(finding))
     posts = []
     monkeypatch.setattr(ra, "post_to_signals", lambda text: posts.append(text))
+    # run_sweep always persists rate-limit state, dry-run or not — mock it
+    # like the other side effects above instead of letting it really write
+    # to WORKSPACE_ROOT/data/recovery-agent-rate-limits.json (silently
+    # lands in real production data on a dev host; hard-crashes in CI
+    # where WORKSPACE_ROOT falls back to the nonexistent "/workspace").
+    monkeypatch.setattr(ra, "_save_rate_state", lambda state: None)
 
     actions = ra.run_sweep(dry_run=True, rate_state={})
     assert actions == []
@@ -251,6 +257,7 @@ def test_run_sweep_known_signature_dry_run_posts_to_signals(monkeypatch):
     ])
     posts = []
     monkeypatch.setattr(ra, "post_to_signals", lambda text: posts.append(text))
+    monkeypatch.setattr(ra, "_save_rate_state", lambda state: None)
 
     actions = ra.run_sweep(dry_run=True, rate_state={})
     assert len(actions) == 1
@@ -265,6 +272,7 @@ def test_run_sweep_rate_limited_escalates_without_acting(monkeypatch):
     ])
     posts = []
     monkeypatch.setattr(ra, "post_to_signals", lambda text: posts.append(text))
+    monkeypatch.setattr(ra, "_save_rate_state", lambda state: None)
     already_at_limit = {"wedged_subprocess": [time.time()] * ra.MAX_ACTIONS_PER_HOUR}
 
     actions = ra.run_sweep(dry_run=True, rate_state=already_at_limit)

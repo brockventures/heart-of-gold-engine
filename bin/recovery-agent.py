@@ -71,17 +71,29 @@ WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 # handler here means the next occurrence is diagnosable in-band.
 log = logging.getLogger("recovery-agent")
 log.setLevel(logging.INFO)
-_handler = RotatingFileHandler(
-    WORKSPACE_ROOT / "logs" / "recovery-agent.log",
-    maxBytes=10 * 1024 * 1024,
-    backupCount=7,
-)
-_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-log.addHandler(_handler)
+# Guard against duplicate handlers — same reasoning as agent-server.py's/
+# relay.py's identical guard. KARAKOS_LOG_DIR mirrors their override so
+# tests (and any environment without a real WORKSPACE_ROOT/logs, e.g. CI)
+# don't crash trying to open a log file under a directory that doesn't
+# exist. This block previously didn't actually mirror the other two
+# despite the comment above claiming it did — missing the env override,
+# the mkdir, and the handler guard — which is why importing this module
+# hard-crashed in GitHub Actions with no WORKSPACE_ROOT set (falls back
+# to the container-era "/workspace" default, which doesn't exist there).
+if not log.handlers:
+    _log_dir = Path(os.environ.get("KARAKOS_LOG_DIR", str(WORKSPACE_ROOT / "logs")))
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _handler = RotatingFileHandler(
+        _log_dir / "recovery-agent.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=7,
+    )
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(_handler)
 
-_console = logging.StreamHandler()
-_console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(_console)
+    _console = logging.StreamHandler()
+    _console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_console)
 
 DB_PATH = WORKSPACE_ROOT / "data" / "memory" / "agent-server.db"
 PROPOSALS_DIR = WORKSPACE_ROOT / "data" / "recovery-proposals"
