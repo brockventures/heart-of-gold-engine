@@ -54,6 +54,50 @@ OUTBOX_PATH = WORKSPACE_ROOT / "data" / "outbox" / "pending.jsonl"
 NOTIFY_SCRIPT = WORKSPACE_ROOT / "bin" / "discord-notify.sh"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 
+MAX_DISCORD_MSG_LEN = 2000
+
+
+def _split_discord_message(text: str, max_length: int = MAX_DISCORD_MSG_LEN) -> list[str]:
+    """Split text into chunks Discord will accept (max 2000 chars each).
+
+    Duplicated from agent-server.py's split_discord_message() rather than
+    imported — agent-server.py already does `from outbox import
+    add_pending`, so the reverse import would be circular. Keep this in
+    sync with that copy if the splitting logic ever changes.
+
+    Found 2026-08-29 via a heartbeat sweep: this path (flush_pending() ->
+    discord-notify.sh -> curl) never had the 2000-char guard agent-server's
+    own post_to_discord() got, so anything queued over the limit failed
+    every delivery attempt with curl exit 22 (Discord 400s on oversize
+    content) forever, silently — flush_pending() catches the per-row
+    CalledProcessError and just leaves it for next time, outbox.py's own
+    process still exits 0 either way, so scheduler.py never saw a failure
+    to log either. Two real messages (one 17 hours old) were stuck exactly
+    this way, found only by manually running `outbox.py flush` in the
+    foreground to see the actual curl error instead of trusting the quiet
+    retry loop. See facts/outbox-2000-char-silent-drop-2026-08-29.md.
+    """
+    if len(text) <= max_length:
+        return [text] if text else []
+
+    chunks: list[str] = []
+    remaining = text
+
+    while len(remaining) > max_length:
+        window = remaining[:max_length]
+        cut = window.rfind("\n\n")
+        if cut <= 0:
+            cut = window.rfind("\n")
+        if cut <= 0:
+            cut = max_length
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks if chunks else [text]
+
 
 def _is_tier2_channel(channel: str) -> bool:
     """True for channels with gate_mode == 'tier2' in config/channels.json
@@ -146,10 +190,19 @@ def flush_pending() -> list[str]:
         if row.get("delivered_at"):
             continue
         try:
-            subprocess.run(
-                [str(NOTIFY_SCRIPT), row["channel"], row["content"], *row.get("attachments", [])],
-                check=True, capture_output=True, text=True,
-            )
+            chunks = _split_discord_message(row["content"] or "")
+            if not chunks:
+                chunks = [""]
+            for idx, chunk in enumerate(chunks):
+                # Attachments ride with the first chunk only — re-uploading
+                # the same file on every chunk would spam duplicates for a
+                # multi-chunk message, and the first chunk is the one the
+                # attachment is most likely referenced from.
+                files = row.get("attachments", []) if idx == 0 else []
+                subprocess.run(
+                    [str(NOTIFY_SCRIPT), row["channel"], chunk, *files],
+                    check=True, capture_output=True, text=True,
+                )
             row["delivered_at"] = datetime.now(timezone.utc).isoformat()
             delivered.append(row["id"])
             changed = True

@@ -142,7 +142,15 @@ def test_usage_report_no_reading_yet(agent_server):
     assert "No rate-limit reading yet" in report
 
 
-def test_usage_report_includes_status_and_window_position(agent_server):
+def test_usage_report_includes_status_and_reset_time(agent_server):
+    """2026-08-29: format_usage_report() no longer surfaces wall-clock
+    window-progress as a percentage (see
+    facts/usage-report-percentage-fix-2026-08-29.md) — that number and
+    utilization both read as "the percentage" in one line, and the one
+    that actually gates the pause (utilization) wasn't the one anyone's
+    eye landed on first. Window position now renders as remaining time
+    only; this used to assert "60%" (60% of the window elapsed) for the
+    same resetsAt, that assertion is gone along with the feature."""
     now = time.time()
     window = agent_server.RATE_LIMIT_WINDOW_SECONDS["five_hour"]
     agent_server.agent_rate_limits["TestAgent"] = {
@@ -152,19 +160,21 @@ def test_usage_report_includes_status_and_window_position(agent_server):
     }
     report = agent_server.format_usage_report("TestAgent", now=now)
     assert "status `allowed`" in report
-    assert "60%" in report  # 60% through
-    assert "resets in" in report
+    assert "resets in 2h00m" in report  # window * 0.4 == 2h remaining
 
 
 def test_usage_report_unknown_window_position_not_rendered_as_zero(agent_server):
     """The invariant upstream's PR specifically calls out: 'no reading' and
-    '0% consumed' are opposite answers and must never render the same."""
+    '0% consumed' are opposite answers and must never render the same.
+    2026-08-29: the no-reading case now reads "window remaining unknown"
+    rather than "window position unknown", following the same rewrite as
+    the test above."""
     agent_server.agent_rate_limits["TestAgent"] = {
         "status": "allowed",
         # no resetsAt / rateLimitType at all
     }
     report = agent_server.format_usage_report("TestAgent")
-    assert "window position unknown" in report
+    assert "window remaining unknown" in report
     assert "0%" not in report
 
 

@@ -1146,12 +1146,31 @@ class DiscordAdapter(discord.Client):
 
     async def _on_message_impl(self, message: discord.Message):
         """Route Discord message to agent"""
-        # Ignore own messages
-        if message.author == self.user:
+        # Ignore messages from servers we aren't configured for. Checked
+        # before the self-author capture below too — Marvin never posts
+        # outside a configured guild, but this keeps the capture log's
+        # scope consistent with every other author's regardless.
+        if message.guild and str(message.guild.id) not in self.server_ids:
             return
 
-        # Ignore messages from servers we aren't configured for
-        if message.guild and str(message.guild.id) not in self.server_ids:
+        # Capture message — including our own. Moved ahead of the
+        # "ignore own messages" return below (2026-08-29, found via a
+        # live "did that message actually send" check that looked like a
+        # false negative): capture_message() used to run only after that
+        # return, so Marvin's own sent messages never made it into
+        # data/messages/messages-*.jsonl, the same gap
+        # facts/outbound-messages-not-in-ingest-log-2026-08-13.md already
+        # documented. mcp/tools-server.py's `discord history` action reads
+        # that exact log, so it inherited the blind spot too — a message
+        # Marvin posted looked indistinguishable from one that silently
+        # failed. Capturing here, before the early return, fixes the log;
+        # the return below still skips all routing/reply logic for
+        # self-authored messages same as before, that part isn't a bug.
+        await self.capture_message(message)
+
+        # Ignore own messages (routing/reply logic only — already captured
+        # above)
+        if message.author == self.user:
             return
 
         # Speaking Banana (2026-08-28, specs/2026-08-28-speaking-banana.md):
@@ -1175,9 +1194,6 @@ class DiscordAdapter(discord.Client):
         ):
             channel_name_for_claim = self.get_channel_name(str(message.channel.id)) or str(message.channel.id)
             banana.claim(channel_name_for_claim, message.author.display_name)
-
-        # Capture message
-        await self.capture_message(message)
 
         # /sys owner commands, intercepted before any normal routing so
         # they work even against a wedged agent. See handle_sys_command.

@@ -32,7 +32,9 @@ def agent_server():
 # with plenty of window left — "we shouldn't stop work just at 90%".
 # status is now ONLY a warning signal (is_rate_limit_warning) with no
 # blocking effect; is_rate_limit_paused is the sole hard stop and is
-# utilization-only, threshold 0.97, regardless of status or window type.
+# utilization-only, threshold 0.95 (lowered from 0.97 2026-08-29, see
+# facts/rate-limit-pause-threshold-95pct-2026-08-29.md), regardless of
+# status or window type.
 @pytest.mark.parametrize("label,info,expected", [
     ("healthy", {"status": "allowed", "utilization": 0.42}, False),
     ("five_hour warning alone does NOT hard-pause anymore",
@@ -43,8 +45,8 @@ def agent_server():
      {"status": "allowed_warning", "utilization": 0.91}, False),
     ("utilization only, status still allowed",
      {"status": "allowed", "utilization": 0.985, "overageInUse": True}, True),
-    ("exactly at the utilization threshold", {"status": "allowed", "utilization": 0.97}, True),
-    ("just under the utilization threshold", {"status": "allowed", "utilization": 0.969999}, False),
+    ("exactly at the utilization threshold", {"status": "allowed", "utilization": 0.95}, True),
+    ("just under the utilization threshold", {"status": "allowed", "utilization": 0.949999}, False),
     ("five_hour warning past utilization threshold pauses on utilization",
      {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.99}, True),
     ("seven_day warning past utilization threshold pauses on utilization",
