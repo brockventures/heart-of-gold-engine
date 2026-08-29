@@ -10,13 +10,16 @@ anyone else and is not meant to be; there is no public setup flow here.
 
 - **The actual software** lives upstream at
   [mcarmody/karakos-package](https://github.com/mcarmody/karakos-package)
-  (public, MIT). This repo's deployment pulls the prebuilt image
-  `ghcr.io/mcarmody/karakos:latest` from there — it does not build from
-  the `Dockerfile` in this tree.
+  (public, MIT). As of the 2026-08-11 native migration, this install runs
+  the package directly as five systemd units on the host
+  (`karakos-agent-server`, `karakos-relay`, `karakos-scheduler`,
+  `karakos-recovery-agent`, `karakos-dashboard`) rather than as a
+  container — `Dockerfile` and `config/docker-compose.yml` still exist in
+  this tree but nothing runs them anymore.
 - **What's actually unique to this repo**: `config/` (this install's
   Discord server/channel wiring, `.env`), `agents/*/memory/` (this
   instance's episodic memory and facts), and deployment-specific files
-  like `config/docker-compose.yml`'s image pin.
+  like the `native/systemd/*.service` unit definitions.
 - **What's a stale/drifted copy of the package**: `bin/`, `dashboard/`,
   and most everything else — carried over from when this repo was a fork
   of `karakos-package` rather than a clean install-only repo. Some of it
@@ -42,7 +45,10 @@ Karakos is a multi-agent system that provides:
 
 - **Hardware**: 4GB RAM minimum (8GB recommended), 2+ CPU cores, 10GB disk space
 - **OS**: Windows 10/11, Ubuntu 22.04+, Debian 12+, macOS 12+
-- **Software**: Docker Engine 24+ with Compose v2
+- **Software**: these are upstream `karakos-package`'s generic requirements
+  (Docker Engine 24+ with Compose v2) for a fresh install. This specific
+  instance no longer uses Docker — see native migration note above —
+  and instead runs as systemd units directly on the host.
 - **Network**: Stable internet for Anthropic API calls
 - **Runtime**: 24/7 recommended
 
