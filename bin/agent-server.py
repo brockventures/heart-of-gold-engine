@@ -247,18 +247,33 @@ LAST_SUMMARY_TEMPLATE = WORKSPACE_ROOT / "data" / "last-session-summary-{agent}.
 STREAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
 log = logging.getLogger("agent-server")
 log.setLevel(logging.INFO)
-handler = RotatingFileHandler(
-    WORKSPACE_ROOT / "logs" / "agent-server.log",
-    maxBytes=10 * 1024 * 1024,
-    backupCount=7
-)
-handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-log.addHandler(handler)
+# Guard against duplicate handlers (2026-08-29). logging.getLogger() by
+# name returns the same process-global logger object every time — but
+# this module is loaded by tests/conftest.py's import_script() via
+# importlib.util.spec_from_file_location, deliberately *outside*
+# sys.modules caching ("allows reload with different env"), so this
+# module-level block reruns on every test file that imports it. Without
+# the guard, each rerun appended another handler pair to the same
+# logger, so one log call fired once per prior import. Real incident:
+# a single pytest run (8 test files import this module) produced dozens
+# of duplicate lines in the real production log, misread as an active
+# Discord outage. KARAKOS_LOG_DIR lets tests (see conftest.py) point the
+# file handler at a throwaway directory instead of the real one.
+if not log.handlers:
+    log_dir = Path(os.environ.get("KARAKOS_LOG_DIR", str(WORKSPACE_ROOT / "logs")))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "agent-server.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=7
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(handler)
 
-# Also log to console
-console = logging.StreamHandler()
-console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(console)
+    # Also log to console
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(console)
 
 # Regex patterns
 THINKING_BLOCK_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
@@ -2914,9 +2929,34 @@ async def crash_recovery():
         unposted = await cursor.fetchall()
 
     if unposted:
-        log.warning(f"Found {len(unposted)} unposted responses, retrying")
-        for msg in unposted:
-            if msg["response"]:
+        # Empty-response rows can never actually post — post_to_discord()
+        # below is only called `if msg["response"]`, so these always fell
+        # through untouched. Historically produced by killing an agent
+        # subprocess mid-turn (restart_agent()/reload_agent() before their
+        # 2026-08-11 lock-gating fix, see those docstrings): the readline()
+        # loop hits EOF, the turn's response comes back empty, and it still
+        # gets marked STATUS_COMPLETE. Since that fix, nothing new should
+        # land in this bucket — the 47 found here on 2026-08-29 all predate
+        # it (newest: 2026-08-18). Left alone, crash_recovery() rediscovers
+        # and silently no-ops the same dead rows on *every* startup forever,
+        # with a "Found N unposted responses, retrying" warning that reads
+        # like an active problem. One-time cleanup: mark them STATUS_SKIPPED
+        # so this stops recurring; genuinely retryable rows (real response
+        # text, just never confirmed posted) still go through below as before.
+        empty = [m for m in unposted if not m["response"]]
+        retryable = [m for m in unposted if m["response"]]
+
+        if empty:
+            log.info(f"Marking {len(empty)} empty-response stale rows as skipped (never postable, pre-2026-08-11 mid-turn-kill artifacts)")
+            await db.executemany(
+                "UPDATE message_queue SET processed = ? WHERE message_id = ?",
+                [(STATUS_SKIPPED, m["message_id"]) for m in empty]
+            )
+            await db.commit()
+
+        if retryable:
+            log.warning(f"Found {len(retryable)} unposted responses, retrying")
+            for msg in retryable:
                 discord_id = await post_to_discord(msg["agent"], msg["channel_id"], msg["response"])
                 if discord_id:
                     # Commit per-message, not once after the whole loop. The

@@ -244,17 +244,23 @@ DISPATCH_TIMEOUTS = {
 # Logging
 log = logging.getLogger("relay")
 log.setLevel(logging.INFO)
-handler = RotatingFileHandler(
-    WORKSPACE_ROOT / "logs" / "relay.log",
-    maxBytes=10 * 1024 * 1024,
-    backupCount=7
-)
-handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-log.addHandler(handler)
+# Guard against duplicate handlers — same reasoning and same 2026-08-29
+# incident as agent-server.py's identical guard, see that comment for
+# the full writeup. KARAKOS_LOG_DIR mirrors agent-server.py's override.
+if not log.handlers:
+    log_dir = Path(os.environ.get("KARAKOS_LOG_DIR", str(WORKSPACE_ROOT / "logs")))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "relay.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=7
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(handler)
 
-console = logging.StreamHandler()
-console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-log.addHandler(console)
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(console)
 
 # Singleton-instance guard (2026-08-07) — added after the 08:02-08:05
 # duplicate-process incident: a rogue duplicate supervisord launched a

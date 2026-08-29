@@ -14,6 +14,21 @@ import pytest
 
 PACKAGE_ROOT = Path(__file__).parent.parent
 
+# Keep server-script logging out of the real production log files.
+# bin/agent-server.py and bin/relay.py both point a RotatingFileHandler
+# at WORKSPACE_ROOT/logs/*.log during their own module-level setup, and
+# guard it against *repeat* imports (see the "Guard against duplicate
+# handlers" comment in each) — but that guard only stops re-imports
+# within a process from piling up handlers, it doesn't stop the first
+# import of a real dev/prod WORKSPACE_ROOT from writing into the real
+# log file. Set this before collection can trigger the first
+# import_script() call anywhere in the suite, so the file handler binds
+# to a throwaway directory for the whole test session instead. Real
+# incident 2026-08-29: pytest test noise (a fake "TestAgent" rate-limit
+# warning, fired dozens of times) ended up in the live production log
+# and read like an active Discord outage.
+os.environ.setdefault("KARAKOS_LOG_DIR", tempfile.mkdtemp(prefix="karakos-test-logs-"))
+
 
 def import_script(name: str, file_path: Path = None):
     """Import a Python script by name, handling hyphens in filenames.
