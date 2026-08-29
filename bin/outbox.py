@@ -46,9 +46,27 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import context_box
+from handoff import parse_handoff
+
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 OUTBOX_PATH = WORKSPACE_ROOT / "data" / "outbox" / "pending.jsonl"
 NOTIFY_SCRIPT = WORKSPACE_ROOT / "bin" / "discord-notify.sh"
+CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
+
+
+def _is_tier2_channel(channel: str) -> bool:
+    """True for channels with gate_mode == 'tier2' in config/channels.json
+    (currently just #agent-chat) — same scope relay.py's inbound
+    context_box parsing uses, so a stray ```handoff``` fence typed
+    elsewhere doesn't get parsed as a real envelope. Fails closed (False)
+    on any config-read problem rather than risk mis-parsing."""
+    try:
+        with open(CHANNELS_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        return (cfg.get("channels", {}).get(channel, {}) or {}).get("gate_mode") == "tier2"
+    except Exception:
+        return False
 
 
 def _load_rows() -> list[dict]:
@@ -95,9 +113,34 @@ def flush_pending() -> list[str]:
     Rows that fail to deliver are left undelivered for the next flush —
     transient Discord/network failures shouldn't drop a queued message,
     only a successful post marks it done.
+
+    context_box (2026-08-29): a second outbound gap, found via a routine
+    log/self-diagnostic sweep the same night agent-server.py's
+    post_to_discord got its own context_box hook (see
+    facts/context-box-outbound-hook-2026-08-29.md). That hook only ever
+    sees a turn's *same-channel* reply (pending_final/response_text) —
+    it never runs for content that took the outbox path instead, which
+    is the normal route for anything meant for #agent-chat while the
+    turn itself is scoped elsewhere (the common case per
+    facts/outbox-is-default-not-fallback.md). A real test message sent
+    that exact way earlier the same session never got recorded or
+    mirrored — confirmed live by checking `/sys context` and finding it
+    absent. Delivery here is the one place both routes converge, so
+    it's the right spot to close the gap symmetrically rather than
+    chasing every call site that might queue a handoff-bearing message.
     """
     rows = _load_rows()
     delivered = []
+    # New rows generated in this same pass (context_box mirror lines) —
+    # collected separately and appended to `rows` before the single save
+    # at the end, rather than calling add_pending() mid-loop. add_pending()
+    # does its own load-modify-save cycle; calling it here while `rows`
+    # (loaded once, above) is later written back wholesale via
+    # _save_rows(rows) would silently clobber whatever add_pending() had
+    # just written to disk — the mirror row would be queued and then
+    # immediately erased before the next flush ever saw it. Caught this
+    # in review before it shipped, not live.
+    new_rows = []
     changed = False
     for row in rows:
         if row.get("delivered_at"):
@@ -110,11 +153,41 @@ def flush_pending() -> list[str]:
             row["delivered_at"] = datetime.now(timezone.utc).isoformat()
             delivered.append(row["id"])
             changed = True
+
+            if _is_tier2_channel(row["channel"]):
+                envelope = parse_handoff(row["content"] or "")
+                if envelope and envelope.context_box:
+                    cb = envelope.context_box
+                    cb_row = context_box.record(
+                        subject=envelope.subject,
+                        state=cb.state,
+                        blocked_on=cb.blocked_on,
+                        waiting_on=cb.waiting_on,
+                        sender="Marvin",
+                        channel=row["channel"],
+                    )
+                    # Don't mirror a message that's already headed to
+                    # #general itself — that would just be the same
+                    # content arriving twice.
+                    if context_box.should_mirror(cb.state) and row["channel"] != "general":
+                        new_rows.append({
+                            "id": str(uuid.uuid4()),
+                            "channel": "general",
+                            "content": context_box.render_mirror_line(
+                                envelope.subject or "(no subject)", cb_row
+                            ),
+                            "attachments": [],
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "delivered_at": None,
+                        })
         except subprocess.CalledProcessError as e:
             sys.stderr.write(
                 f"outbox: delivery failed for {row['id']} -> #{row['channel']}: "
                 f"{e.stderr.strip() if e.stderr else e}\n"
             )
+    if new_rows:
+        rows.extend(new_rows)
+        changed = True
     if changed:
         _save_rows(rows)
     return delivered

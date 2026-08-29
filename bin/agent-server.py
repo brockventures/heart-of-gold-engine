@@ -30,6 +30,9 @@ import aiosqlite
 from aiohttp import web
 
 import banana
+import context_box
+from handoff import parse_handoff
+from outbox import add_pending
 
 # =============================================================================
 # Configuration
@@ -174,7 +177,20 @@ RATE_LIMIT_WARNING_UTILIZATION_THRESHOLD = 0.90
 # point for proactive wind-down/compaction (see maybe_rate_limit_compact())
 # so a session summarizes itself before the pause actually holds the
 # queue, rather than freezing mid-thought.
-RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD = 0.97
+#
+# 0.97 -> 0.95, 2026-08-29 (Ian, after the 04:05 UTC crash): a manual
+# override resumed Marvin mid-warning-zone, utilization re-crossed 97%
+# three minutes later, and the second compact-ahead-of-pause attempt
+# only had ~5s of runway before Anthropic's hard `rejected` landed — the
+# summarizer subprocess itself failed (real nonzero exit in ~3s, not the
+# 45s timeout — consistent with that call getting caught by the same
+# limit it was racing). 95% buys roughly two more points of headroom,
+# enough to give one plausible manual override room to still land a
+# clean compaction instead of racing the cutoff. See
+# facts/usage-report-percentage-fix-2026-08-29.md for the fuller
+# incident writeup (that fact covers the /sys usage display fix from the
+# same incident, not this threshold).
+RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD = 0.95
 # Heartbeats (poke.sh --source heartbeat, see heartbeat.sh) are exempted
 # from the pause below (2026-08-07, per Ian/Moon Problem): the pause trips
 # at Anthropic's own warning threshold, well short of 100%, so there's
@@ -348,6 +364,22 @@ def _spawn(coro, name: Optional[str] = None) -> asyncio.Task:
             return
         exc = t.exception()
         if exc:
+            # graceful_shutdown() (SIGTERM/SIGINT handler) intentionally
+            # ends with sys.exit(0) — its normal, successful exit path, not
+            # a crash. asyncio.Task.exception() surfaces SystemExit like
+            # any other exception though, so every clean restart/reload of
+            # the whole agent-server process was logging as
+            # "Background task ... failed: SystemExit(0)" — found
+            # 2026-08-29 during a routine log sweep, at least 3 occurrences
+            # that day alone, all correlating with intentional restarts,
+            # none an actual failure. A non-zero exit code is still worth
+            # a real log line (something asked to exit unhappily), just
+            # not at ERROR-with-traceback severity that a log scan would
+            # mistake for a crash.
+            if isinstance(exc, SystemExit):
+                if exc.code not in (0, None):
+                    log.warning(f"Background task {t.get_name()} exited with code {exc.code}")
+                return
             log.error(f"Background task {t.get_name()} failed: {exc!r}", exc_info=exc)
 
     task.add_done_callback(_on_done)
@@ -919,7 +951,22 @@ def format_usage_report(agent: str, now: Optional[float] = None) -> str:
     counterpart to cost-report.sh: that answers "what has this spent",
     this answers "how close is it to being cut off", which is the number
     that actually stops a turn mid-sentence. Never raises on a
-    partial/missing reading."""
+    partial/missing reading.
+
+    2026-08-29: utilization moved to the front, and the wall-clock
+    window-progress percentage (how much of the 5h window has elapsed —
+    unrelated to actual usage) dropped from this line in favor of plain
+    remaining time. Real incident: at 04:04 UTC the window was ~65%
+    through its wall-clock life while utilization — the number that
+    actually trips the 97% pause threshold — was already at 98-99%. Two
+    numbers that both read as "the percentage" in one line, and the one
+    that gates the pause wasn't the one anyone's eye landed on first.
+    Ian's fix (2026-08-29): utilization up front, window-progress percent
+    replaced with H:MM remaining. `rate_limit_window_progress()` itself
+    is unchanged and still backs the 80%-of-window warning backstop in
+    is_rate_limit_warning() and the raw `percent_of_window_used` field on
+    /usage — only this human-facing line stops surfacing it as a
+    percentage."""
     info = agent_rate_limits.get(agent)
     if not info:
         return (
@@ -927,13 +974,11 @@ def format_usage_report(agent: str, now: Optional[float] = None) -> str:
             "so this fills in the first time the agent takes a turn."
         )
 
-    progress = rate_limit_window_progress(info, now=now)
-    window_name = (info.get("rateLimitType") or "unknown").replace("_", "-")
-    consumed = (
-        "window position unknown" if progress is None
-        else f"{progress * 100:.0f}% through the {window_name} window"
-    )
-    parts = [f"status `{info.get('status') or 'unknown'}` — {consumed}"]
+    parts = [f"status `{info.get('status') or 'unknown'}`"]
+
+    utilization = info.get("utilization")
+    if utilization is not None:
+        parts.append(f"{utilization * 100:.0f}% utilization")
 
     resets_at = info.get("resetsAt")
     if resets_at:
@@ -941,18 +986,16 @@ def format_usage_report(agent: str, now: Optional[float] = None) -> str:
         remaining = int(resets_at - now)
         if remaining > 0:
             hours, minutes = divmod(remaining // 60, 60)
-            parts.append(f"resets in {hours}h{minutes:02d}m")
+            parts.append(f"window resets in {hours}h{minutes:02d}m")
         else:
             parts.append("window has reset")
+    else:
+        parts.append("window remaining unknown")
 
     if info.get("isUsingOverage"):
         parts.append("currently on overage")
     elif info.get("overageStatus"):
         parts.append(f"overage {info.get('overageStatus')}")
-
-    utilization = info.get("utilization")
-    if utilization is not None:
-        parts.append(f"{utilization * 100:.0f}% utilization")
 
     return ", ".join(parts)
 
@@ -981,7 +1024,8 @@ def is_rate_limit_paused(agent: str) -> bool:
     """True if status=="rejected" (Anthropic already denied a request —
     stronger than a warning, hard-pause immediately, don't wait on
     utilization) OR utilization has crossed
-    RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD (0.97). Deliberately NOT keyed
+    RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD (0.95, lowered from 0.97
+    2026-08-29). Deliberately NOT keyed
     off 'allowed_warning' alone (see is_rate_limit_warning() for that
     signal) — Anthropic sets that status around 90% utilization, which
     jammed a real session with plenty of window left (2026-08-08, Ian:
@@ -2789,6 +2833,43 @@ async def process_agent_queue(agent: str):
                     await banana.release_self(channel_name)
                 else:
                     banana.release(channel_name, agent)
+
+        # context_box outbound half (handoff.py docstring, context_box.py's
+        # module docstring, facts/context-box-2026-08-27.md gap #1): relay.py
+        # only parses *inbound* messages for a context_box field — on_message
+        # returns early on `message.author == self.user`, so this agent's own
+        # blockers never got recorded or mirrored. Same fix shape as the
+        # banana outbound hook just above: catch it here, at compose time,
+        # against the full response_text (not pending_final, for the same
+        # incremental-streaming reason). Scoped to tier2 gate_mode channels
+        # only, matching relay.py's inbound gating (currently #agent-chat) —
+        # a stray ```handoff fence typed in #general or #lounge shouldn't be
+        # parsed as a real envelope.
+        channel_config = (
+            channels_config.get("channels", {}).get(channel_name, {})
+            if channel_name else {}
+        )
+        if channel_config.get("gate_mode") == "tier2" and response_text:
+            envelope = parse_handoff(response_text)
+            if envelope and envelope.context_box:
+                cb = envelope.context_box
+                row = context_box.record(
+                    subject=envelope.subject,
+                    state=cb.state,
+                    blocked_on=cb.blocked_on,
+                    waiting_on=cb.waiting_on,
+                    sender=agent,
+                    channel=channel_name,
+                )
+                if context_box.should_mirror(cb.state):
+                    add_pending(
+                        "general",
+                        context_box.render_mirror_line(envelope.subject or "(no subject)", row),
+                    )
+                    log.info(
+                        f"[context_box] outbound {channel_name} subject={envelope.subject!r} "
+                        f"state={cb.state} -> mirrored to #general"
+                    )
 
         # Mark complete
         await db.execute(
