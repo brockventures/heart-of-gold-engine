@@ -80,9 +80,21 @@ def test_unknown_tool():
 
 
 def test_invalid_agent_name(admin):
-    """Name validation must reject names that don't match the lowercase regex."""
+    """Name validation must reject malformed input before it ever reaches a
+    live HTTP call — spaces, underscores, and a leading digit are never
+    valid regardless of case.
+
+    NOT testing case here: the real primary agent is registered as
+    "Marvin" (capital M, see config/agents.json) and reload_agent/
+    reset_agent get called with that exact string in normal operation, so
+    NAME_RE is deliberately case-insensitive. An earlier version of this
+    test used "Bad-Name" as the invalid example — but that's just a
+    hyphenated title-case name indistinguishable from a legitimate one;
+    tightening NAME_RE to make it fail broke reload for Marvin himself.
+    Fixed 2026-08-29 (see admin-server.py's NAME_RE comment).
+    """
     with pytest.raises(ValueError):
-        admin.tool_reload_agent({"name": "Bad-Name"})
+        admin.tool_reload_agent({"name": "123bad"})
     with pytest.raises(ValueError):
         admin.tool_reset_agent({"name": "with spaces"})
     with pytest.raises(ValueError):

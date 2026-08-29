@@ -35,6 +35,16 @@ SERVER_URL = os.environ.get("AGENT_SERVER_URL", f"http://127.0.0.1:{os.environ.g
 TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 CREATE_AGENT_SH = WORKSPACE_ROOT / "bin" / "create-agent.sh"
 
+# Deliberately case-insensitive (checked 2026-08-29 against config/agents.json
+# before "fixing" this to lowercase-only broke it): the hand-bootstrapped
+# primary agent is registered as "Marvin", capital M, and reload_agent/
+# reset_agent get called with that exact string in normal operation — a
+# lowercase-only regex here would reject the one agent name that matters
+# most. create-agent.sh enforces lowercase-only for agents *created*
+# through it (separate, stricter check, by design — new agents get a
+# fresh, disposable name and no legacy capitalization to preserve); this
+# layer only needs to reject genuinely malformed input (spaces,
+# underscores, leading digit/hyphen/empty), not police case.
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
 PROTOCOL_VERSION = "2024-11-05"
 
