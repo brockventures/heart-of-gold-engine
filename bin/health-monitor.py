@@ -97,6 +97,56 @@ GIT_FETCH_TIMEOUT = 15
 GIT_CMD_TIMEOUT = 10
 GIT_PUSH_TIMEOUT = 30
 
+# CI-status-after-push polling (seconds). Real CI runs observed 2026-08-29
+# completed in ~20-40s, so poll every 15s up to a 4-minute cap — enough
+# headroom for a slow runner without letting a hung/never-triggered
+# workflow block the health-monitor run indefinitely.
+GH_RUN_LIST_TIMEOUT = 15
+CI_POLL_INTERVAL = 15
+CI_POLL_TIMEOUT = 240
+
+def check_ci_status_after_push(sha: str) -> tuple[str, str]:
+    """Poll GitHub Actions for the run triggered by the push check_git_sync()
+    just made, and report whether it passed.
+
+    Returns a ("success" | "failure" | "pending", message) pair — "pending"
+    means no terminal run showed up within CI_POLL_TIMEOUT (informational,
+    not a failure: the workflow may simply not have triggered yet on
+    GitHub's side). Only ever called right after this process's own push;
+    it isn't a general-purpose CI-status poller for arbitrary commits.
+    """
+    deadline = time.monotonic() + CI_POLL_TIMEOUT
+    while True:
+        try:
+            result = subprocess.run(
+                ["gh", "run", "list", "--commit", sha, "--branch", "main",
+                 "--limit", "1", "--json", "status,conclusion,url"],
+                cwd=WORKSPACE_ROOT, check=True, capture_output=True, text=True,
+                timeout=GH_RUN_LIST_TIMEOUT,
+            )
+            runs = json.loads(result.stdout or "[]")
+        except Exception as e:
+            log.warning(f"git sync check: gh run list for {sha} failed: {e}")
+            runs = []
+
+        if runs and runs[0].get("status") == "completed":
+            conclusion = runs[0].get("conclusion")
+            url = runs[0].get("url", "")
+            if conclusion == "success":
+                return "success", ""
+            return "failure", (
+                f"CI run for pushed commit {sha} finished with conclusion "
+                f"'{conclusion}': {url}"
+            )
+
+        if time.monotonic() >= deadline:
+            return "pending", (
+                f"no CI run found for {sha} after {CI_POLL_TIMEOUT}s, "
+                "may not have triggered yet"
+            )
+
+        time.sleep(CI_POLL_INTERVAL)
+
 def check_git_sync() -> tuple[bool, str]:
     """Check that local main hasn't silently diverged from origin/main.
 
@@ -155,6 +205,28 @@ def check_git_sync() -> tuple[bool, str]:
                 timeout=GIT_PUSH_TIMEOUT,
             )
             log.info(f"git sync check: pushed {ahead} commit(s) to origin/main")
+
+            # Incident 2026-08-11 through ~2026-08-29: CI on GitHub Actions
+            # had been red for weeks with nobody noticing, because nothing
+            # after a push ever looked at whether the resulting run passed.
+            # Only check the run *this push* triggered — not a general
+            # retroactive CI auditor for commits already on origin before
+            # this function ran.
+            try:
+                sha = subprocess.run(
+                    ["git", "rev-parse", "main"],
+                    cwd=WORKSPACE_ROOT, check=True, capture_output=True, text=True,
+                    timeout=GIT_CMD_TIMEOUT,
+                ).stdout.strip()
+                ci_status, ci_message = check_ci_status_after_push(sha)
+                if ci_status == "failure":
+                    problems.append(ci_message)
+                elif ci_status == "pending":
+                    log.info(f"git sync check: {ci_message}")
+                else:
+                    log.info(f"git sync check: CI passed for {sha}")
+            except Exception as e:
+                log.warning(f"git sync check: could not verify CI status after push: {e}")
         except subprocess.TimeoutExpired:
             problems.append(
                 f"local main is {ahead} commit(s) ahead of origin/main and push timed out"

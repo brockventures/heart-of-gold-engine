@@ -142,6 +142,13 @@ class TestGitSyncCheck:
             if args[:2] == ["git", "push"]:
                 push_calls.append(args)
                 return Result()
+            if args[:2] == ["git", "rev-parse"]:
+                return Result(stdout="deadbeef\n")
+            if args[:3] == ["gh", "run", "list"]:
+                return Result(stdout=json.dumps(
+                    [{"status": "completed", "conclusion": "success",
+                      "url": "https://github.com/x/y/actions/runs/1"}]
+                ))
             raise AssertionError(f"unexpected git call: {args}")
 
         monkeypatch.setattr(monitor.subprocess, "run", fake_run)
@@ -263,3 +270,141 @@ class TestGitSyncCheck:
         healthy, reason = monitor.check_git_sync()
         assert healthy is False
         assert "timed out" in reason
+
+
+class TestCiStatusAfterPush:
+    """Test the post-push CI status poll.
+
+    Incident 2026-08-11 through ~2026-08-29: CI on GitHub Actions had been
+    red for weeks and nobody noticed, because pytest aborted the whole run
+    on the first collection error and nothing ever surfaced the failures
+    hiding underneath. check_git_sync() now polls `gh run list` for the
+    run triggered by its own push and alerts #signals if it didn't pass.
+    These tests fake subprocess.run rather than hitting real `gh`.
+    """
+
+    def _make_monitor(self, tmp_workspace, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+        return import_script("health-monitor")
+
+    class Result:
+        def __init__(self, stdout=""):
+            self.stdout = stdout
+            self.stderr = ""
+
+    def test_ci_success_reports_success_with_no_message(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+
+        def fake_run(args, **kwargs):
+            if args[:3] == ["gh", "run", "list"]:
+                return self.Result(stdout=json.dumps(
+                    [{"status": "completed", "conclusion": "success",
+                      "url": "https://github.com/x/y/actions/runs/1"}]
+                ))
+            raise AssertionError(f"unexpected call: {args}")
+
+        monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+
+        status, message = monitor.check_ci_status_after_push("deadbeef")
+        assert status == "success"
+        assert message == ""
+
+    def test_ci_failure_alerts_with_sha_url_and_conclusion(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+
+        def fake_run(args, **kwargs):
+            if args[:3] == ["gh", "run", "list"]:
+                return self.Result(stdout=json.dumps(
+                    [{"status": "completed", "conclusion": "failure",
+                      "url": "https://github.com/x/y/actions/runs/2"}]
+                ))
+            raise AssertionError(f"unexpected call: {args}")
+
+        monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+
+        status, message = monitor.check_ci_status_after_push("deadbeef")
+        assert status == "failure"
+        assert "deadbeef" in message
+        assert "https://github.com/x/y/actions/runs/2" in message
+        assert "failure" in message
+
+    def test_ci_never_found_reports_pending_not_failure(self, tmp_workspace, monkeypatch):
+        """If GitHub hasn't surfaced a run for the pushed SHA within the
+        poll window, that's informational — not treated as a hard
+        failure, since the workflow may simply not have triggered yet."""
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        monkeypatch.setattr(monitor, "CI_POLL_TIMEOUT", 0)
+        calls = []
+
+        def fake_run(args, **kwargs):
+            if args[:3] == ["gh", "run", "list"]:
+                calls.append(args)
+                return self.Result(stdout="[]")
+            raise AssertionError(f"unexpected call: {args}")
+
+        monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+
+        status, message = monitor.check_ci_status_after_push("deadbeef")
+        assert status == "pending"
+        assert "deadbeef" in message
+        assert len(calls) >= 1
+
+    def test_git_sync_alerts_when_pushed_commits_ci_fails(self, tmp_workspace, monkeypatch):
+        """Integration: check_git_sync() itself surfaces the CI failure of
+        the commit it just pushed, through its normal (bool, str) return
+        so main()'s existing poke_signals routing picks it up."""
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+
+        def fake_run(args, **kwargs):
+            if args[:2] == ["git", "fetch"]:
+                return self.Result()
+            if args[:3] == ["git", "rev-list", "--count"]:
+                if args[3] == "origin/main..main":
+                    return self.Result(stdout="1\n")
+                return self.Result(stdout="0\n")
+            if args[:2] == ["git", "push"]:
+                return self.Result()
+            if args[:2] == ["git", "rev-parse"]:
+                return self.Result(stdout="cafef00d\n")
+            if args[:3] == ["gh", "run", "list"]:
+                return self.Result(stdout=json.dumps(
+                    [{"status": "completed", "conclusion": "failure",
+                      "url": "https://github.com/x/y/actions/runs/3"}]
+                ))
+            raise AssertionError(f"unexpected call: {args}")
+
+        monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+
+        healthy, reason = monitor.check_git_sync()
+        assert healthy is False
+        assert "cafef00d" in reason
+        assert "https://github.com/x/y/actions/runs/3" in reason
+        assert "failure" in reason
+
+    def test_git_sync_stays_healthy_when_ci_still_pending(self, tmp_workspace, monkeypatch):
+        """A push succeeding but CI not showing up yet must not fail the
+        overall git-sync check — only a confirmed non-success conclusion
+        should."""
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        monkeypatch.setattr(monitor, "CI_POLL_TIMEOUT", 0)
+
+        def fake_run(args, **kwargs):
+            if args[:2] == ["git", "fetch"]:
+                return self.Result()
+            if args[:3] == ["git", "rev-list", "--count"]:
+                if args[3] == "origin/main..main":
+                    return self.Result(stdout="1\n")
+                return self.Result(stdout="0\n")
+            if args[:2] == ["git", "push"]:
+                return self.Result()
+            if args[:2] == ["git", "rev-parse"]:
+                return self.Result(stdout="cafef00d\n")
+            if args[:3] == ["gh", "run", "list"]:
+                return self.Result(stdout="[]")
+            raise AssertionError(f"unexpected call: {args}")
+
+        monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+
+        healthy, reason = monitor.check_git_sync()
+        assert healthy is True
+        assert reason == ""
