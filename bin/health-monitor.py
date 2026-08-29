@@ -91,6 +91,91 @@ def check_health_file(component: str, threshold: int) -> tuple[bool, str]:
     except Exception as e:
         return False, f"{component} error: {e}"
 
+# git sync check timeouts (seconds) — short enough that a network hiccup
+# can't hang the daily health-monitor run.
+GIT_FETCH_TIMEOUT = 15
+GIT_CMD_TIMEOUT = 10
+GIT_PUSH_TIMEOUT = 30
+
+def check_git_sync() -> tuple[bool, str]:
+    """Check that local main hasn't silently diverged from origin/main.
+
+    Incident 2026-08-29: local main drifted 43 commits / 18 days ahead of
+    origin/main with zero visible errors. Root cause was a GITHUB_TOKEN
+    missing the 'workflow' OAuth scope — GitHub rejects (with a clear
+    stderr message) any push of a range touching .github/workflows/*
+    without it, and nothing was reading `git push`'s exit code or stderr.
+    This check fetches origin/main, and if local is ahead, attempts a
+    plain fast-forward `git push origin main` right here — if that
+    succeeds, the drift was same-session and self-heals silently (no
+    alert). Only a genuine push *failure* is worth alerting on, and it's
+    reported every run until fixed (not just once) since the underlying
+    cause needs a human (regenerating the token) to resolve. Never
+    force-pushes, rebases, or touches history — read-only except for the
+    push itself, which git already refuses unless it's a fast-forward.
+    """
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin", "main"],
+            cwd=WORKSPACE_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=GIT_FETCH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "git sync check: fetch from origin timed out"
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        return False, f"git sync check: fetch from origin failed: {stderr}"
+    except Exception as e:
+        return False, f"git sync check: fetch from origin errored: {e}"
+
+    try:
+        ahead = int(subprocess.run(
+            ["git", "rev-list", "--count", "origin/main..main"],
+            cwd=WORKSPACE_ROOT, check=True, capture_output=True, text=True,
+            timeout=GIT_CMD_TIMEOUT,
+        ).stdout.strip())
+        behind = int(subprocess.run(
+            ["git", "rev-list", "--count", "main..origin/main"],
+            cwd=WORKSPACE_ROOT, check=True, capture_output=True, text=True,
+            timeout=GIT_CMD_TIMEOUT,
+        ).stdout.strip())
+    except Exception as e:
+        return False, f"git sync check: rev-list comparison failed: {e}"
+
+    problems = []
+
+    if ahead > 0:
+        try:
+            subprocess.run(
+                ["git", "push", "origin", "main"],
+                cwd=WORKSPACE_ROOT, check=True, capture_output=True, text=True,
+                timeout=GIT_PUSH_TIMEOUT,
+            )
+            log.info(f"git sync check: pushed {ahead} commit(s) to origin/main")
+        except subprocess.TimeoutExpired:
+            problems.append(
+                f"local main is {ahead} commit(s) ahead of origin/main and push timed out"
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            problems.append(
+                f"local main is {ahead} commit(s) ahead of origin/main and push failed: {stderr}"
+            )
+
+    if behind > 0:
+        problems.append(
+            f"local main is {behind} commit(s) behind origin/main "
+            "(informational — someone/something else pushed; may need a "
+            "manual merge, not auto-handled)"
+        )
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, ""
+
 def poke_signals(message: str):
     """Send alert to signals channel"""
     try:
@@ -118,6 +203,11 @@ def main():
         if not healthy:
             log.warning(f"Health check failed: {reason}")
             issues.append(reason)
+
+    git_healthy, git_reason = check_git_sync()
+    if not git_healthy:
+        log.warning(f"Health check failed: {git_reason}")
+        issues.append(git_reason)
 
     if issues:
         alert = "⚠️ Health check failures:\n" + "\n".join(f"• {issue}" for issue in issues)
