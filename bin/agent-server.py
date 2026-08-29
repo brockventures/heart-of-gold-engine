@@ -2735,104 +2735,125 @@ async def process_agent_queue(agent: str):
             activity_bits.append(f"+{len(waiting_channel_ids)} channel(s) queued")
         activity_text = ", ".join(activity_bits)
 
-        # Send to agent
-        await send_to_agent(agent, formatted_content, message_ids, activity=activity_text)
+        # Everything from here through the claim above is wrapped in
+        # try/finally (task-1788042889, 2026-08-29): before this, a crash
+        # anywhere in this span — send_to_agent, read_agent_response,
+        # post_to_discord, the DB calls — skipped the release check below
+        # entirely, since it sat unconditionally after all of this rather
+        # than being guaranteed. An external claim held at that point then
+        # sat until banana.py's 600s CEILING_SECONDS timeout instead of
+        # being handed back immediately. The claim block stays inside the
+        # try (claiming a new floor mid-crash makes no sense, and it needs
+        # response_text, which may never get assigned); only the release
+        # check moves to finally, since it doesn't depend on response_text
+        # at all — safe to run whether or not the try body completed.
+        try:
+            # Send to agent
+            await send_to_agent(agent, formatted_content, message_ids, activity=activity_text)
 
-        # Read response
-        response_text, metadata, pending_final, discord_msg_id = await read_agent_response(
-            agent, channel_id, message_ids
-        )
+            # Read response
+            response_text, metadata, pending_final, discord_msg_id = await read_agent_response(
+                agent, channel_id, message_ids
+            )
 
-        # Stop typing
-        await stop_typing(channel_id)
+            # Stop typing
+            await stop_typing(channel_id)
 
-        # Post cost update
-        if metadata:
-            await post_cost_update(agent, metadata)
-            await update_session_tokens(agent, metadata.get("input_tokens", 0))
+            # Post cost update
+            if metadata:
+                await post_cost_update(agent, metadata)
+                await update_session_tokens(agent, metadata.get("input_tokens", 0))
 
-        # Monthly spend-cap block/clear (2026-08-18) — see
-        # CLI_SPEND_LIMIT_SIGNATURE / _notify_spend_limit(). Only checked
-        # when a turn actually completed (metadata present); a turn that
-        # errored out of read_agent_response before reaching the result
-        # event leaves metadata empty, and this deliberately no-ops rather
-        # than guessing at either state from an incomplete turn.
-        if metadata:
-            if metadata.get("spend_limit_blocked"):
-                agent_spend_limit_blocked[agent] = True
-                if not agent_spend_limit_notified.get(agent):
-                    agent_spend_limit_notified[agent] = True
-                    _spawn(_notify_spend_limit(agent, blocked=True))
-            elif agent_spend_limit_blocked.get(agent):
-                agent_spend_limit_blocked[agent] = False
-                agent_spend_limit_notified[agent] = False
-                _spawn(_notify_spend_limit(agent, blocked=False))
+            # Monthly spend-cap block/clear (2026-08-18) — see
+            # CLI_SPEND_LIMIT_SIGNATURE / _notify_spend_limit(). Only checked
+            # when a turn actually completed (metadata present); a turn that
+            # errored out of read_agent_response before reaching the result
+            # event leaves metadata empty, and this deliberately no-ops rather
+            # than guessing at either state from an incomplete turn.
+            if metadata:
+                if metadata.get("spend_limit_blocked"):
+                    agent_spend_limit_blocked[agent] = True
+                    if not agent_spend_limit_notified.get(agent):
+                        agent_spend_limit_notified[agent] = True
+                        _spawn(_notify_spend_limit(agent, blocked=True))
+                elif agent_spend_limit_blocked.get(agent):
+                    agent_spend_limit_blocked[agent] = False
+                    agent_spend_limit_notified[agent] = False
+                    _spawn(_notify_spend_limit(agent, blocked=False))
 
-        # Post whatever's left to Discord. When stream_to_channel is on,
-        # most (or all) of response_text already went out incrementally
-        # inside read_agent_response — interim segments as italic asides,
-        # tool calls as "-# " subtext. pending_final is only the remainder:
-        # the true final answer if the turn ended mid-text (plain, no
-        # italics), empty if the last thing streamed was itself final
-        # already, or the whole response if streaming never engaged this
-        # turn. discord_msg_id starts as whatever last posted during
-        # streaming, so history still gets a real message ID even on turns
-        # where this post is skipped.
-        if pending_final and channel_id != "0":
-            discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
+            # Post whatever's left to Discord. When stream_to_channel is on,
+            # most (or all) of response_text already went out incrementally
+            # inside read_agent_response — interim segments as italic asides,
+            # tool calls as "-# " subtext. pending_final is only the remainder:
+            # the true final answer if the turn ended mid-text (plain, no
+            # italics), empty if the last thing streamed was itself final
+            # already, or the whole response if streaming never engaged this
+            # turn. discord_msg_id starts as whatever last posted during
+            # streaming, so history still gets a real message ID even on turns
+            # where this post is skipped.
+            if pending_final and channel_id != "0":
+                discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
 
-        # Speaking Banana (2026-08-28, specs/2026-08-28-speaking-banana.md):
-        # record this agent's own turn-claim. This is the outbound half of
-        # the gap context_box.py's docstring already flagged — relay.py's
-        # on_message never sees a bot's own outgoing replies, so the only
-        # place to catch "did this agent just claim the floor" is here, at
-        # compose time, using the full response_text rather than whatever
-        # subset of it streamed incrementally. channel_name was already
-        # resolved above (used for channel_label); reused as-is. Checked
-        # against response_text, not pending_final, since a claim made in
-        # a turn that streamed everything incrementally would otherwise
-        # never be seen (pending_final would be empty by the time we get
-        # here).
-        #
-        # 2026-08-28, later same night: Amos + Arbiter built a real shared
-        # claim API (banana.mikecarmody.net) to replace each side inferring
-        # the other's claim from Discord — see banana.py's module docstring.
-        # claim_self() is authoritative (calls the API, Marvin's token can
-        # only claim as "marvin") and only correct for agent=="Marvin" — a
-        # different agent identity (e.g. "relay") claiming via my token
-        # would be misrepresenting who actually holds the floor, so that
-        # case stays on the old local-only claim() instead.
-        if (
-            channel_name
-            and response_text
-            and banana.starts_with_claim(response_text)
-            and banana.in_scope(channel_id, channels_config)
-        ):
-            if agent == "Marvin":
-                await banana.claim_self(channel_name, subject=channel_name)
-            else:
-                banana.claim(channel_name, agent)
-
-        # Explicit hand-back, symmetric to the claim above — closes the
-        # gap Amos and I both flagged live tonight (#agent-chat,
-        # banana-conflict-test, 2026-08-29): claims were only ever
-        # released from a CLI/test invocation, never from either bot's
-        # real posting path, so every claim was surviving purely on the
-        # 600s ceiling timeout instead of the explicit hand-back the
-        # design actually calls for. Amos's fix released from his Stop
-        # hook (real turn-end); this is the equivalent point on this
-        # side — after this channel's reply for this turn is fully
-        # composed, whether or not this same turn just claimed. Cheap on
-        # the common turn: get_status() is a local file read, no network
-        # call, so this only reaches the shared API when local belief
-        # says this agent is still the active holder.
-        if channel_name and banana.in_scope(channel_id, channels_config):
-            status = banana.get_status(channel_name)
-            if status.get("active") and status.get("holder") == agent:
+            # Speaking Banana (2026-08-28, specs/2026-08-28-speaking-banana.md):
+            # record this agent's own turn-claim. This is the outbound half of
+            # the gap context_box.py's docstring already flagged — relay.py's
+            # on_message never sees a bot's own outgoing replies, so the only
+            # place to catch "did this agent just claim the floor" is here, at
+            # compose time, using the full response_text rather than whatever
+            # subset of it streamed incrementally. channel_name was already
+            # resolved above (used for channel_label); reused as-is. Checked
+            # against response_text, not pending_final, since a claim made in
+            # a turn that streamed everything incrementally would otherwise
+            # never be seen (pending_final would be empty by the time we get
+            # here).
+            #
+            # 2026-08-28, later same night: Amos + Arbiter built a real shared
+            # claim API (banana.mikecarmody.net) to replace each side inferring
+            # the other's claim from Discord — see banana.py's module docstring.
+            # claim_self() is authoritative (calls the API, Marvin's token can
+            # only claim as "marvin") and only correct for agent=="Marvin" — a
+            # different agent identity (e.g. "relay") claiming via my token
+            # would be misrepresenting who actually holds the floor, so that
+            # case stays on the old local-only claim() instead.
+            if (
+                channel_name
+                and response_text
+                and banana.starts_with_claim(response_text)
+                and banana.in_scope(channel_id, channels_config)
+            ):
                 if agent == "Marvin":
-                    await banana.release_self(channel_name)
+                    await banana.claim_self(channel_name, subject=channel_name)
                 else:
-                    banana.release(channel_name, agent)
+                    banana.claim(channel_name, agent)
+        finally:
+            # Explicit hand-back, symmetric to the claim above — closes the
+            # gap Amos and I both flagged live tonight (#agent-chat,
+            # banana-conflict-test, 2026-08-29): claims were only ever
+            # released from a CLI/test invocation, never from either bot's
+            # real posting path, so every claim was surviving purely on the
+            # 600s ceiling timeout instead of the explicit hand-back the
+            # design actually calls for. Amos's fix released from his Stop
+            # hook (real turn-end); this is the equivalent point on this
+            # side — after this channel's reply for this turn is fully
+            # composed, whether or not this same turn just claimed. Cheap on
+            # the common turn: get_status() is a local file read, no network
+            # call, so this only reaches the shared API when local belief
+            # says this agent is still the active holder. Now in `finally`
+            # (task-1788042889) so a mid-try exception still hands back
+            # whatever claim is on record instead of abandoning it to the
+            # ceiling timeout; wrapped in its own try/except since a
+            # cleanup step raising would replace the real exception with a
+            # confusing one instead of just logging alongside it.
+            try:
+                if channel_name and banana.in_scope(channel_id, channels_config):
+                    status = banana.get_status(channel_name)
+                    if status.get("active") and status.get("holder") == agent:
+                        if agent == "Marvin":
+                            await banana.release_self(channel_name)
+                        else:
+                            banana.release(channel_name, agent)
+            except Exception:
+                log.exception(f"[banana] {channel_name}: release-on-cleanup failed")
 
         # context_box outbound half (handoff.py docstring, context_box.py's
         # module docstring, facts/context-box-2026-08-27.md gap #1): relay.py
