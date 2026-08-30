@@ -58,6 +58,14 @@ class GateMessage:
     mentions_self: bool = False
     is_reply_to_self: bool = False
     author_is_bot: bool = False
+    # A ping to a shared role Marvin belongs to (e.g. @robots), as opposed
+    # to a direct @mention of Marvin himself. Added 2026-08-30 after Mike
+    # flagged (agent-chat, 05:13 UTC) that a @Robot broadcast fell through
+    # to normal Tier 2 scoring instead of force-waking like a real
+    # @mention -- Amos and Zero both had (and fixed) the identical gap on
+    # their own sides same night. Caller resolves which role IDs count as
+    # "self" from config; this field is just the pre-resolved bool.
+    mentions_role: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,9 +124,10 @@ class ReplyGate:
 
         has_marker = bool(self.attention_marker) and self.attention_marker in (msg.content or "")
 
-        if msg.mentions_self or msg.is_reply_to_self or has_marker:
+        if msg.mentions_self or msg.mentions_role or msg.is_reply_to_self or has_marker:
             reason = (
                 "@mention" if msg.mentions_self else
+                "@role mention" if msg.mentions_role else
                 "reply to you" if msg.is_reply_to_self else
                 "attention marker"
             )
@@ -251,6 +260,11 @@ def _selftest() -> int:
 
     check("tier 1 ignores the cooldown",
           g.evaluate(M(content="hey", mentions_self=True)).wake, True)
+
+    d_role = g.evaluate(M(content="crew, status?", mentions_role=True))
+    check("@role mention wakes like a real @mention", d_role.wake, True)
+    check("@role mention reason is distinct from @mention", d_role.reason, "@role mention")
+    check("@role mention ignores the cooldown", d_role.tier, "tier1")
 
     g.note_human_message("c1")
     check("a human resets the cooldown",

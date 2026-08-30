@@ -1398,11 +1398,16 @@ class DiscordAdapter(discord.Client):
                     channel_id=str(message.channel.id),
                 )
             else:
+                robots_role_id = channels_config.get("robots_role_id")
                 gate_msg = GateMessage(
                     channel_id=str(message.channel.id),
                     author_id=str(message.author.id),
                     content=message.content or "",
                     mentions_self=self.user in message.mentions,
+                    mentions_role=bool(
+                        robots_role_id
+                        and any(str(r.id) == str(robots_role_id) for r in message.role_mentions)
+                    ),
                     is_reply_to_self=await self._is_reply_to_self(message),
                     author_is_bot=message.author.bot,
                 )
