@@ -230,7 +230,18 @@ RESTART_SERVER_COOLDOWN_SEC = 60  # guards a fat-fingered double-SIGTERM into on
 # 2026-08-16.md) and stops. A human decides whether to force it from there.
 RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC = int(os.environ.get("RESTART_SERVER_IDLE_WAIT_TIMEOUT_SEC", "300"))
 RESTART_SERVER_STATUS_INTERVAL_SEC = 30  # interim "still waiting, won't force it" pushes while idle-waiting
-RESTART_SERVER_POST_RESTART_TIMEOUT_SEC = 30  # bound on polling for agent-server to come back after SIGTERM
+# Bound on polling for agent-server to come back after SIGTERM. Was 30 —
+# too tight even before 2026-08-30's boot_id fix: graceful_shutdown() alone
+# can run up to ~30s idle-wait plus up to 25s PER AGENT for session
+# summaries (sequential, not parallel) before it even starts dying, and
+# journalctl shows real SIGTERM-to-"Running on http" gaps of ~25-31s on
+# this install with just two agents. The old code never noticed because it
+# accepted the first (falsely-positive) health response in ~1s, well
+# inside any timeout. Now that a real restart is required to satisfy this
+# poll, the bound needs real headroom instead of getting lucky — 120s
+# covers the measured worst case with margin before this starts reporting
+# a false crash-loop.
+RESTART_SERVER_POST_RESTART_TIMEOUT_SEC = 120
 
 # Dispatch config
 DISPATCH_INBOX_DIR = WORKSPACE_ROOT / "inbox"
@@ -1108,6 +1119,7 @@ class DiscordAdapter(discord.Client):
         wait_start = time.time()
         last_status_push = wait_start
         snapshot: Optional[dict] = None
+        pre_boot_id: Optional[str] = None
         while True:
             try:
                 health = await _fetch_health()
@@ -1122,6 +1134,7 @@ class DiscordAdapter(discord.Client):
             }
             if not not_idle:
                 snapshot = agents
+                pre_boot_id = health.get("boot_id")
                 break
 
             elapsed = time.time() - wait_start
@@ -1181,6 +1194,18 @@ class DiscordAdapter(discord.Client):
         # Poll until agent-server is back, then confirm sessions survived
         # (new PID, same session_ids — the same guarantee /sys reload
         # already relies on) rather than just "it responded".
+        #
+        # 2026-08-30: "responded" alone is a false positive — graceful_
+        # shutdown() keeps /health answering all the way through its own
+        # cleanup (idle-wait, per-agent session summaries, subprocess
+        # kills) right up until sys.exit(0), so the very first poll almost
+        # always lands on the still-dying OLD process, which trivially
+        # reports matching session_ids against itself. That's what made
+        # this always read "done in 1s" when real recovery was 1-2
+        # minutes out — Ian flagged this live, 2026-08-30. Now require
+        # boot_id (fresh per process, see SERVER_BOOT_ID in
+        # agent-server.py) to actually change before accepting a health
+        # response as evidence of a real restart, not just a response.
         poll_start = time.time()
         while time.time() - poll_start < RESTART_SERVER_POST_RESTART_TIMEOUT_SEC:
             await asyncio.sleep(1)
@@ -1190,6 +1215,9 @@ class DiscordAdapter(discord.Client):
                 continue
             agents = health.get("agents", {})
             if not agents:
+                continue
+            if pre_boot_id is not None and health.get("boot_id") == pre_boot_id:
+                # Still the old process — it hasn't actually died yet.
                 continue
             post_sessions = {name: a.get("session_id") for name, a in agents.items()}
             preserved = all(

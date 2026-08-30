@@ -473,6 +473,18 @@ DISCORD_ID_TO_AGENT: Dict[int, str] = {}
 # Graceful shutdown flag
 shutting_down = False
 
+# Per-process identity, generated fresh on import (i.e. once per actual OS
+# process, including every restart) — 2026-08-30, fixes /sys restart-server
+# reporting "done in 1s" when real recovery takes 1-2 minutes. graceful_
+# shutdown() keeps the aiohttp server (and /health) answering throughout its
+# own cleanup — waiting for idle, generating session summaries, killing
+# subprocesses — right up until sys.exit(0) at the very end, so a poll loop
+# that just checks "/health responds with matching session_ids" gets a false
+# positive almost immediately: it's still talking to the dying OLD process,
+# which trivially matches itself. See _sys_restart_server() in relay.py,
+# which now requires this to actually change before declaring victory.
+SERVER_BOOT_ID = str(uuid.uuid4())
+
 # =============================================================================
 # Database Schema
 # =============================================================================
@@ -3512,7 +3524,13 @@ async def handle_health(request):
 
     return web.json_response({
         "status": "healthy",
-        "agents": agent_status
+        "agents": agent_status,
+        # Changes on every real process restart (fresh on import, see
+        # SERVER_BOOT_ID above) — unlike session_id, which is deliberately
+        # preserved across restarts and so can't tell a caller whether
+        # they're still talking to a not-yet-dead old process.
+        "boot_id": SERVER_BOOT_ID,
+        "pid": os.getpid(),
     })
 
 async def handle_agents(request):
