@@ -83,11 +83,13 @@ Transport for claim_self()/release_self() (2026-08-29, task-1788046725):
 was a hand-rolled aiohttp POST against /api/claim and /api/release, now
 delegates to `AsyncBananaClient` from the `banana-protocol` pip package
 (github.com/brockventures/banana-protocol, pinned in requirements.txt —
-see that pin's comment for why pinned-not-floating). Adopted so upstream
-fixes — e.g. the same-night `holder` default-identity footgun fix,
-commit 9298d7d — flow through automatically instead of us reimplementing
-each one by hand and quietly drifting from what Amos and Zero are
-running. Deliberately narrow adoption: only the two functions that were
+see that pin's comment for why pinned-not-floating; bumped to tag
+v0.1.1 on 2026-08-30 after the original 9298d7d pin turned out to have
+a clean-install bug). Adopted so upstream fixes — e.g. the same-night
+`holder` default-identity footgun fix — flow through automatically
+instead of us reimplementing each one by hand and quietly drifting from
+what Amos and Zero are running. Deliberately narrow adoption: only the
+two functions that were
 already making real network calls got swapped. get_status()/in_scope()/
 claim()/release()/heartbeat() below stay local-only exactly as before —
 they never touched the network to begin with (see GRACE_SECONDS/

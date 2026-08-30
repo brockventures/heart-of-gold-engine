@@ -7,24 +7,22 @@ schedule==1.2.2
 prompt-toolkit==3.0.48
 rich==13.9.4
 PyYAML==6.0.2
-# Pinned to a commit, not a floating branch, deliberately — see
+# Pinned to a tag, not a floating branch, deliberately — see
 # bin/speaking_banana.py's module docstring. Cavern-wide adoption
 # 2026-08-29 (Ian approved, task-1788046725): Amos pinned lib/
-# speaking_banana.py to the same commit (9298d7d) for cross-bot
-# alignment; bump only as a deliberate, reviewed step, not silently via
-# an unpinned "latest".
+# speaking_banana.py to the same ref for cross-bot alignment; bump only
+# as a deliberate, reviewed step, not silently via an unpinned "latest".
 #
-# KNOWN ISSUE as of 2026-08-29 23:50 UTC: `pip install -r requirements.txt`
-# fails on a clean environment against this exact commit — pyproject.toml
-# has no [tool.setuptools.packages.find], so setuptools' flat-layout
-# auto-discovery finds two top-level dirs (banana/, specs/) and refuses to
-# build ("Multiple top-level packages discovered"). Reproduced with a
-# plain `pip install .` against a fresh clone, not a git-URL or network
-# quirk. Verified fix (adding `[tool.setuptools.packages.find]
-# include = ["banana*"]`) works locally; flagged to Zero/Ryan in
-# #agent-chat since we don't have push access to brockventures/
-# banana-protocol to land it ourselves. The current venv on this host has
-# a locally patched wheel installed already (works today), but do not
-# assume a fresh `pip install -r requirements.txt` elsewhere will
-# succeed until this line is re-verified against a fixed upstream commit.
-banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@9298d7d
+# 2026-08-30: bumped 9298d7d -> v0.1.1 (commit cbc900d). The prior pin
+# had a real clean-install bug (setuptools flat-layout auto-discovery
+# saw two top-level dirs, banana/ and specs/, and refused to build —
+# reproduced independently with `pip install git+...@9298d7d` in a
+# throwaway venv, not just Zero's report). This host's .venv had been
+# running on an undocumented local pyproject.toml patch applied to a
+# manual /tmp checkout, which masked the bug here while leaving any
+# fresh install elsewhere broken. v0.1.1 carries Zero's upstream fix
+# ([tool.setuptools.packages.find] include = ["banana*"]) plus the
+# mandatory-`holder`-arg fix; verified with a clean `pip install` in a
+# fresh venv before landing this bump. See #agent-chat 2026-08-29/30 for
+# the coordination thread with Zero/Ryan/Amos.
+banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@v0.1.1
