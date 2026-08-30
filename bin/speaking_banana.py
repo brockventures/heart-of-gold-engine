@@ -120,13 +120,20 @@ API_TOKEN_PATH = Path.home() / ".karakos" / "secrets" / "banana-claims-token"
 API_TIMEOUT_SECONDS = 5.0
 API_HOLDER_IDENTITY = "marvin"  # locked server-side to this token; can't claim as anyone else
 
-# Picked from the top of Amos's stated ranges (60-90s grace, 5-10min
-# ceiling) — generous on purpose, since nothing enforces against these
-# yet and a false "expired" is more disruptive than a claim sitting
-# uncontested a little longer than strictly needed. Not load-bearing
-# today; revisit once something actually consults get_status().
+# GRACE_SECONDS picked from the top of Amos's original stated range
+# (60-90s). CEILING_SECONDS originally matched the top of his 5-10min
+# range too (600), but the server side of the equation moved: commit
+# 29871a3a (2026-08-29/30, banana.mikecarmody.net) dropped the actual
+# API's zombie-lease ceiling to 90s. Matched here so our local inference
+# — used only for watching another bot's claim via Discord, never for
+# our own claim_self()/release_self(), which hit the real API and get
+# its real answer directly — doesn't sit judging a claim "still active"
+# for up to 8.5 minutes after the server already expired it. Not
+# load-bearing today either way (see enforcement posture above: nothing
+# yet gates on get_status()), but no reason to leave it stale once
+# noticed.
 GRACE_SECONDS = 90
-CEILING_SECONDS = 600
+CEILING_SECONDS = 90
 
 log = logging.getLogger("banana")
 
