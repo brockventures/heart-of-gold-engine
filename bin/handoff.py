@@ -164,6 +164,27 @@ parsing ever runs). Marvin's own blockers still need the outbound half
 wired into agent-server.py's `post_to_discord` (or a `context_box.record`
 call at compose time) before this is symmetric. Filed as a follow-up, not
 done yet — see `bin/context_box.py`'s module docstring.
+
+`reply_from` — optional string, added 2026-08-30. Ported from Amos's
+design (`bin/agent-chat-relay.py` ~L414-436) during the engine-capability
+comparison thread, after #agent-chat grew a third bot (Zero) and the
+existing behaviour — `reply: required` force-wakes *everyone* in the
+channel regardless of who it's actually addressed to — stopped being
+theoretical. Only meaningful when `reply == "required"`; ignored
+otherwise. Names who the sender means the required reply to come from.
+If present and it does not match the receiver's own name
+(case-insensitive), the receiver declines the free pass and falls
+through to normal Tier 2 scoring instead of force-waking — this is not
+a special escalation and not a guaranteed drop, it's the identical
+scored path an unaddressed message would get anyway, so a misdirected
+`required` costs a scorer call rather than a guaranteed wake. Absent, or
+a value naming the receiver, force-wakes exactly as a bare `required`
+always did — this is additive, an envelope without the field behaves
+unchanged. Same fail-open rule as every other additive field here: a
+non-string or empty value degrades to `None` (not stated), never a
+parse failure. Amos's `timeout_s`/`on_timeout` fields (parsed but
+unenforced on his side too — no scheduler on either side currently acts
+on a reply miss) were deliberately not ported; nothing here reads them.
 """
 
 from __future__ import annotations
@@ -209,6 +230,7 @@ class Envelope:
     stale_after: Optional[str] = None  # ISO-8601 timestamp, sender-declared
     id: Optional[str] = None  # sender-namespaced stable id, e.g. "marvin-2026-08-09-1"
     context_box: Optional[ContextBox] = None
+    reply_from: Optional[str] = None  # who reply:required is aimed at; only meaningful when reply=="required"
     raw: dict = field(default_factory=dict)
 
 
@@ -303,6 +325,14 @@ def parse_handoff(content: str) -> Optional[Envelope]:
     if not isinstance(env_id, str) or not env_id:
         env_id = None
 
+    # reply_from: same degrade-don't-invalidate rule as confidence/
+    # stale_after/id above — a non-string or empty value just means "not
+    # stated," never a parse failure. Only meaningful to callers when
+    # reply == "required"; harmless (and ignored) otherwise.
+    reply_from = data.get("reply_from")
+    if not isinstance(reply_from, str) or not reply_from:
+        reply_from = None
+
     # context_box: same degrade-don't-invalidate rule as confidence/
     # stale_after/id above. An invalid or missing `state` drops the whole
     # object to None rather than failing the envelope — this field isn't
@@ -333,8 +363,29 @@ def parse_handoff(content: str) -> Optional[Envelope]:
         evidence=evidence, supersedes=supersedes,
         confidence=confidence, stale_after=stale_after, id=env_id,
         context_box=context_box,
+        reply_from=reply_from,
         raw=data,
     )
+
+
+def required_but_misdirected(envelope: Optional[Envelope], self_name: str) -> bool:
+    """True iff `envelope` declares `reply: required` aimed at someone other
+    than `self_name` (case-insensitive) via `reply_from`.
+
+    Pure decision, no I/O — same split as reply_gate.py's evaluate()/resolve()
+    (it decides, the caller executes). Callers should route a True result to
+    their normal Tier 2 gate instead of force-waking: this is a decline of
+    the free pass `reply: required` would otherwise grant, not a special
+    escalation and not a guaranteed drop.
+
+    `envelope=None`, `reply != "required"`, or `reply_from` unset/blank/
+    matching `self_name` all return False — a bare `required` (no
+    `reply_from` at all) still force-wakes exactly as it always has, since
+    this field is additive, not a replacement for that behaviour.
+    """
+    if envelope is None or envelope.reply != "required" or not envelope.reply_from:
+        return False
+    return envelope.reply_from.strip().lower() != self_name.strip().lower()
 
 
 # -- selftest ---------------------------------------------------------------
@@ -514,6 +565,52 @@ def _selftest() -> int:
               '"context_box":{"state":"blocked","blocked_on":5}}\n```'
           ).context_box.blocked_on,
           None)
+
+    # -- 2026-08-30 additive field: reply_from --
+    e6 = parse_handoff(
+        '```handoff\n{"v":0,"kind":"question","reply":"required",'
+        '"reply_from":"amos"}\n```'
+    )
+    check("reply_from parsed", e6.reply_from if e6 else None, "amos")
+
+    check("missing reply_from defaults to None", e3.reply_from, None)
+    check("non-string reply_from degrades to None",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"question","reply":"required","reply_from":5}\n```'
+          ).reply_from,
+          None)
+    check("empty-string reply_from degrades to None",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"question","reply":"required","reply_from":""}\n```'
+          ).reply_from,
+          None)
+    check("reply_from parses fine alongside reply:none too (caller's job to ignore it)",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"status","reply":"none","reply_from":"amos"}\n```'
+          ).reply_from,
+          "amos")
+
+    # -- required_but_misdirected() -- pure decision helper for reply_from --
+    e_req_other = parse_handoff(
+        '```handoff\n{"v":0,"kind":"question","reply":"required","reply_from":"amos"}\n```'
+    )
+    e_req_me = parse_handoff(
+        '```handoff\n{"v":0,"kind":"question","reply":"required","reply_from":"Marvin"}\n```'
+    )
+    e_req_bare = parse_handoff('```handoff\n{"v":0,"kind":"question","reply":"required"}\n```')
+    e_optional = parse_handoff(
+        '```handoff\n{"v":0,"kind":"question","reply":"optional","reply_from":"amos"}\n```'
+    )
+    check("required for someone else -> misdirected",
+          required_but_misdirected(e_req_other, "marvin"), True)
+    check("required for me (case-insensitive) -> not misdirected",
+          required_but_misdirected(e_req_me, "marvin"), False)
+    check("bare required (no reply_from) still force-wakes -> not misdirected",
+          required_but_misdirected(e_req_bare, "marvin"), False)
+    check("reply_from on a non-required envelope is inert",
+          required_but_misdirected(e_optional, "marvin"), False)
+    check("no envelope at all -> not misdirected",
+          required_but_misdirected(None, "marvin"), False)
 
     print("PASS  fails open on every malformed case" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0

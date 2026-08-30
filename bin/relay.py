@@ -28,7 +28,7 @@ from typing import Optional, Dict, List
 from logging.handlers import RotatingFileHandler
 
 from reply_gate import Decision, GateMessage, ReplyGate, SCORER_PROMPT
-from handoff import parse_handoff
+from handoff import parse_handoff, required_but_misdirected
 from outbox import add_pending
 import context_box
 import speaking_banana as banana
@@ -1411,7 +1411,25 @@ class DiscordAdapter(discord.Client):
                         f"quiet (scorer skipped)"
                     )
                 return
-            if envelope and envelope.reply == "required":
+            # reply_from (handoff.py, added 2026-08-30): a `reply:required`
+            # names who it's actually aimed at, in a channel with more than
+            # one addressable agent. Ported from Amos's design after
+            # #agent-chat grew a third bot (Zero) and an unconditional
+            # force-wake on ANY `required` envelope stopped being a
+            # two-party assumption. required_but_misdirected() is the pure
+            # decision (see handoff.py); a True result declines the free
+            # pass and falls through to the normal gate below, same scored
+            # path an unaddressed message gets anyway, not a special
+            # escalation or a guaranteed drop.
+            misdirected = required_but_misdirected(envelope, self.user.name)
+            if misdirected:
+                log.info(
+                    f"[gate] {channel_name} handoff: reply=required but "
+                    f"reply_from={envelope.reply_from!r} names someone else -- "
+                    f"declining the free pass, falling through to normal gate"
+                )
+
+            if envelope and envelope.reply == "required" and not misdirected:
                 decision = Decision(
                     True, "handoff", "reply: required",
                     channel_id=str(message.channel.id),
