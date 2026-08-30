@@ -1374,6 +1374,10 @@ class DiscordAdapter(discord.Client):
             # move `reply` already made for the wake/quiet decision.
             # Inbound-only for now — see context_box.py's module docstring
             # for the outbound (Marvin's own replies) gap that's still open.
+            # mirror_to (below, task-1788124679) generalizes the egress half
+            # of this: destination-parameterized instead of hardcoded
+            # #general, and triggerable without a context_box at all.
+            state_triggered_mirror = False
             if envelope and envelope.context_box:
                 cb = envelope.context_box
                 row = context_box.record(
@@ -1385,14 +1389,41 @@ class DiscordAdapter(discord.Client):
                     channel=channel_name or str(message.channel.id),
                 )
                 if context_box.should_mirror(cb.state):
+                    state_triggered_mirror = True
+                    # mirror_to (2026-08-30) overrides the destination when
+                    # present; absent, this keeps the original #general
+                    # default -- every envelope written before mirror_to
+                    # existed still lands exactly where it always has.
+                    destination = envelope.mirror_to or "general"
                     add_pending(
-                        "general",
+                        destination,
                         context_box.render_mirror_line(envelope.subject or "(no subject)", row),
                     )
                     log.info(
                         f"[context_box] {channel_name} subject={envelope.subject!r} "
-                        f"state={cb.state} -> mirrored to #general"
+                        f"state={cb.state} -> mirrored to #{destination}"
                     )
+
+            # Generalized envelope egress (2026-08-30, task-1788124679):
+            # mirror_to alone -- no triggering context_box required --
+            # lets a sender request a mirror for ANY kind of message, to
+            # any configured channel. Deliberately a separate mechanism
+            # from context_box's state-triggered board above, not a
+            # replacement (see handoff.py's mirror_to docstring for why).
+            # Skipped when the state-triggered path above already fired
+            # for this same envelope, so a context_box message with
+            # mirror_to set gets exactly one mirror, not two.
+            if envelope and envelope.mirror_to and not state_triggered_mirror:
+                add_pending(
+                    envelope.mirror_to,
+                    context_box.render_envelope_mirror_line(
+                        envelope, message.author.display_name, channel_name or str(message.channel.id),
+                    ),
+                )
+                log.info(
+                    f"[egress] {channel_name} kind={envelope.kind} "
+                    f"subject={envelope.subject!r} -> mirrored to #{envelope.mirror_to}"
+                )
 
             if envelope and envelope.reply == "none":
                 # Sender's declared intent still wins — silence stays free,

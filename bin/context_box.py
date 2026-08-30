@@ -118,6 +118,23 @@ def render_mirror_line(subject: str, row: dict) -> str:
     return " — ".join(bits)
 
 
+def render_envelope_mirror_line(envelope, sender: str, source_channel: str) -> str:
+    """One-line rendering for the generalized envelope-egress path
+    (`mirror_to`, added 2026-08-30 -- task-1788124679), used when a
+    message requests a mirror with no triggering `context_box` at all.
+    Deliberately separate from render_mirror_line() above: that one
+    renders a *board row* (state/blocked_on/waiting_on) for the
+    state-triggered mechanism; this one renders an *envelope* directly,
+    since a `mirror_to`-only message was never recorded on the board in
+    the first place -- there's no stalled-thread state to show, just "the
+    sender wanted this specific message seen here."""
+    subject = envelope.subject.strip() if envelope.subject and envelope.subject.strip() else "(no subject)"
+    return (
+        f"**{envelope.kind}** — `{subject}` "
+        f"(from {sender} in #{source_channel})"
+    )
+
+
 def render_board(open_only: bool = True) -> str:
     """Render the current board for /sys context. `open_only` (default)
     drops `resolved` rows — the board is meant to answer "what's stuck

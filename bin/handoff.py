@@ -165,6 +165,34 @@ wired into agent-server.py's `post_to_discord` (or a `context_box.record`
 call at compose time) before this is symmetric. Filed as a follow-up, not
 done yet — see `bin/context_box.py`'s module docstring.
 
+`mirror_to` — optional string, added 2026-08-30 (task-1788124679). Names a
+channel (`general`, `signals`, `staff-comms`, `agent-chat`, `lounge` — the
+same hand-maintained set `skills/outbox/scripts/queue_outbox_message.py`
+validates against, kept in sync by hand for the same reason that file's
+docstring gives) the sender wants this specific message mirrored to,
+independent of `context_box`. This is a deliberately separate mechanism
+from `context_box`'s state-triggered board above, not a replacement or a
+rename of it — `context_box` answers "is this thread stalled, and on
+whom" for messages that carry that field; `mirror_to` answers "the
+sender wants *this* message seen somewhere else," for any `kind`, with
+or without a `context_box` at all. Raised by Zero in #agent-chat
+2026-08-30 as "envelope-egress" during the engine-capability comparison;
+Marvin's in-thread reply that day noted the existing mechanism already
+covered the state-triggered half but hardcoded the destination to
+#general and had no path for a kind-only signal to request its own
+mirror — this field closes that second gap.
+
+Interaction with `context_box`: when a `context_box` state already
+triggers a mirror (`state in {blocked, waiting-human}`), a `mirror_to`
+present alongside it overrides the destination (default stays `general`
+when absent — existing behaviour for every envelope written before this
+field existed is unchanged). When there's no triggering `context_box` at
+all, `mirror_to` alone is sufficient to request a mirror of that message
+to the named channel — see `bin/context_box.py`'s
+`render_envelope_mirror_line()` and `bin/relay.py`'s wiring. An invalid
+channel name degrades to `None` (not stated), same fail-open rule as
+every other additive field here — never a parse failure.
+
 `reply_from` — optional string, added 2026-08-30. Ported from Amos's
 design (`bin/agent-chat-relay.py` ~L414-436) during the engine-capability
 comparison thread, after #agent-chat grew a third bot (Zero) and the
@@ -203,6 +231,13 @@ VALID_REPLY = {"required", "optional", "none"}
 VALID_KINDS = {"finding", "question", "answer", "handoff", "correction", "status"}
 VALID_CONFIDENCE = {"observed", "inferred", "reported"}
 VALID_CONTEXT_STATE = {"active", "blocked", "waiting-human", "resolved"}
+# Hand-maintained, kept in sync with config/channels.json and
+# skills/outbox/scripts/queue_outbox_message.py's own VALID_CHANNELS by
+# hand — same tradeoff that file's docstring documents: this is a small,
+# stable list, and parsing channels.json here would just trade a
+# hand-sync problem for a load-order dependency this module doesn't
+# otherwise have.
+VALID_MIRROR_CHANNELS = {"general", "signals", "staff-comms", "agent-chat", "lounge"}
 
 
 @dataclass(frozen=True)
@@ -231,6 +266,7 @@ class Envelope:
     id: Optional[str] = None  # sender-namespaced stable id, e.g. "marvin-2026-08-09-1"
     context_box: Optional[ContextBox] = None
     reply_from: Optional[str] = None  # who reply:required is aimed at; only meaningful when reply=="required"
+    mirror_to: Optional[str] = None  # channel this message wants mirrored to; independent of context_box
     raw: dict = field(default_factory=dict)
 
 
@@ -358,12 +394,22 @@ def parse_handoff(content: str) -> Optional[Envelope]:
                 f"— dropping context_box, envelope otherwise unaffected"
             )
 
+    # mirror_to: same degrade-don't-invalidate rule as the fields above --
+    # an unrecognized channel name is far more likely a typo than a new
+    # channel worth honouring silently (same reasoning VALID_KINDS/
+    # VALID_REPLY already apply, just not load-bearing enough here to
+    # warrant a drift-visibility log of its own).
+    mirror_to = data.get("mirror_to")
+    if mirror_to not in VALID_MIRROR_CHANNELS:
+        mirror_to = None
+
     return Envelope(
         v=v, kind=kind, reply=reply, subject=subject,
         evidence=evidence, supersedes=supersedes,
         confidence=confidence, stale_after=stale_after, id=env_id,
         context_box=context_box,
         reply_from=reply_from,
+        mirror_to=mirror_to,
         raw=data,
     )
 
@@ -611,6 +657,30 @@ def _selftest() -> int:
           required_but_misdirected(e_optional, "marvin"), False)
     check("no envelope at all -> not misdirected",
           required_but_misdirected(None, "marvin"), False)
+
+    # -- 2026-08-30 additive field: mirror_to --
+    for ch in ("general", "signals", "staff-comms", "agent-chat", "lounge"):
+        check(f"mirror_to={ch} accepted",
+              parse_handoff(
+                  f'```handoff\n{{"v":0,"kind":"status","reply":"none","mirror_to":"{ch}"}}\n```'
+              ).mirror_to,
+              ch)
+    check("missing mirror_to defaults to None", e3.mirror_to, None)
+    check("unrecognized mirror_to degrades to None, not a parse failure",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"status","reply":"none","mirror_to":"dm-mike"}\n```'
+          ).mirror_to,
+          None)
+    check("non-string mirror_to degrades to None",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"status","reply":"none","mirror_to":5}\n```'
+          ).mirror_to,
+          None)
+    check("mirror_to parses independent of context_box (no context_box needed)",
+          parse_handoff(
+              '```handoff\n{"v":0,"kind":"correction","reply":"none","mirror_to":"signals"}\n```'
+          ).mirror_to,
+          "signals")
 
     print("PASS  fails open on every malformed case" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0
