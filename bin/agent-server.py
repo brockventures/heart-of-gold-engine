@@ -203,6 +203,14 @@ RATE_LIMIT_HEARTBEAT_AUTHOR = "heartbeat"
 # 5 minutes: loose enough that a normal fast multi-message exchange never
 # trips it, tight enough to catch a real pause/restart/outage gap.
 BACKLOG_GAP_THRESHOLD_SEC = 300
+# Entry-side mid-turn steering threshold (2026-08-30, Ian's design —
+# see the injection point in process_agent_queue). Short on purpose:
+# this is "is the message I'm about to answer already old by the time
+# I've picked it up," not the backlog callout's "was there a real gap" —
+# ordinary queue/processing lag should almost never trip it, so 30s
+# catches "busy elsewhere / just resumed" without firing on routine
+# turnaround time.
+ENTRY_STALE_THRESHOLD_SEC = 30
 # How often rate_limit_gate_sweep_loop retries a paused agent's queue.
 # process_agent_queue() is otherwise only triggered reactively (a new
 # message arrives, or another channel is left queued after a drain) —
@@ -1911,6 +1919,50 @@ async def get_latest_channel_message_id(agent: str, channel_id: str) -> Optional
         log.debug(f"[stale-gate] snapshot fetch error for channel {channel_id}: {e}")
     return None
 
+async def get_recent_channel_messages(
+    agent: str, channel_id: str, after_id: Optional[str] = None, limit: int = 10
+) -> List[Dict]:
+    """Fetch real messages from a channel via the Discord REST API,
+    oldest-first — read-only, best-effort, empty list on any failure.
+
+    Entry-side half of mid-turn steering (2026-08-30, Ian's design,
+    #agent-chat/#general 2026-08-29/30): when the message a turn is about
+    to answer is already old by the time we pick it up (busy elsewhere,
+    a pause, a restart), this pulls whatever's landed in the channel
+    since — from any author, not just what made it into this agent's own
+    message_queue — so the draft starts from current reality instead of
+    a stale snapshot. `after_id` is the newest message_id already in this
+    turn's own batch; Discord's `after` param excludes it and everything
+    older, so the result is exactly the gap. Discord returns newest-first
+    regardless of before/after/around; reversed here so callers can just
+    iterate in reading order.
+    """
+    global http_session
+    if channel_id == "0":
+        return []
+    token = AGENT_TOKENS.get(agent)
+    if not token and AGENT_TOKENS:
+        token = list(AGENT_TOKENS.values())[0]
+    if not token:
+        return []
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {"Authorization": f"Bot {token}"}
+    params: Dict[str, Any] = {"limit": limit}
+    if after_id:
+        params["after"] = after_id
+    try:
+        async with http_session.get(url, headers=headers, params=params) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return list(reversed(data))
+            log.debug(
+                f"[entry-stale-check] recent-messages fetch failed "
+                f"({resp.status}) for channel {channel_id}"
+            )
+    except Exception as e:
+        log.debug(f"[entry-stale-check] recent-messages fetch error for channel {channel_id}: {e}")
+    return []
+
 async def start_typing(agent: str, channel_id: str):
     """Start typing indicator in Discord channel"""
     if channel_id == "0" or channel_id in typing_tasks:
@@ -2747,6 +2799,51 @@ async def process_agent_queue(agent: str):
             if attachment_lines:
                 part = f"{part}\n{attachment_lines}"
             formatted_parts.append(part)
+
+        # Mid-turn steering, entry-side check (2026-08-30, Ian's design —
+        # #general 2026-08-29/30, 30s threshold agreed live). Companion to
+        # the exit-side snapshot below: this one asks "is the message I'm
+        # about to answer already stale by the time I've picked it up" —
+        # busy in another channel, a rate-limit pause, a restart — rather
+        # than "did the channel move while I was thinking." Only meaningful
+        # for real Discord channels with real snowflake message_ids (the
+        # dashboard's silent chat has neither); `after_id` on the fetch
+        # means only messages genuinely newer than this batch's own newest
+        # come back, so nothing already shown above gets duplicated.
+        if messages[-1]["server"] == "discord" and channel_id != "0":
+            try:
+                newest_created = datetime.strptime(
+                    messages[-1]["created_at"], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                trigger_age = (datetime.now(timezone.utc) - newest_created).total_seconds()
+            except (TypeError, ValueError):
+                trigger_age = None
+
+            if trigger_age is not None and trigger_age > ENTRY_STALE_THRESHOLD_SEC:
+                newest_message_id = messages[-1]["message_id"]
+                recent = await get_recent_channel_messages(
+                    agent, channel_id, after_id=newest_message_id
+                )
+                if recent:
+                    log.info(
+                        f"[entry-stale-check] {agent}: trigger message in "
+                        f"{channel_label} is {trigger_age:.0f}s old, found "
+                        f"{len(recent)} newer message(s) live — injecting "
+                        f"as context"
+                    )
+                    recent_lines = [
+                        f"[{m.get('timestamp', '')}] "
+                        f"{(m.get('author') or {}).get('username', 'unknown')}: "
+                        f"{m.get('content', '')}"
+                        for m in recent
+                    ]
+                    formatted_parts.append(
+                        f"[Entry stale-check: the message above that triggered "
+                        f"this turn is {trigger_age:.0f}s old — {len(recent)} "
+                        f"more message(s) have landed live in {channel_label} "
+                        f"since then, fetched fresh rather than relying on a "
+                        f"stale snapshot:]\n" + "\n\n".join(recent_lines)
+                    )
 
         formatted_content = "\n\n".join(formatted_parts)
 
