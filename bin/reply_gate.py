@@ -68,6 +68,30 @@ class GateMessage:
     mentions_role: bool = False
 
 
+def is_content_free(content: str) -> bool:
+    """True for a message too short or empty to plausibly need a full turn:
+    nothing at all, or a single word with no '?' -- a lone reaction ("lol",
+    "nice", "same"), a bare emoji, a stray punctuation mark. Checked BEFORE
+    a Tier 2 decision is handed to the caller for scoring, unlike relay.py's
+    _substance_floor(), which only runs as a post-hoc fallback after the
+    scorer has already failed -- so this saves the live model call outright
+    instead of just covering for a dead one. Amos's side does the same
+    pre-filter; found missing here during the 2026-08-30 engine-capability
+    comparison.
+
+    Deliberately narrow, same bias as the rest of this module: a '?' or
+    more than one word opts back into real scoring rather than being
+    declared trivial. Skipping a scorer call that should have run is not
+    recoverable the way running an unnecessary one is.
+    """
+    content = (content or "").strip()
+    if not content:
+        return True
+    if "?" in content:
+        return False
+    return len(content.split()) <= 1
+
+
 @dataclass(frozen=True)
 class Decision:
     wake: bool
@@ -141,6 +165,12 @@ class ReplyGate:
         if remaining > 0:
             return Decision(
                 False, "cooldown", f"{int(remaining)}s left",
+                named=named, channel_id=msg.channel_id,
+            )
+
+        if is_content_free(msg.content):
+            return Decision(
+                False, "tier2-trivial", "content-free, scorer skipped",
                 named=named, channel_id=msg.channel_id,
             )
 
@@ -275,8 +305,8 @@ def _selftest() -> int:
     check("attention marker wakes without a real @mention",
           g_marker.evaluate(M(content="\U0001F4E8 marvin, need this today")).wake, True)
     check("attention marker ignores the cooldown, like @mention",
-          g_marker.evaluate(M(content="ambient")).needs_score, True)
-    g_marker.resolve(g_marker.evaluate(M(content="ambient")), 0.9)  # start a cooldown
+          g_marker.evaluate(M(content="ambient chatter")).needs_score, True)
+    g_marker.resolve(g_marker.evaluate(M(content="ambient chatter")), 0.9)  # start a cooldown
     check("marker still wakes during an active cooldown",
           g_marker.evaluate(M(content="\U0001F4E8 urgent")).wake, True)
     check("no marker configured means plain prose never force-wakes",
@@ -286,7 +316,7 @@ def _selftest() -> int:
     check("cooldown is per-channel", d4.needs_score, True)
 
     t["now"] += 301
-    check("cooldown expires", g.evaluate(M(content="later")).needs_score, True)
+    check("cooldown expires", g.evaluate(M(content="later today")).needs_score, True)
 
     # -- 2026-08-09: scorer-failure fallback must not collapse to 0.0 --
     d5 = g.evaluate(M(content="scorer will fail on this one"))
@@ -301,6 +331,23 @@ def _selftest() -> int:
     check("score=None with fallback=False stays quiet", r6.wake, False)
     check("score=None fallback=False does NOT start a cooldown",
           g.evaluate(M(content="right after")).needs_score, True)
+
+    # -- 2026-08-30: pre-scorer content filter, no live model call spent --
+    t["now"] += 301
+    check("empty content is trivial, scorer skipped",
+          g.evaluate(M(content="")).needs_score, False)
+    check("empty content declines", g.evaluate(M(content="")).wake, False)
+    d7 = g.evaluate(M(content="lol"))
+    check("single reaction word is trivial, scorer skipped", d7.needs_score, False)
+    check("single reaction word tier is tier2-trivial", d7.tier, "tier2-trivial")
+    check("bare emoji is trivial, scorer skipped",
+          g.evaluate(M(content="\U0001F44D")).needs_score, False)
+    check("a trivial decline does not start a cooldown",
+          g.evaluate(M(content="right after that")).needs_score, True)
+    check("single word WITH '?' still goes to the scorer",
+          g.evaluate(M(content="really?")).needs_score, True)
+    check("two ordinary words still go to the scorer",
+          g.evaluate(M(content="thanks Marvin")).needs_score, True)
 
     print("PASS  the gate declines when it should" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0
