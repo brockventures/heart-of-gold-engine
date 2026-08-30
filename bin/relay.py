@@ -21,6 +21,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
@@ -508,14 +509,21 @@ class DiscordAdapter(discord.Client):
                 _INFLIGHT_COUNT -= 1
 
         @self.tree.command(name="halt", description="Interrupt the current in-flight turn — session and subprocess stay alive")
-        @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
-        async def halt_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
+        @discord.app_commands.describe(
+            agent="Target agent (default: the channel's owning agent)",
+            message="Optional instruction to queue as the next turn once the halt lands",
+        )
+        async def halt_cmd(interaction: discord.Interaction, agent: Optional[str] = None, message: Optional[str] = None):
             global _INFLIGHT_COUNT
             _INFLIGHT_COUNT += 1
             try:
                 if not await _owner_check(interaction):
                     return
-                reply = await adapter._run_sys_command("halt", agent or _default_agent())
+                extra_args = [message] if message else []
+                reply = await adapter._run_sys_command(
+                    "halt", agent or _default_agent(), extra_args, str(interaction.user),
+                    channel=interaction.channel,
+                )
                 await interaction.response.send_message(reply)
             finally:
                 _INFLIGHT_COUNT -= 1
@@ -937,8 +945,52 @@ class DiscordAdapter(discord.Client):
                     f"{AGENT_SERVER_URL}/agents/{agent}/interrupt", headers=headers
                 ) as resp:
                     ok = resp.status == 200
+
+                # 2026-08-30, follow-up: "halt, and here's what to do
+                # instead" in one command. Deliberately NOT a special-cased
+                # send — the interrupted turn still holds agent_locks[agent]
+                # until its own result event lands and the state flips back
+                # to IDLE (interrupt_agent() skips that lock on purpose, see
+                # its docstring), so a direct send_to_agent() here would race
+                # the still-finishing turn. Queuing through POST /message —
+                # the exact path a normal Discord message takes — sidesteps
+                # that entirely: it lands in message_queue and gets drained
+                # by process_agent_queue's own self-continuation pass the
+                # moment the interrupted turn actually clears, same as any
+                # message that arrived while the agent was busy. Reuses
+                # _post_to_agent_server/_spool_deferred_poke so a follow-up
+                # gets the same never-drop guarantee a live message does.
+                follow_up = " ".join(extra_args).strip() if extra_args else ""
+                queued_note = ""
+                if ok and follow_up:
+                    channel_id = str(channel.id) if channel is not None else "0"
+                    channel_name = (
+                        self.get_channel_name(channel_id)
+                        or getattr(channel, "name", None)
+                        or "unknown"
+                    )
+                    payload = {
+                        "agent": agent,
+                        "channel": channel_name,
+                        "channel_id": channel_id,
+                        "server": "discord",
+                        "author": author,
+                        "author_id": str(OWNER_DISCORD_ID),
+                        "is_bot": False,
+                        "content": follow_up,
+                        "message_id": f"halt-followup-{uuid.uuid4()}",
+                        "mentions_agent": True,
+                    }
+                    queued_ok, detail = await self._post_to_agent_server(payload)
+                    if queued_ok:
+                        queued_note = " — follow-up queued for the moment the interrupted turn clears"
+                    else:
+                        self._spool_deferred_poke(payload, detail)
+                        queued_note = f" — follow-up spooled for retry (agent-server said: {detail})"
+
                 return (f"**/sys halt** `{agent}`: "
-                        f"{'sent — current turn interrupted, session intact' if ok else f'failed ({resp.status})'}")
+                        f"{'sent — current turn interrupted, session intact' if ok else f'failed ({resp.status})'}"
+                        f"{queued_note}")
 
             if cmd == "override":
                 # /sys override <agent> <minutes> [reason...] — owner-set,
