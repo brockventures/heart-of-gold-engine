@@ -415,7 +415,7 @@ class DiscordAdapter(discord.Client):
         # CommandTree is the better call for us: officially supported,
         # handles registration and interaction dispatch itself, one less
         # hand-rolled REST surface to get subtly wrong. Registers
-        # status/usage/context/clear/reload/compact/override/override-clear
+        # status/usage/context/clear/reload/halt/compact/override/override-clear
         # — every /sys command with a real handler. Amos's explicit warning, taken
         # seriously: a command that registers cleanly and has no matching
         # branch silently does nothing when clicked, nothing errors
@@ -503,6 +503,19 @@ class DiscordAdapter(discord.Client):
                 if not await _owner_check(interaction):
                     return
                 reply = await adapter._run_sys_command("reload", agent or _default_agent())
+                await interaction.response.send_message(reply)
+            finally:
+                _INFLIGHT_COUNT -= 1
+
+        @self.tree.command(name="halt", description="Interrupt the current in-flight turn — session and subprocess stay alive")
+        @discord.app_commands.describe(agent="Target agent (default: the channel's owning agent)")
+        async def halt_cmd(interaction: discord.Interaction, agent: Optional[str] = None):
+            global _INFLIGHT_COUNT
+            _INFLIGHT_COUNT += 1
+            try:
+                if not await _owner_check(interaction):
+                    return
+                reply = await adapter._run_sys_command("halt", agent or _default_agent())
                 await interaction.response.send_message(reply)
             finally:
                 _INFLIGHT_COUNT -= 1
@@ -911,6 +924,22 @@ class DiscordAdapter(discord.Client):
                 return (f"**/sys reload** `{agent}`: "
                         f"{'done — session preserved' if ok else f'failed ({resp.status})'}")
 
+            if cmd == "halt":
+                # 2026-08-30, Ian's ask: a Discord-native equivalent of the
+                # CLI's own interrupt, for "I need you to STOP on this
+                # specific thing" — distinct from reload/clear, which bounce
+                # the whole subprocess. Verified live against the real CLI:
+                # sends a stream-json control_request over stdin, gets a
+                # control_response ack, and the in-flight turn actually
+                # stops without killing the process or losing the session.
+                # See interrupt_agent() in agent-server.py for the capture.
+                async with self.http_session.post(
+                    f"{AGENT_SERVER_URL}/agents/{agent}/interrupt", headers=headers
+                ) as resp:
+                    ok = resp.status == 200
+                return (f"**/sys halt** `{agent}`: "
+                        f"{'sent — current turn interrupted, session intact' if ok else f'failed ({resp.status})'}")
+
             if cmd == "override":
                 # /sys override <agent> <minutes> [reason...] — owner-set,
                 # auto-expiring bypass of is_rate_limit_paused() for one
@@ -964,7 +993,7 @@ class DiscordAdapter(discord.Client):
                         f"{'cleared' if had_one else 'no active override'}")
 
             return (f"Unknown /sys command: `{cmd}`. Known: status, clear, "
-                    f"reload, compact, usage, override, override-clear, "
+                    f"reload, halt, compact, usage, override, override-clear, "
                     f"restart-server, context")
         except Exception as e:
             return f"**/sys {cmd}** failed: {e}"

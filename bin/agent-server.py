@@ -1705,6 +1705,51 @@ async def restart_agent(agent: str):
         await start_agent_subprocess(agent)
 
 
+async def interrupt_agent(agent: str) -> Dict[str, Any]:
+    """Send a stream-json `control_request`/"interrupt" to the agent's live
+    subprocess over stdin (2026-08-30, Ian's ask: a Discord-native "HALT"
+    command mirroring the CLI's own interrupt). Verified live against the
+    real Claude CLI, not from docs alone: it acks with a `control_response`
+    (subtype "success", echoing request_id, `response.still_queued` listing
+    any queued messages it dropped), actually stops the in-flight turn,
+    injects a synthetic user turn ("[Request interrupted by user]"), and
+    closes with a `result` event (`is_error: true`, `stop_reason: null`,
+    subtype `error_during_execution`) — all without killing the process or
+    losing the session. read_agent_response()'s main loop already ignores
+    unrecognized event types and handles an `is_error` result without
+    special-casing it, so no changes were needed there.
+
+    Deliberately does NOT take agent_locks[agent], unlike restart_agent()/
+    reload_agent() above. Those two are fine waiting for a lock, because
+    they're bouncing the subprocess between turns. This is the opposite
+    case — the whole point is to interrupt a turn that is, right now,
+    holding that lock — so waiting for it first would defeat the command
+    entirely, the same "must work even if the agent is wedged" requirement
+    the /sys status/clear/reload commands are already built to satisfy.
+    Writing unlocked is safe because proc.stdin.write() is a plain
+    synchronous call, not a coroutine — on a single-threaded event loop it
+    can't interleave mid-call with whatever the turn's own send_to_agent()
+    is writing, only ever land fully before or fully after it.
+    """
+    proc = agent_processes.get(agent)
+    if not proc or not proc.stdin:
+        return {"ok": False, "error": "no subprocess"}
+    request_id = str(uuid.uuid4())
+    msg = json.dumps({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {"subtype": "interrupt"},
+    }) + "\n"
+    try:
+        proc.stdin.write(msg.encode())
+        await proc.stdin.drain()
+        log.info(f"Sent interrupt control_request to {agent} (request_id={request_id})")
+        return {"ok": True, "request_id": request_id}
+    except Exception as e:
+        log.error(f"Error sending interrupt to {agent}: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 async def reload_agent(agent: str):
     """Bounce the subprocess but keep the session — used to pick up new
     SYSTEM_PROMPT / persona / MCP config without dropping conversation
@@ -3564,6 +3609,28 @@ async def handle_agent_compact(request):
     return web.json_response({"status": "compacted"})
 
 
+async def handle_agent_interrupt(request):
+    """POST /agents/{name}/interrupt - Halt the current in-flight turn via
+    the CLI's own stream-json control_request protocol, without killing the
+    subprocess or losing the session. See interrupt_agent() for what's
+    actually verified to happen. A 200 here means the interrupt request was
+    written to stdin, not that a turn was necessarily in progress to
+    interrupt — the CLI acks unconditionally (see live capture); an idle
+    subprocess has nothing to stop and just no-ops."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if agent not in agent_config:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    result = await interrupt_agent(agent)
+    if not result.get("ok"):
+        return web.json_response({"status": "failed", "error": result.get("error")}, status=500)
+    return web.json_response({"status": "interrupted", "request_id": result.get("request_id")})
+
+
 async def handle_rate_limit_override_set(request):
     """POST /agents/{name}/rate-limit-override - Owner-set, auto-expiring
     bypass of is_rate_limit_paused() (2026-08-10). Body:
@@ -3947,6 +4014,7 @@ def main():
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
     app.router.add_post("/agents/{name}/reload", handle_agent_reload)
     app.router.add_post("/agents/{name}/compact", handle_agent_compact)
+    app.router.add_post("/agents/{name}/interrupt", handle_agent_interrupt)
     app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/agents/{name}/rate-limit-override", handle_rate_limit_override_set)
     app.router.add_post("/agents/{name}/rate-limit-override/clear", handle_rate_limit_override_clear)
