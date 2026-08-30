@@ -621,28 +621,108 @@ async def init_db():
 # Configuration Loading
 # =============================================================================
 
+def _validate_agents_config(data: Any) -> Optional[str]:
+    """Return None if `data` (parsed agents.json) looks structurally sound,
+    else a short human-readable reason it doesn't."""
+    if not isinstance(data, dict):
+        return "not a JSON object"
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        return "'agents' key missing or not an object"
+    for name, cfg in agents.items():
+        if not isinstance(cfg, dict):
+            return f"agents.{name} is not an object"
+    return None
+
+
+def _validate_channels_config(data: Any) -> Optional[str]:
+    """Return None if `data` (parsed channels.json) looks structurally
+    sound, else a short human-readable reason it doesn't."""
+    if not isinstance(data, dict):
+        return "not a JSON object"
+    channels = data.get("channels")
+    if not isinstance(channels, dict):
+        return "'channels' key missing or not an object"
+    for name, cfg in channels.items():
+        if not isinstance(cfg, dict) or "id" not in cfg:
+            return f"channels.{name} missing required 'id' field"
+    return None
+
+
+async def _load_validated_config(path: Path, label: str, validator) -> Optional[dict]:
+    """Load+parse+validate one config JSON file. Returns the parsed dict
+    on success, or None on any failure (missing file, bad JSON, failed
+    schema check) — callers keep whatever they already had in memory in
+    that case instead of overwriting a working config with garbage, or
+    letting a JSONDecodeError propagate out of load_config() and take
+    down startup() (cold boot) or the /agents/{name}/register hot-reload
+    path over a single bad edit.
+
+    Failures alert #signals rather than just logging: a routing/agent
+    roster change that silently didn't take effect is exactly the kind
+    of thing that needs a human, not a line in a log nobody's tailing.
+
+    Modeled on Aerial's git_sync last-known-good-config fallback
+    (azylman/aerial, surfaced 2026-08-30 via task-1788075644) — this is
+    the cheap, no-repo-surgery slice of that pattern: config validation
+    with an LKGC fallback, independent of whether the full generic-
+    engine/instance-config repo split ever happens.
+    """
+    if not path.exists():
+        log.warning(f"{label} not found: {path}")
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.error(f"{label} failed to load ({e}) — keeping last-known-good config")
+        add_pending(
+            "signals",
+            f"⚠️ `{label}` failed to parse ({e}) — agent-server kept the "
+            f"last-known-good config in memory instead of applying this "
+            f"edit. Fix the file; it'll pick up on the next reload. "
+            f"<@{OWNER_DISCORD_ID}>",
+        )
+        return None
+    reason = validator(data)
+    if reason:
+        log.error(f"{label} failed validation ({reason}) — keeping last-known-good config")
+        add_pending(
+            "signals",
+            f"⚠️ `{label}` failed validation ({reason}) — agent-server kept "
+            f"the last-known-good config in memory instead of applying this "
+            f"edit. Fix the file; it'll pick up on the next reload. "
+            f"<@{OWNER_DISCORD_ID}>",
+        )
+        return None
+    return data
+
+
 async def load_config():
-    """Load agent and channel configuration from JSON files"""
+    """Load agent and channel configuration from JSON files, validating
+    each before applying it. See _load_validated_config for the LKGC
+    fallback behavior on a missing/malformed/invalid file."""
     global agent_config, channels_config, AGENT_TOKENS, DISCORD_ID_TO_AGENT
 
     # Load agents config
-    if AGENTS_CONFIG_PATH.exists():
-        with open(AGENTS_CONFIG_PATH) as f:
-            config_data = json.load(f)
-            agent_config = config_data.get("agents", {})
-            log.info(f"Loaded configuration for {len(agent_config)} agents")
-    else:
-        log.error(f"Agents config not found: {AGENTS_CONFIG_PATH}")
-        agent_config = {}
+    new_agents = await _load_validated_config(
+        AGENTS_CONFIG_PATH, "config/agents.json", _validate_agents_config
+    )
+    if new_agents is not None:
+        agent_config = new_agents.get("agents", {})
+        log.info(f"Loaded configuration for {len(agent_config)} agents")
+    elif not agent_config:
+        log.error(f"No usable agents config yet (no prior good config to fall back to): {AGENTS_CONFIG_PATH}")
 
     # Load channels config
-    if CHANNELS_CONFIG_PATH.exists():
-        with open(CHANNELS_CONFIG_PATH) as f:
-            channels_config = json.load(f)
-            log.info(f"Loaded {len(channels_config.get('channels', {}))} channel mappings")
-    else:
-        log.warning(f"Channels config not found: {CHANNELS_CONFIG_PATH}")
-        channels_config = {}
+    new_channels = await _load_validated_config(
+        CHANNELS_CONFIG_PATH, "config/channels.json", _validate_channels_config
+    )
+    if new_channels is not None:
+        channels_config = new_channels
+        log.info(f"Loaded {len(channels_config.get('channels', {}))} channel mappings")
+    elif not channels_config:
+        log.warning(f"No usable channels config yet (no prior good config to fall back to): {CHANNELS_CONFIG_PATH}")
 
     # Build Discord token map
     for agent_name, config in agent_config.items():
