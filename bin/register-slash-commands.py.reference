@@ -29,8 +29,8 @@ from pathlib import Path
 import requests
 
 WORKSPACE = Path(__file__).resolve().parent.parent
-APP_ID = "000000000000000000"       # Amos bot application
-GUILD_ID = "000000000000000000"     # Karakos
+APP_ID = "000000000000000000"        # this bot's application ID
+GUILD_ID = "000000000000000000"      # target guild ID
 API = "https://discord.com/api/v10"
 
 STRING, INTEGER = 3, 4
