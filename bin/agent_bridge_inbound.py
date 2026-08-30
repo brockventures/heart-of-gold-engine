@@ -56,12 +56,15 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-HOST = "127.0.0.1"  # tailscale0 only — was 127.0.0.1 behind the Cloudflare
+HOST = os.environ.get("AGENT_BRIDGE_HOST", "127.0.0.1")  # tailscale-interface
+# IP for this install, not 127.0.0.1/0.0.0.0 — was 127.0.0.1 behind a Cloudflare
 # tunnel, which did the public exposure; now that tailnet is the transport
 # (2026-08-28, Cloudflare tunnel decommissioned), this has to be reachable
 # from off-box. Bound to the tailscale interface specifically, not 0.0.0.0 —
 # same minimal-exposure principle as the original design, just a different
 # interface. Matches the fix Amos made on his own receiver the same night.
+# Real value lives in config/.env (AGENT_BRIDGE_HOST) — instance-specific,
+# never committed. The 127.0.0.1 default here is inert until set.
 PORT = 8787
 MAX_BODY_BYTES = 32_768  # handoff envelopes are small by design (~450 tokens
 # was the longest real one seen — see handoff.py's docstring); this is

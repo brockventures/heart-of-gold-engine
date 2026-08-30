@@ -1,7 +1,7 @@
 # Calendar Skill
 
-Read-only access to Ian's personal and work calendars via their ICS feed
-URLs. No write path exists on either feed — both are view-only exports.
+Read-only access to the owner's personal and work calendars via their ICS
+feed URLs. No write path exists on either feed — both are view-only exports.
 
 ## What It Does
 
