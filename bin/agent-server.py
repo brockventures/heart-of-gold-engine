@@ -1875,6 +1875,42 @@ async def post_to_discord(agent: str, channel_id: str, content: str, reply_to: O
 
     return last_msg_id
 
+async def get_latest_channel_message_id(agent: str, channel_id: str) -> Optional[str]:
+    """Fetch the most recent message ID in a channel via the Discord REST
+    API — read-only, best-effort. Used for mid-turn steering, Phase 1
+    (2026-08-30, task-1788046725 follow-on): checks whether *anything*
+    landed in the channel while a turn was generating, not just messages
+    that made it into this agent's own message_queue (which reply-gating
+    can skip entirely — see the Amos-adoption-commit race in #agent-chat
+    2026-08-29 that started this thread). Returns None on any failure
+    rather than raising; this is instrumentation, never something that
+    should affect whether a turn completes or posts.
+    """
+    global http_session
+    if channel_id == "0":
+        return None
+    token = AGENT_TOKENS.get(agent)
+    if not token and AGENT_TOKENS:
+        token = list(AGENT_TOKENS.values())[0]
+    if not token:
+        return None
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {"Authorization": f"Bot {token}"}
+    try:
+        async with http_session.get(url, headers=headers, params={"limit": 1}) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data:
+                    return data[0].get("id")
+            else:
+                log.debug(
+                    f"[stale-gate] snapshot fetch failed ({resp.status}) "
+                    f"for channel {channel_id}"
+                )
+    except Exception as e:
+        log.debug(f"[stale-gate] snapshot fetch error for channel {channel_id}: {e}")
+    return None
+
 async def start_typing(agent: str, channel_id: str):
     """Start typing indicator in Discord channel"""
     if channel_id == "0" or channel_id in typing_tasks:
@@ -2714,6 +2750,22 @@ async def process_agent_queue(agent: str):
 
         formatted_content = "\n\n".join(formatted_parts)
 
+        # Mid-turn steering, Phase 1 — instrumentation only (2026-08-30,
+        # following Crab Cavern's Pre-Flight Stale Gate design from Zero;
+        # see #agent-chat 2026-08-29/30). Snapshot the channel's actual
+        # last message ID via the Discord REST API — not just this
+        # agent's own message_queue, which reply-gating can skip
+        # entirely — right before generation starts, so staleness can be
+        # detected afterward regardless of who spoke or whether it was
+        # ever queued for us. Deliberately NOT wired to abort, edit, or
+        # re-steer the draft yet: this exact hot path has a real history
+        # of subtle races (the 2000-char silent drop, the asyncio
+        # fire-and-forget GC bug, the reload-hook self-kill), so before
+        # anything auto-cancels a turn's output, this logs how often
+        # staleness actually happens. See the check after read_agent_
+        # response below for Phase 2 notes.
+        preflight_snapshot_id = await get_latest_channel_message_id(agent, channel_id)
+
         # Start typing indicator
         await start_typing(agent, channel_id)
 
@@ -2758,6 +2810,34 @@ async def process_agent_queue(agent: str):
 
             # Stop typing
             await stop_typing(channel_id)
+
+            # Mid-turn steering, Phase 1 continued: compare against the
+            # snapshot taken before generation started. Snowflake IDs
+            # sort numerically, so a plain int comparison tells us
+            # something genuinely new landed (not just a different-but-
+            # equally-stale ID from a fetch race). Log only — Phase 2
+            # (actually discarding/re-steering a stale draft) is a
+            # separate, deliberately un-rushed follow-up; see the
+            # snapshot comment above for why this stays observe-only for
+            # now. metadata check mirrors the spend-cap block above: only
+            # meaningful for a turn that actually completed.
+            if metadata and preflight_snapshot_id:
+                post_snapshot_id = await get_latest_channel_message_id(agent, channel_id)
+                try:
+                    moved = (
+                        post_snapshot_id is not None
+                        and int(post_snapshot_id) > int(preflight_snapshot_id)
+                    )
+                except (TypeError, ValueError):
+                    moved = False
+                if moved:
+                    log.warning(
+                        f"[stale-gate] {agent}: {channel_label} moved during "
+                        f"generation (snapshot {preflight_snapshot_id} -> "
+                        f"{post_snapshot_id}). Posting the draft as-is — "
+                        f"Phase 1 is detect-and-log only, no auto-abort or "
+                        f"re-steer yet."
+                    )
 
             # Post cost update
             if metadata:
