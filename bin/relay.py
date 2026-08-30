@@ -274,6 +274,25 @@ if not log.handlers:
     console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     log.addHandler(console)
 
+    # Modules relay.py imports and calls in-process (handoff, banana) each
+    # define their own named logger (logging.getLogger(__name__) /
+    # getLogger("banana")) but were never wired to a handler -- same class
+    # of bug DISCORD_SERVER_ID_FIX.md already diagnosed once for discord.py's
+    # own logger: with no handler anywhere in the chain, messages don't
+    # error, they just vanish. Confirmed live 2026-08-30: a real
+    # "unrecognized context_box.state" warning from handoff.py never
+    # reached relay.log, only turned up in the raw systemd journal (a
+    # logging.Handler-of-last-resort artifact, not a real log destination
+    # anyone watches). Wiring both into the same handlers "relay" already
+    # uses, rather than a separate file, keeps one log to check instead of
+    # a growing list of module-specific ones.
+    for _extra_logger_name in ("handoff", "banana"):
+        _extra_log = logging.getLogger(_extra_logger_name)
+        _extra_log.setLevel(logging.INFO)
+        if not _extra_log.handlers:
+            _extra_log.addHandler(handler)
+            _extra_log.addHandler(console)
+
 # Singleton-instance guard (2026-08-07) — added after the 08:02-08:05
 # duplicate-process incident: a rogue duplicate supervisord launched a
 # second copy of this process alongside the real one. relay.py doesn't
