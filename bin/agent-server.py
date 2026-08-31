@@ -3173,10 +3173,30 @@ async def process_agent_queue(agent: str):
             # different agent identity (e.g. "relay") claiming via my token
             # would be misrepresenting who actually holds the floor, so that
             # case stays on the old local-only claim() instead.
+            # Interim widening (2026-08-31, task-1788204155, Ian's "easy fix
+            # while the hard fix is worked out"): starts_with_claim() alone
+            # keys off literal leading-emoji text, so a substantive reply
+            # with no 🍌 prefix — plain prose, which is most of what Marvin
+            # actually sends — never claims, even mid a long multi-round
+            # exchange. This does NOT touch the shared v0 envelope schema
+            # (no new field, nothing Amos/Zero need to agree on) — it only
+            # broadens *my own* local trigger for calling the claim I
+            # already had authority to call, using the `reply` semantics
+            # already in the envelope today. Purely additive: claim() is
+            # watch-first and never blocks (see speaking_banana.py docstring),
+            # so a false-positive claim here costs nothing but a log line.
+            # Still doesn't catch a substantive reply with no handoff
+            # envelope at all — that's a habit fix, not a code one, and the
+            # real round-governor/structural work stays pending the RFC.
+            _handoff_envelope = parse_handoff(response_text) if response_text else None
+            _structural_claim = (
+                _handoff_envelope is not None
+                and _handoff_envelope.reply in ("required", "optional")
+            )
             if (
                 channel_name
                 and response_text
-                and banana.starts_with_claim(response_text)
+                and (banana.starts_with_claim(response_text) or _structural_claim)
                 and banana.in_scope(channel_id, channels_config)
             ):
                 if agent == "Marvin":

@@ -228,7 +228,23 @@ log = logging.getLogger(__name__)
 _FENCE_RE = re.compile(r"```handoff\s*\n(.*?)\n```", re.DOTALL)
 
 VALID_REPLY = {"required", "optional", "none"}
-VALID_KINDS = {"finding", "question", "answer", "handoff", "correction", "status"}
+# 2026-08-31: added comment/proposal/consensus/summary — Zero (Ryan's bot)
+# and Amos have been sending these live in #agent-chat for at least a day
+# (companionship-thread + round-governor RFC), and every one of those
+# envelopes was silently failing open here: kind not in the old set ->
+# parse_handoff() returns None -> the sender's actual `reply` value never
+# reaches the gate below, same failure shape as the 2026-08-09 bug this
+# file's docstring already describes ("kind drives nothing on the gate,
+# but an unrecognized value still drops the whole envelope, including
+# `reply`, which does"). Found live during Ian's "easy fix while the hard
+# fix is worked out" push (task-1788204155) — this is that easy fix: a
+# stale local allow-list, not a wire-format change, so no cross-bot RFC
+# needed. "observation" and similar genuine typos still correctly fail
+# open (see _selftest below) — only known-real kinds got added.
+VALID_KINDS = {
+    "finding", "question", "answer", "handoff", "correction", "status",
+    "comment", "proposal", "consensus", "summary",
+}
 VALID_CONFIDENCE = {"observed", "inferred", "reported"}
 VALID_CONTEXT_STATE = {"active", "blocked", "waiting-human", "resolved"}
 # Hand-maintained, kept in sync with config/channels.json and
