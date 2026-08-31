@@ -2416,8 +2416,52 @@ async def read_agent_response(
                 break
 
             try:
-                event = json.loads(line.decode())
-            except json.JSONDecodeError:
+                decoded_line = line.decode()
+            except UnicodeDecodeError as e:
+                # Distinct from the JSONDecodeError case below: this is the
+                # raw bytes off the pipe failing to decode at all, not
+                # malformed JSON. Would otherwise propagate to the broad
+                # `except Exception` around the whole loop and silently
+                # abort reading the rest of this turn's stream (whatever
+                # had accumulated in final_text so far still gets
+                # returned, but everything after this line is lost with no
+                # trace). Logged here instead of relying on that outer
+                # catch, which never named what actually broke.
+                log.warning(
+                    f"{agent}: undecodable stdout line ({len(line)} bytes, "
+                    f"decode error: {e}) -- skipping"
+                )
+                continue
+
+            try:
+                event = json.loads(decoded_line)
+            except json.JSONDecodeError as e:
+                # task-1788135135 (2026-08-31): found completely silent --
+                # no log, no counter -- while chasing long single-turn
+                # replies losing whole interior sections before ever
+                # reaching Discord, with no delivery error anywhere
+                # (confirmed via #lounge history: content cut off mid-
+                # sentence and resumed at a non-adjacent section, not a
+                # simple end-truncation). Leading theory: stream-json is
+                # one JSON object per line, so if a single large `text`
+                # content block's write gets split across an unescaped
+                # newline somewhere upstream, this line and the
+                # continuation line that follows it both fail to parse --
+                # and previously both were dropped with zero trace while
+                # the loop kept going, silently erasing exactly one
+                # interior chunk from final_text. Not yet proven; this
+                # logs enough (length + head/tail snippet, never the full
+                # body, to avoid flooding logs on a bad line) to confirm
+                # or rule the theory out next time it fires, instead of
+                # guessing again.
+                snippet_len = 120
+                head = decoded_line[:snippet_len]
+                tail = decoded_line[-snippet_len:] if len(decoded_line) > snippet_len else ""
+                log.warning(
+                    f"{agent}: unparseable stream-json line "
+                    f"({len(decoded_line)} chars, error: {e}) -- skipping. "
+                    f"head={head!r} tail={tail!r}"
+                )
                 continue
 
             event_type = event.get("type")
