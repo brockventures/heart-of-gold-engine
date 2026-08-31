@@ -136,6 +136,23 @@ def run_memory_patterns():
     except subprocess.CalledProcessError as e:
         log.error(f"Memory patterns job failed: {e.stderr}")
 
+def run_memory_reflection():
+    """Track 2b (weekly dispatch, monthly-gated) of the curated memory
+    layer. See bin/memory-reflection.py — proposes fact-file drafts
+    from established patterns for human review; does not write
+    voice.md/MEMORY.md directly (v1, deliberately conservative)."""
+    log.info("Running memory reflection job")
+    try:
+        result = subprocess.run(
+            ["python3", f"{WORKSPACE_ROOT}/bin/memory-reflection.py"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        log.info(f"Memory reflection: {result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        log.error(f"Memory reflection job failed: {e.stderr}")
+
 def run_health_monitor():
     """Run health monitor"""
     log.info("Running health monitor")
@@ -241,6 +258,7 @@ def main():
     schedule.every().day.at("03:00").do(run_memory_maintenance)
     schedule.every().sunday.at("03:15").do(run_memory_dedup)     # Track 1b, weekly
     schedule.every().sunday.at("03:30").do(run_memory_patterns)  # Track 2, weekly
+    schedule.every().sunday.at("03:45").do(run_memory_reflection)  # Track 2b, monthly-gated
     schedule.every().day.at("03:46").do(run_friction_sensor)
     schedule.every().day.at("04:00").do(run_health_monitor)
     schedule.every().day.at("04:30").do(purge_old_data)

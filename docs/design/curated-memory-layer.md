@@ -142,8 +142,10 @@ trusting first-pass judgment.
   high-confidence facts back into the index automatically, which is the
   other half of closing the original Crab Cavern-shaped gap (a fact
   existing in a DB nobody reads doesn't help either).
-- Reflection (the only job allowed to touch `voice.md`/`MEMORY.md`
-  directly) is still not built — see Phasing below, deliberately last.
+- Reflection is built (see Phasing item 4) but deliberately does not
+  yet auto-write `voice.md`/`MEMORY.md` — v1 proposes fact-file drafts
+  for human review only. Auto-apply is a real, explicit follow-up, not
+  a silently-missing feature.
 
 ## Phasing
 
@@ -171,16 +173,25 @@ trusting first-pass judgment.
    the same embedding approach as Track 1b — real semantic matching for
    patterns is future work, not a blocker for evidence-gating to be
    correct today.
-4. **Reflection** — **not built.** Last on purpose, most sensitive, the
-   only job that would ever touch `voice.md` or `MEMORY.md` directly.
-   Gets the revert-button-not-approval-gate safeguard from day one
-   rather than retrofitted, per the ratified #agent-chat discussion —
-   an edit lands, is logged with its evidence chain, and stays revertable
-   async rather than gating on a synchronous human approval. Given the
-   standing, repeatedly-documented history of voice drifting flat under
-   load (see `facts/voice-flattened-immediately-after-recalibration-2026-08-28.md`
-   and its siblings), this is the piece most worth building carefully
-   and separately rather than folding into the same pass as Tracks 1/1b/2.
+4. **Reflection** — **Built 2026-08-31, v1 conservative**
+   (`bin/memory-reflection.py`, weekly dispatch / monthly-gated —
+   direct port of Amos's `DOW==7 && DOM<=07` guard). Only consumes
+   `patterns` rows that already reached `established` (3+
+   reinforcements) in Track 2 — it does not re-derive persona judgments
+   from raw episodes itself, Track 2 already spent that budget. v1
+   stops short of the full "revert button, not approval gate" model:
+   it writes a proposed fact-file draft to
+   `data/memory-candidates/reflection-YYYY-MM.md` for human review and
+   marks the pattern `reflected_at` so it isn't reprocessed, but does
+   **not** write `voice.md`/`MEMORY.md` directly (`PROPOSE_ONLY = True`
+   in the module). Given the standing, repeatedly-documented history of
+   voice drifting flat under load (see
+   `facts/voice-flattened-immediately-after-recalibration-2026-08-28.md`
+   and its siblings), auto-apply for this specific job is a real
+   follow-up that deserves a live-tested track record first, not a
+   design principle skipped for lack of time — the mechanism (gate,
+   evidence source, audit trail) is real and running; only the last
+   step (writing the file itself) is intentionally held back.
 
 Open item carried forward from the original fact, still unresolved and
 not blocking: whether "Mnemosyne" the name is deliberate reuse of the
