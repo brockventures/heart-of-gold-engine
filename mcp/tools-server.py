@@ -452,6 +452,23 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
                     tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
                     return {"task": task}
             return {"error": f"Task not found: {task_id}"}
+        elif action == "update":
+            task_id = args.get("id", "")
+            new_status = args.get("status")
+            if not task_id:
+                return {"error": "update requires 'id'"}
+            if not new_status:
+                return {"error": "update requires 'status'"}
+            for task in tasks:
+                if task["id"] == task_id:
+                    task["status"] = new_status
+                    task["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    if new_status == "done" and "completed_at" not in task:
+                        task["completed_at"] = task["updated_at"]
+                    tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
+                    return {"task": task}
+            return {"error": f"Task not found: {task_id}"}
+        return {"error": f"Unknown taskboard action: {action}"}
 
     elif tool_name == "vault":
         action = args.get("action", "status")

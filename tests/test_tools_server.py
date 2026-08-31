@@ -97,3 +97,62 @@ def test_skill_dir_with_neither_file_is_silently_ignored(tools_server, tmp_path,
 
     assert tools == []
     assert capsys.readouterr().err == ""
+
+
+class TestTaskboardUpdate:
+    """taskboard's 'update' action was advertised in the tool schema
+    (description + inputSchema enum) but never implemented in
+    handle_core_tool — any call fell through to the generic
+    'Unknown tool or action: taskboard' error, indistinguishable from
+    the tool itself being missing. Regression coverage for the fix."""
+
+    def _add_task(self, tools_server, title="a task"):
+        # taskboard's "add" doesn't mkdir data/ itself — it relies on the
+        # real WORKSPACE_ROOT already having one. Match that expectation
+        # here rather than papering over it in the tool.
+        (tools_server.WORKSPACE / "data").mkdir(parents=True, exist_ok=True)
+        result = tools_server.handle_core_tool("taskboard", {"action": "add", "title": title})
+        return result["task"]["id"]
+
+    def test_update_changes_status(self, tools_server):
+        task_id = self._add_task(tools_server)
+
+        result = tools_server.handle_core_tool(
+            "taskboard", {"action": "update", "id": task_id, "status": "in_progress"}
+        )
+
+        assert result["task"]["status"] == "in_progress"
+        assert "error" not in result
+
+        listed = tools_server.handle_core_tool("taskboard", {"action": "list"})
+        task = next(t for t in listed["tasks"] if t["id"] == task_id)
+        assert task["status"] == "in_progress"
+
+    def test_update_missing_id_is_an_error_not_a_crash(self, tools_server):
+        result = tools_server.handle_core_tool(
+            "taskboard", {"action": "update", "status": "in_progress"}
+        )
+        assert "error" in result
+
+    def test_update_missing_status_is_an_error_not_a_crash(self, tools_server):
+        task_id = self._add_task(tools_server)
+        result = tools_server.handle_core_tool(
+            "taskboard", {"action": "update", "id": task_id}
+        )
+        assert "error" in result
+
+    def test_update_unknown_task_id_reports_not_found(self, tools_server):
+        result = tools_server.handle_core_tool(
+            "taskboard", {"action": "update", "id": "task-doesnotexist", "status": "done"}
+        )
+        assert "error" in result
+        assert "task-doesnotexist" in result["error"]
+
+    def test_unknown_taskboard_action_names_the_action_not_the_tool(self, tools_server):
+        """The pre-fix fallback error ('Unknown tool or action: taskboard')
+        read as if the whole tool was missing. It should name the bad
+        action instead, scoped to the taskboard branch."""
+        result = tools_server.handle_core_tool("taskboard", {"action": "bogus"})
+        assert "error" in result
+        assert "taskboard" not in result["error"] or "bogus" in result["error"]
+        assert "bogus" in result["error"]
