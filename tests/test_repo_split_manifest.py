@@ -19,6 +19,16 @@ Two checks:
 
 Nothing here moves any files. See docs/design/repo-split-manifest.md for
 the reasoning behind each bucket.
+
+Both config/repo-split-manifest.json and config/channels.json are
+themselves classified "instance" (real per-install data) -- as of the
+Phase 3 split (task-1788078430, 2026-08-30) they no longer live in this
+(engine) repo at all. Locally they're symlinks into the sibling instance
+checkout; in a fresh clone (CI, or any other engine-only install) they
+simply don't exist. This whole module is a no-op skip in that case --
+the guardrail still has value on a machine with the instance repo
+checked out alongside, but it can't be a hard CI requirement for a repo
+that, by design, doesn't carry the data it's checking.
 """
 
 import json
@@ -31,6 +41,15 @@ from conftest import PACKAGE_ROOT
 
 MANIFEST_PATH = PACKAGE_ROOT / "config" / "repo-split-manifest.json"
 CHANNELS_PATH = PACKAGE_ROOT / "config" / "channels.json"
+
+if not (MANIFEST_PATH.exists() and CHANNELS_PATH.exists()):
+    pytest.skip(
+        "config/repo-split-manifest.json and/or config/channels.json not "
+        "present -- both are instance-classified and live outside this "
+        "engine repo post-split (task-1788078430); skipping the guardrail "
+        "rather than failing CI on data it will never have.",
+        allow_module_level=True,
+    )
 
 # Directories whose *contents* we don't expect to read as text (binary,
 # vendored, or otherwise noisy) when scanning for leaked IDs.
