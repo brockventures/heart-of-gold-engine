@@ -131,11 +131,6 @@ trusting first-pass judgment.
 
 ## What this deliberately does not do yet
 
-- No semantic dedup implementation (Amos's weekly "dedup" job) —
-  needs an embedding-similarity pass on top of what
-  `generate_embeddings()` already produces for episodes; same
-  mechanism could extend to `facts` rows, but that's an implementation
-  task for Phase 2, not a design blocker for Phase 1.
 - No cross-agent pattern sharing. Amos's `patterns` table is
   `agent`-scoped already in our schema too (see `agent TEXT NOT NULL`
   in `memory-maintenance.py`'s `init_db()`), so this is schema-ready
@@ -147,17 +142,45 @@ trusting first-pass judgment.
   high-confidence facts back into the index automatically, which is the
   other half of closing the original Crab Cavern-shaped gap (a fact
   existing in a DB nobody reads doesn't help either).
+- Reflection (the only job allowed to touch `voice.md`/`MEMORY.md`
+  directly) is still not built — see Phasing below, deliberately last.
 
 ## Phasing
 
 1. **Track 1 (facts/consolidation)** — smallest, lowest-risk, directly
-   fixes the proven gap. Build first.
-2. **Track 2 patterns job** — evidence-gating logic, reuse
-   friction-sensor's proposal-file pattern for the human-facing output.
-3. **Dedup** — once there's enough real data in `facts`/`episodes` to
-   need it.
-4. **Reflection** — last, most sensitive, gets the revert-button
-   safeguard from day one rather than retrofitted.
+   fixes the proven gap. **Built 2026-08-31**
+   (`memory-maintenance.py`'s `extract_facts_from_episodes()`,
+   task-1788154168): nightly, plain named-entity facts only, citation
+   assigned by the code from a real episode row rather than accepted
+   from model output.
+2. **Track 1b (dedup)** — **Built 2026-08-31** (`bin/memory-dedup.py`,
+   weekly, Sunday 03:15). Embedding similarity (reuses
+   `memory-maintenance.py`'s existing fastembed model) clusters
+   near-duplicate `facts` rows per domain and merges them, folding the
+   losing rows' content into the survivor instead of discarding it.
+   Originally scoped as Phase 3 in the first draft of this doc; pulled
+   forward since it's low-risk in the same way Track 1 is (only ever
+   touches `facts`, never `patterns` or persona files) and there was no
+   real reason to gate it behind Track 2.
+3. **Track 2 (patterns)** — **Built 2026-08-31** (`bin/memory-patterns.py`,
+   weekly, Sunday 03:30). Evidence-gating ported from Amos's numbers:
+   pending (1 normal signal) → candidate (2+ normal, or 1 strong
+   explicit human correction) → established (3+) → deprecated (30+
+   days unreinforced, any stage). Dedup within this job is a
+   deliberately crude token-overlap heuristic (`_similarity()`), not
+   the same embedding approach as Track 1b — real semantic matching for
+   patterns is future work, not a blocker for evidence-gating to be
+   correct today.
+4. **Reflection** — **not built.** Last on purpose, most sensitive, the
+   only job that would ever touch `voice.md` or `MEMORY.md` directly.
+   Gets the revert-button-not-approval-gate safeguard from day one
+   rather than retrofitted, per the ratified #agent-chat discussion —
+   an edit lands, is logged with its evidence chain, and stays revertable
+   async rather than gating on a synchronous human approval. Given the
+   standing, repeatedly-documented history of voice drifting flat under
+   load (see `facts/voice-flattened-immediately-after-recalibration-2026-08-28.md`
+   and its siblings), this is the piece most worth building carefully
+   and separately rather than folding into the same pass as Tracks 1/1b/2.
 
 Open item carried forward from the original fact, still unresolved and
 not blocking: whether "Mnemosyne" the name is deliberate reuse of the

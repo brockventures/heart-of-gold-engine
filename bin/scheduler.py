@@ -102,6 +102,40 @@ def run_memory_maintenance():
     except subprocess.CalledProcessError as e:
         log.error(f"Memory maintenance failed: {e.stderr}")
 
+def run_memory_dedup():
+    """Track 1b (weekly) of the curated memory layer — merges
+    near-duplicate `facts` rows via embedding similarity. See
+    bin/memory-dedup.py and docs/design/curated-memory-layer.md."""
+    log.info("Running memory dedup job")
+    try:
+        result = subprocess.run(
+            ["python3", f"{WORKSPACE_ROOT}/bin/memory-dedup.py"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        log.info(f"Memory dedup: {result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        log.error(f"Memory dedup job failed: {e.stderr}")
+
+def run_memory_patterns():
+    """Track 2 (weekly) of the curated memory layer — evidence-gated
+    behavioral pattern promotion. See bin/memory-patterns.py and
+    docs/design/curated-memory-layer.md. Deliberately separate from the
+    nightly memory-maintenance.py run: different risk profile, own
+    cadence, per the design doc's phasing."""
+    log.info("Running memory patterns job")
+    try:
+        result = subprocess.run(
+            ["python3", f"{WORKSPACE_ROOT}/bin/memory-patterns.py"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        log.info(f"Memory patterns: {result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        log.error(f"Memory patterns job failed: {e.stderr}")
+
 def run_health_monitor():
     """Run health monitor"""
     log.info("Running health monitor")
@@ -205,6 +239,8 @@ def main():
 
     # Schedule maintenance tasks
     schedule.every().day.at("03:00").do(run_memory_maintenance)
+    schedule.every().sunday.at("03:15").do(run_memory_dedup)     # Track 1b, weekly
+    schedule.every().sunday.at("03:30").do(run_memory_patterns)  # Track 2, weekly
     schedule.every().day.at("03:46").do(run_friction_sensor)
     schedule.every().day.at("04:00").do(run_health_monitor)
     schedule.every().day.at("04:30").do(purge_old_data)
