@@ -305,14 +305,22 @@ def write_health(success: bool, stats: dict) -> None:
     }))
 
 
-def process_messages_to_episodes(conn: sqlite3.Connection) -> int:
-    """Process yesterday's messages into episodes."""
+def process_messages_to_episodes(conn: sqlite3.Connection) -> tuple[int, list]:
+    """Process yesterday's messages into episodes.
+
+    Returns (created_count, new_episodes) where new_episodes is a list of
+    {"id", "summary", "channel"} dicts for episodes created *this run* —
+    needed by extract_candidate_facts() below so fact extraction only
+    looks at what's actually new, and so every extracted fact can cite a
+    real, just-inserted episode id rather than a model-guessed one.
+    """
     messages = read_previous_day_messages()
     if not messages:
-        return 0
+        return 0, []
 
     episodes = segment_messages_into_episodes(messages)
     created = 0
+    new_episodes = []
 
     for episode_msgs in episodes:
         if not episode_msgs:
@@ -325,16 +333,166 @@ def process_messages_to_episodes(conn: sqlite3.Connection) -> int:
         channel = episode_msgs[0].get("channel_name", "unknown")
         created_at = episode_msgs[0].get("ts", datetime.now(timezone.utc).isoformat())
 
-        conn.execute(
+        cursor = conn.execute(
             """INSERT INTO episodes (summary, importance, channel, created_at)
                VALUES (?, ?, ?, ?)""",
             (summary, importance, channel, created_at)
         )
+        new_episodes.append({"id": cursor.lastrowid, "summary": summary, "channel": channel})
         created += 1
 
     conn.commit()
     log.info(f"Created {created} episodes from messages")
-    return created
+    return created, new_episodes
+
+
+def extract_candidate_fact(episode_id: int, summary: str) -> dict | None:
+    """Ask Haiku whether this episode contains a durable, plain
+    named-entity/glossary fact — a definition ("X is the name of Y"),
+    not a preference, correction, or behavioral rule about an agent.
+
+    Track 1 only, per docs/design/curated-memory-layer.md: behavioral
+    pattern promotion (Track 2) is explicitly out of scope for this
+    job and must not be extracted here even if the model is tempted to.
+
+    The episode_id is never taken from the model's output — it's the
+    real id of the episode being examined, passed in by the caller and
+    stamped onto the result. That's the citation-integrity guarantee:
+    there's no path for a hallucinated citation because the model is
+    never asked to produce one.
+    """
+    prompt = f"""Read this conversation excerpt. Does it contain a durable,
+plain named-entity or glossary-style fact — a definition of a person,
+place, channel, system, or thing ("X is the name of Y")?
+
+Do NOT extract: preferences, corrections, behavioral rules, opinions,
+in-progress work, or anything that's really about how someone should
+act rather than what something IS.
+
+If yes, respond with ONLY a single-line JSON object:
+{{"subject": "short name", "content": "one-sentence definition", "domain": "one word category"}}
+
+If no, respond with ONLY: NONE
+
+Excerpt: {summary}"""
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--model", "haiku", "--max-turns", "1"],
+            capture_output=True,
+            text=True,
+            timeout=20
+        )
+        raw = result.stdout.strip()
+        if not raw or raw.upper() == "NONE":
+            return None
+
+        data = json.loads(raw)
+        subject = str(data.get("subject", "")).strip()
+        content = str(data.get("content", "")).strip()
+        if not subject or not content:
+            return None
+
+        return {
+            "subject": subject,
+            "content": content,
+            "domain": str(data.get("domain", "general")).strip() or "general",
+            "episode_id": episode_id,
+        }
+    except Exception as e:
+        log.warning(f"Failed to extract candidate fact for episode {episode_id}: {e}")
+        return None
+
+
+def citation_is_valid(conn: sqlite3.Connection, episode_id: int) -> bool:
+    """Deterministic check: does this episode id actually exist?
+
+    Cheap on purpose — the point isn't sophistication, it's that this
+    check runs against the real table instead of trusting the model's
+    own claim that it checked. See the citation-integrity discussion in
+    docs/design/curated-memory-layer.md.
+    """
+    row = conn.execute("SELECT id FROM episodes WHERE id = ?", (episode_id,)).fetchone()
+    return row is not None
+
+
+def insert_candidate_fact(conn: sqlite3.Connection, candidate: dict) -> int:
+    """Insert a validated candidate into the (previously always-empty)
+    facts table, citation baked into the content so the audit trail
+    survives even if someone only ever reads the facts table directly."""
+    now = datetime.now(timezone.utc).isoformat()
+    content = f"{candidate['content']} [source: episode {candidate['episode_id']}]"
+    cursor = conn.execute(
+        """INSERT INTO facts (subject, content, confidence, domain, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (candidate["subject"], content, 0.7, candidate["domain"], now, now)
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def write_candidates_file(candidates: list) -> Path | None:
+    """Human-readable audit trail alongside the DB rows — the file is
+    what a human actually reviews; the DB row is what a future
+    retrieval layer would query. Neither replaces the other."""
+    if not candidates:
+        return None
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = WORKSPACE / "data" / "memory-candidates"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{date_str}.md"
+
+    lines = [
+        f"# Memory candidates — {date_str}",
+        "",
+        "Auto-promoted plain facts from nightly consolidation (Track 1 — "
+        "see docs/design/curated-memory-layer.md). Named-entity/glossary "
+        "facts only; behavioral patterns and persona edits are Track 2 "
+        "and not built by this job.",
+        "",
+    ]
+    for c in candidates:
+        lines.append(
+            f"- **{c['subject']}** ({c['domain']}): {c['content']} "
+            f"_(episode {c['episode_id']}, facts.id {c['fact_id']})_"
+        )
+    lines.append("")
+
+    out_path.write_text("\n".join(lines))
+    return out_path
+
+
+def extract_facts_from_episodes(conn: sqlite3.Connection, new_episodes: list) -> dict:
+    """Track 1 driver: for each newly-created episode, try to extract a
+    plain fact, validate its citation deterministically, and if it
+    passes both, insert it and record it for the audit file."""
+    accepted = []
+    rejected_citation = 0
+
+    for ep in new_episodes:
+        candidate = extract_candidate_fact(ep["id"], ep["summary"])
+        if candidate is None:
+            continue
+        if not citation_is_valid(conn, candidate["episode_id"]):
+            # Shouldn't happen — episode_id is assigned by us, not the
+            # model — but the check exists precisely so "shouldn't
+            # happen" doesn't quietly become "didn't happen, allegedly".
+            rejected_citation += 1
+            log.warning(f"Rejected candidate fact citing nonexistent episode {candidate['episode_id']}")
+            continue
+        candidate["fact_id"] = insert_candidate_fact(conn, candidate)
+        accepted.append(candidate)
+
+    candidates_file = write_candidates_file(accepted)
+    if candidates_file:
+        log.info(f"Wrote {len(accepted)} candidate facts to {candidates_file}")
+
+    return {
+        "facts_extracted": len(accepted),
+        "facts_rejected_citation": rejected_citation,
+        "candidates_file": str(candidates_file) if candidates_file else None,
+    }
 
 
 def main():
@@ -344,13 +502,16 @@ def main():
     try:
         conn = init_db()
 
+        episodes_created, new_episodes = process_messages_to_episodes(conn)
+
         stats = {
-            "episodes_created": process_messages_to_episodes(conn),
+            "episodes_created": episodes_created,
             "decayed": decay_importance(conn),
             "pruned": prune_low_importance(conn),
             "consolidated": consolidate_episodes(conn),
             "embedded": generate_embeddings(conn),
         }
+        stats.update(extract_facts_from_episodes(conn, new_episodes))
 
         conn.close()
         duration = round(time.time() - start, 2)
