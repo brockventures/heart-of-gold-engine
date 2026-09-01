@@ -19,6 +19,14 @@ Attachment support added 2026-08-13: switches to Mailgun's multipart form
 endpoint (via `requests`, already present in the venv) whenever attachments
 are supplied. Text-only sends still use the original urlencoded urllib path
 unchanged, so existing behavior/callers are untouched.
+
+Multi-recipient support added 2026-09-01: `to` accepts either a single
+address string (unchanged) or a list of address strings, joined into the
+comma-separated form Mailgun's `to` field already natively accepts —
+Mailgun delivers one message with all recipients visible to each other in
+the To: header, not N separate sends. If that visibility isn't wanted
+(e.g. recipients who shouldn't see each other's address), call this once
+per recipient instead; this tool has no bcc concept.
 """
 
 import json
@@ -50,6 +58,8 @@ def load_env_var(name: str) -> str:
 def main():
     args = json.loads(os.environ.get("TOOL_ARGS", "{}"))
     to = args.get("to", "")
+    if isinstance(to, list):
+        to = ", ".join(addr.strip() for addr in to if addr and addr.strip())
     subject = args.get("subject", "")
     body = args.get("body", "")
     from_name = args.get("from_name", "Marvin")

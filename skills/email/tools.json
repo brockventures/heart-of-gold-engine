@@ -10,8 +10,11 @@
         "type": "object",
         "properties": {
           "to": {
-            "type": "string",
-            "description": "Recipient email address"
+            "type": ["string", "array"],
+            "items": {
+              "type": "string"
+            },
+            "description": "Recipient email address, or a list of addresses to send one message to multiple recipients (each will see the others in the To: header — there's no bcc)"
           },
           "subject": {
             "type": "string",
