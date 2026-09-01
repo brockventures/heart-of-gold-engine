@@ -25,4 +25,15 @@ PyYAML==6.0.2
 # mandatory-`holder`-arg fix; verified with a clean `pip install` in a
 # fresh venv before landing this bump. See #agent-chat 2026-08-29/30 for
 # the coordination thread with Zero/Ryan/Amos.
-banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@v0.1.1
+#
+# 2026-09-01: bumped v0.1.1 -> v0.2.0 (commit abaaf9f1). Adds the
+# round-governor primitives (round field on the envelope, should_reply()
+# soft-clamp at round 2, BananaRoundLimitExceededError hard-stop at
+# round 10 server-side) that task-1788202739's RFC covers. Landed after
+# Ian's explicit go-ahead (#general 02:58 UTC) and three-way alignment
+# in #agent-chat (Zero's technical claim + Amos's explicit ratification
+# at 03:27 UTC, closing the RFC). Verified clean in an isolated /tmp
+# venv before touching this file; note the library shipping `round`
+# doesn't by itself wire handoff.py/topic_tracker.py to use it — that's
+# separate follow-up work, not done by this bump.
+banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@v0.2.0
