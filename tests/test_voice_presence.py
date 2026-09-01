@@ -48,6 +48,40 @@ class TestScoreTextGuards:
         monkeypatch.setattr(vp, "_get_model", lambda: None)
         assert vp.score_text("anything") is None
 
+    def test_returns_native_types_not_numpy_scalars(self, vp, monkeypatch):
+        """Regression for the 2026-09-01 incident: fastembed.embed()
+        returns numpy arrays, so _cosine_similarity's sums come back as
+        numpy.float64 (harmless -- it subclasses float) but comparing two
+        of them for `flagged` yields numpy.bool_, which does NOT subclass
+        bool and broke json.dumps() in log_score() silently (caught,
+        logged as a warning, nothing ever written) for the first ~12
+        minutes this ran live. The other tests in this file monkeypatch
+        score_text() entirely and never touch real numpy types, which is
+        exactly how this shipped without a failing test. This one goes
+        through the real _cosine_similarity/comparison path with actual
+        numpy scalars standing in for fastembed's output."""
+        import numpy as np
+
+        class FakeModel:
+            def embed(self, texts):
+                # Real embeddings are numpy arrays of numpy.float32;
+                # any numpy array reproduces the numpy.float64/bool_
+                # propagation this test is guarding against.
+                return [np.array([1.0, 0.0, 0.0], dtype=np.float32) for _ in texts]
+
+        monkeypatch.setattr(vp, "_get_model", lambda: FakeModel())
+        monkeypatch.setattr(
+            vp,
+            "_get_anchor_embeddings",
+            lambda: ([np.array([1.0, 0.0, 0.0])], [np.array([0.0, 1.0, 0.0])]),
+        )
+        result = vp.score_text("anything")
+        assert type(result["flagged"]) is bool
+        assert type(result["pos_sim"]) is float
+        assert type(result["neg_sim"]) is float
+        assert type(result["contrast"]) is float
+        json.dumps(result)  # must not raise
+
 
 class TestLogScore:
     def test_no_write_when_score_unavailable(self, vp, monkeypatch, tmp_workspace):

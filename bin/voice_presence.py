@@ -162,11 +162,17 @@ def score_text(text: str) -> Optional[dict]:
     text_emb = list(model.embed([text]))[0]
     pos_sim = sum(_cosine_similarity(text_emb, a) for a in pos_emb) / len(pos_emb)
     neg_sim = sum(_cosine_similarity(text_emb, a) for a in neg_emb) / len(neg_emb)
+    # pos_sim/neg_sim are numpy.float64 (embeddings come back as numpy
+    # arrays from fastembed) -- that's harmless for json since
+    # numpy.float64 subclasses Python float, but comparing two of them
+    # yields numpy.bool_, which does NOT subclass bool and isn't
+    # JSON-serializable. Cast explicitly rather than relying on json to
+    # cope with numpy scalars anywhere in this dict.
     return {
-        "pos_sim": round(pos_sim, 4),
-        "neg_sim": round(neg_sim, 4),
-        "contrast": round(pos_sim - neg_sim, 4),
-        "flagged": neg_sim > pos_sim,
+        "pos_sim": round(float(pos_sim), 4),
+        "neg_sim": round(float(neg_sim), 4),
+        "contrast": round(float(pos_sim - neg_sim), 4),
+        "flagged": bool(neg_sim > pos_sim),
     }
 
 
