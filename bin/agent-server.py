@@ -32,6 +32,7 @@ from aiohttp import web
 
 import speaking_banana as banana
 import context_box
+import voice_presence
 from handoff import parse_handoff
 from outbox import add_pending
 
@@ -393,6 +394,15 @@ def _spawn(coro, name: Optional[str] = None) -> asyncio.Task:
 
     task.add_done_callback(_on_done)
     return task
+
+async def _voice_presence_log(agent: str, channel: str, text: str) -> None:
+    """Thread-offload wrapper around voice_presence.log_score() — embedding
+    inference (and the one-time model load) is synchronous/CPU-bound, and
+    this runs via _spawn() as a background task sharing the same event
+    loop as every other agent's turn processing, so it goes through
+    asyncio.to_thread() rather than blocking that loop directly."""
+    await asyncio.to_thread(voice_presence.log_score, agent, channel, text)
+
 response_buffers: Dict[str, str] = {}
 agent_last_cost: Dict[str, float] = {}
 agent_sessions: Dict[str, str] = {}
@@ -3169,6 +3179,18 @@ async def process_agent_queue(agent: str):
             # where this post is skipped.
             if pending_final and channel_id != "0":
                 discord_msg_id = await post_to_discord(agent, channel_id, pending_final)
+
+            # Voice-presence, Phase 1 (2026-09-01, task-1788226029): score
+            # this turn's full reply against voice.md's register via
+            # embedding cosine-similarity, detect-and-log only -- no
+            # blocking, no live model call. Same posture as the stale-gate
+            # work above (observe first, don't ask discipline to hold
+            # where it's already failed repeatedly). _spawn() so scoring
+            # never adds latency to a reply that's already posted; scored
+            # against response_text (the full turn), not pending_final,
+            # same reasoning as the banana-claim check below.
+            if response_text and channel_name:
+                _spawn(_voice_presence_log(agent, channel_name, response_text))
 
             # Speaking Banana (2026-08-28, specs/2026-08-28-speaking-banana.md):
             # record this agent's own turn-claim. This is the outbound half of
