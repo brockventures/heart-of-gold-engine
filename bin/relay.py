@@ -566,8 +566,18 @@ class DiscordAdapter(discord.Client):
             try:
                 if not await _owner_check(interaction):
                     return
+                # Defer immediately — 2026-09-01, Ian saw "The application did
+                # not respond" on a real /compact call. Root cause: this hits
+                # compact_session() -> summarize-session.py, which has a 75s
+                # timeout (see agent-server.py), while Discord's initial ack
+                # window is 3s. Same failure mode restart-server_cmd above was
+                # already fixed for; compact_cmd just never got the same fix
+                # when it was added. The compaction itself was very likely
+                # completing fine server-side — Discord was just giving up on
+                # waiting for an ack that never came.
+                await interaction.response.defer()
                 reply = await adapter._run_sys_command("compact", agent or _default_agent())
-                await interaction.response.send_message(reply)
+                await interaction.followup.send(reply)
             finally:
                 _INFLIGHT_COUNT -= 1
 
