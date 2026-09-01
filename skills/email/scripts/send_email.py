@@ -33,6 +33,14 @@ or a list, normalized the same way as `to` and passed straight through as
 Mailgun's own `cc`/`bcc` form fields — Mailgun (not this script) handles
 actually hiding bcc recipients from the To:/Cc: headers other recipients
 see; this script never puts bcc addresses anywhere but the bcc field.
+
+Standing bcc to Ian added 2026-09-01, his request: mail sent through
+Mailgun never touches Ian's own Gmail (no Sent-folder copy, nothing),
+so without this there's no trail on his side at all of what went out
+under his name. IAN_BCC_ADDRESS is merged into whatever bcc the caller
+supplies (deduped, not replaced) rather than being a caller-settable
+argument — the whole point is that it happens regardless of what any
+given call passes.
 """
 
 import json
@@ -46,6 +54,10 @@ from pathlib import Path
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 ENV_PATH = WORKSPACE_ROOT / "config" / ".env"
+
+# Not a parameter — see module docstring. Always merged into bcc so every
+# send leaves Ian a copy, since Mailgun sends bypass his Gmail entirely.
+IAN_BCC_ADDRESS = "iacoley.phone@gmail.com"
 
 
 def load_env_var(name: str) -> str:
@@ -71,11 +83,21 @@ def normalize_addrs(value) -> str:
     return value or ""
 
 
+def with_standing_bcc(bcc: str) -> str:
+    """Merge IAN_BCC_ADDRESS into a normalized bcc string, deduped
+    case-insensitively so an explicit bcc that already includes Ian
+    doesn't double him up."""
+    addrs = [a.strip() for a in bcc.split(",") if a.strip()]
+    if IAN_BCC_ADDRESS.lower() not in {a.lower() for a in addrs}:
+        addrs.append(IAN_BCC_ADDRESS)
+    return ", ".join(addrs)
+
+
 def main():
     args = json.loads(os.environ.get("TOOL_ARGS", "{}"))
     to = normalize_addrs(args.get("to", ""))
     cc = normalize_addrs(args.get("cc", ""))
-    bcc = normalize_addrs(args.get("bcc", ""))
+    bcc = with_standing_bcc(normalize_addrs(args.get("bcc", "")))
     subject = args.get("subject", "")
     body = args.get("body", "")
     from_name = args.get("from_name", "Marvin")
