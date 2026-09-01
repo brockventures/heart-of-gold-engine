@@ -26,7 +26,13 @@ comma-separated form Mailgun's `to` field already natively accepts —
 Mailgun delivers one message with all recipients visible to each other in
 the To: header, not N separate sends. If that visibility isn't wanted
 (e.g. recipients who shouldn't see each other's address), call this once
-per recipient instead; this tool has no bcc concept.
+per recipient instead.
+
+cc/bcc added same day, same pattern: each accepts a single address string
+or a list, normalized the same way as `to` and passed straight through as
+Mailgun's own `cc`/`bcc` form fields — Mailgun (not this script) handles
+actually hiding bcc recipients from the To:/Cc: headers other recipients
+see; this script never puts bcc addresses anywhere but the bcc field.
 """
 
 import json
@@ -55,11 +61,21 @@ def load_env_var(name: str) -> str:
     return ""
 
 
+def normalize_addrs(value) -> str:
+    """Accept a single address string or a list of address strings, return
+    the comma-separated form Mailgun's to/cc/bcc fields all natively take.
+    Blank/None entries in a list are dropped rather than producing stray
+    commas."""
+    if isinstance(value, list):
+        return ", ".join(addr.strip() for addr in value if addr and addr.strip())
+    return value or ""
+
+
 def main():
     args = json.loads(os.environ.get("TOOL_ARGS", "{}"))
-    to = args.get("to", "")
-    if isinstance(to, list):
-        to = ", ".join(addr.strip() for addr in to if addr and addr.strip())
+    to = normalize_addrs(args.get("to", ""))
+    cc = normalize_addrs(args.get("cc", ""))
+    bcc = normalize_addrs(args.get("bcc", ""))
     subject = args.get("subject", "")
     body = args.get("body", "")
     from_name = args.get("from_name", "Marvin")
@@ -88,6 +104,16 @@ def main():
     from_address = f"{from_name} <marvin@{from_domain}>"
     url = f"https://api.mailgun.net/v3/{mailgun_api_domain}/messages"
 
+    # Shared field set for both send paths below — cc/bcc only added when
+    # actually supplied, so a plain to-only send's request body is
+    # byte-for-byte what it was before cc/bcc existed.
+    fields = {"from": from_address, "to": to, "subject": subject, "text": body}
+    if cc:
+        fields["cc"] = cc
+    if bcc:
+        fields["bcc"] = bcc
+    response_addrs = {"to": to, **({"cc": cc} if cc else {}), **({"bcc": bcc} if bcc else {})}
+
     if attachments:
         missing = [p for p in attachments if not Path(p).is_file()]
         if missing:
@@ -105,7 +131,7 @@ def main():
             resp = requests.post(
                 url,
                 auth=("api", api_key),
-                data={"from": from_address, "to": to, "subject": subject, "text": body},
+                data=fields,
                 files=files,
                 timeout=30,
             )
@@ -120,7 +146,7 @@ def main():
                 "message_id": result.get("id", ""),
                 "mailgun_response": result.get("message", ""),
                 "from": from_address,
-                "to": to,
+                **response_addrs,
                 "attachments": [Path(p).name for p in attachments],
             }))
         else:
@@ -130,12 +156,7 @@ def main():
             sys.exit(1)
         return
 
-    payload = urllib.parse.urlencode({
-        "from": from_address,
-        "to": to,
-        "subject": subject,
-        "text": body,
-    }).encode()
+    payload = urllib.parse.urlencode(fields).encode()
 
     request = urllib.request.Request(url, data=payload, method="POST")
     credentials = f"api:{api_key}".encode()
@@ -152,7 +173,7 @@ def main():
                 "message_id": result.get("id", ""),
                 "mailgun_response": result.get("message", ""),
                 "from": from_address,
-                "to": to,
+                **response_addrs,
             }))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode(errors="ignore")

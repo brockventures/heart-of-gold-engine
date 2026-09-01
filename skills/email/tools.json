@@ -1,6 +1,6 @@
 {
   "skill_name": "email",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Send outbound email as marvin@iancoley.org via Mailgun, and read the Marvin label on Ian's Gmail via IMAP",
   "tools": [
     {
@@ -14,7 +14,21 @@
             "items": {
               "type": "string"
             },
-            "description": "Recipient email address, or a list of addresses to send one message to multiple recipients (each will see the others in the To: header — there's no bcc)"
+            "description": "Recipient email address, or a list of addresses to send one message to multiple recipients (each will see the others in the To: header — use cc/bcc if that visibility isn't wanted)"
+          },
+          "cc": {
+            "type": ["string", "array"],
+            "items": {
+              "type": "string"
+            },
+            "description": "CC address, or a list of addresses — visible to all recipients in the Cc: header"
+          },
+          "bcc": {
+            "type": ["string", "array"],
+            "items": {
+              "type": "string"
+            },
+            "description": "BCC address, or a list of addresses — hidden from every other recipient (Mailgun strips it from headers other recipients see)"
           },
           "subject": {
             "type": "string",
