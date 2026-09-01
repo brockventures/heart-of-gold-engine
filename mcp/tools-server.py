@@ -427,6 +427,29 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
         tasks_file = WORKSPACE / "data" / "taskboard.json"
         action = args.get("action", "list")
 
+        def _maybe_mark_email_read(task: dict) -> None:
+            """Completing a task created by read_marvin_folder.py's
+            email-intake (source="email-intake", email_uid=<uid>) also
+            flips that message's \\Seen flag, via the same skill-script
+            path a normal tool call would use — so Gmail's own read state
+            doubles as the record of what's actually been addressed.
+            Added 2026-09-01 per Ian's sign-off. Best-effort: a failure
+            here must not block the task completion itself."""
+            if task.get("source") != "email-intake" or "email_uid" not in task:
+                return
+            try:
+                skill_dir = SKILLS_DIR / "email"
+                env = os.environ.copy()
+                env["WORKSPACE_ROOT"] = str(WORKSPACE)
+                env["TOOL_ARGS"] = json.dumps({"uid": task["email_uid"], "read": True})
+                subprocess.run(
+                    ["python3", str(skill_dir / "scripts" / "mark_email_read.py")],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(skill_dir), env=env,
+                )
+            except Exception:
+                pass  # best-effort; the task itself still completes
+
         tasks = []
         if tasks_file.exists():
             tasks = json.loads(tasks_file.read_text()).get("tasks", [])
@@ -450,6 +473,7 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
                     task["status"] = "done"
                     task["completed_at"] = datetime.now(timezone.utc).isoformat()
                     tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
+                    _maybe_mark_email_read(task)
                     return {"task": task}
             return {"error": f"Task not found: {task_id}"}
         elif action == "update":
@@ -461,11 +485,14 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
                 return {"error": "update requires 'status'"}
             for task in tasks:
                 if task["id"] == task_id:
+                    was_done = task["status"] == "done"
                     task["status"] = new_status
                     task["updated_at"] = datetime.now(timezone.utc).isoformat()
                     if new_status == "done" and "completed_at" not in task:
                         task["completed_at"] = task["updated_at"]
                     tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
+                    if new_status == "done" and not was_done:
+                        _maybe_mark_email_read(task)
                     return {"task": task}
             return {"error": f"Task not found: {task_id}"}
         return {"error": f"Unknown taskboard action: {action}"}

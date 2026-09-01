@@ -1,11 +1,11 @@
 {
   "skill_name": "email",
-  "version": "1.2.0",
-  "description": "Send outbound email as marvin@iancoley.org via Mailgun, and read the Marvin label on Ian's Gmail via IMAP",
+  "version": "1.4.0",
+  "description": "Send outbound email as marvin@iancoley.org via Mailgun, read the Marvin label on Ian's Gmail via IMAP, and mark messages in that label read/unread",
   "tools": [
     {
       "name": "send_email",
-      "description": "Send an email from marvin@iancoley.org via Mailgun. Requires MAILGUN_API_KEY and MAILGUN_DOMAIN in config/.env.",
+      "description": "Send an email from marvin@iancoley.org via Mailgun. Ian is always bcc'd automatically (not something a caller can opt out of) since Mailgun sends don't leave any trace in his own Gmail. Requires MAILGUN_API_KEY and MAILGUN_DOMAIN in config/.env.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -48,7 +48,7 @@
     },
     {
       "name": "read_marvin_folder",
-      "description": "Read new messages from the 'Marvin' label in Ian's Gmail via IMAP. Returns only messages not seen on a previous call (tracked by UID in a local state file) — doesn't mark anything read/unread in Gmail itself. Requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD in config/.env.",
+      "description": "Read new messages from the 'Marvin' label in Ian's Gmail via IMAP. Returns only messages not seen on a previous call (tracked by UID in a local state file). Each genuinely-new message also creates a taskboard entry (source=email-intake) so it has to be explicitly closed out rather than just noted; completing that task marks the message read via mark_email_read. Doesn't touch Gmail's read state itself — that only happens via mark_email_read. Requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD in config/.env.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -58,6 +58,24 @@
           }
         },
         "required": []
+      }
+    },
+    {
+      "name": "mark_email_read",
+      "description": "Flip the \\Seen flag on one message in the 'Marvin' Gmail label — mark it read (default) or unread. Scoped to the Marvin folder only, same as read_marvin_folder; added 2026-09-01 per Ian's explicit sign-off to use Gmail's own read state as a record of what's been addressed. Requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD in config/.env.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "uid": {
+            "type": ["string", "integer"],
+            "description": "The message's IMAP UID within the Marvin folder (as returned by read_marvin_folder)"
+          },
+          "read": {
+            "type": "boolean",
+            "description": "true to mark read (default), false to mark unread"
+          }
+        },
+        "required": ["uid"]
       }
     }
   ]

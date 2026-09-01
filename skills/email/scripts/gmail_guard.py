@@ -11,12 +11,20 @@ is no way to scope an app password to a single label. The restriction is
 therefore a code-level boundary, and the design goal is to make it a real
 structural one rather than a convention that happens to be followed
 today: this wrapper does not expose imaplib's list(), or select() with a
-caller-supplied folder name, or any write/delete/move IMAP command at
-all. There is exactly one usable folder (a class constant, not a
-constructor argument — cannot be parameterized by a caller), and exactly
-one access mode, read-only. The only operations available through this
-wrapper are search and fetch, both implicitly scoped to whatever folder
-was selected at connect time.
+caller-supplied folder name, or any raw write/delete/move IMAP command.
+There is exactly one usable folder (a class constant, not a constructor
+argument — cannot be parameterized by a caller).
+
+Scope widened 2026-09-01, Ian's explicit sign-off in #general: "I am
+good with you reading/unreading anything in the Marvin folder as a
+matter of record." That's flag-state on messages already confined to
+this one folder, not a loosening of the folder boundary itself — the
+mailbox is now selected read-write (Gmail's IMAP has no "read-write but
+flags-only" mode to select into), but the only write operation this
+class exposes is toggling the \\Seen flag via mark_seen()/mark_unseen(),
+and the flag name is hardcoded exactly like ALLOWED_FOLDER is — not a
+caller-supplied argument. Still no delete, no move, no expunge, no
+arbitrary STORE. search/fetch/close are otherwise unchanged.
 
 Known limit, stated plainly rather than glossed over: this cannot stop a
 future script from importing imaplib directly and bypassing this
@@ -36,15 +44,21 @@ from typing import Any
 
 
 class MarvinFolderOnly:
-    """Read-only IMAP access to exactly one Gmail label. Nothing else is
-    reachable through this class."""
+    """IMAP access to exactly one Gmail label. Nothing else is reachable
+    through this class: search/fetch, plus toggling the \\Seen flag
+    (2026-09-01, Ian's sign-off) — no delete, no move, no arbitrary
+    flag/STORE command."""
 
     ALLOWED_FOLDER = "Marvin"  # not a parameter — cannot be overridden by a caller
 
     def __init__(self, address: str, app_password: str) -> None:
         self._conn = imaplib.IMAP4_SSL("imap.gmail.com")
         self._conn.login(address, app_password)
-        status, _ = self._conn.select(f'"{self.ALLOWED_FOLDER}"', readonly=True)
+        # Read-write: Gmail's IMAP has no "read-only mailbox, but let me
+        # flip flags" mode — EXAMINE (readonly=True) rejects STORE outright.
+        # The mailbox-open mode is therefore no longer the enforcement
+        # point; which methods this class exposes is.
+        status, _ = self._conn.select(f'"{self.ALLOWED_FOLDER}"')
         if status != "OK":
             self._conn.logout()
             raise RuntimeError(f"Could not open '{self.ALLOWED_FOLDER}' folder")
@@ -56,6 +70,18 @@ class MarvinFolderOnly:
     def fetch(self, uid: str, parts: str):
         """UID fetch within the Marvin folder only."""
         return self._conn.uid("fetch", uid, parts)
+
+    def mark_seen(self, uid: str) -> bool:
+        """Flag one message \\Seen. The flag is hardcoded, same pattern as
+        ALLOWED_FOLDER — not something a caller can substitute."""
+        status, _ = self._conn.uid("store", uid, "+FLAGS", r"(\Seen)")
+        return status == "OK"
+
+    def mark_unseen(self, uid: str) -> bool:
+        """Clear \\Seen on one message. Same hardcoded-flag constraint as
+        mark_seen()."""
+        status, _ = self._conn.uid("store", uid, "-FLAGS", r"(\Seen)")
+        return status == "OK"
 
     def close(self) -> None:
         self._conn.logout()
@@ -85,8 +111,20 @@ def _selftest() -> int:
         name for name, val in inspect.getmembers(MarvinFolderOnly)
         if not name.startswith("_") and inspect.isfunction(val)
     }
-    check("only search/fetch/close are public methods",
-          public_methods == {"search", "fetch", "close"})
+    check("only search/fetch/mark_seen/mark_unseen/close are public methods",
+          public_methods == {"search", "fetch", "mark_seen", "mark_unseen", "close"})
+
+    mark_seen_src = inspect.getsource(MarvinFolderOnly.mark_seen)
+    mark_unseen_src = inspect.getsource(MarvinFolderOnly.mark_unseen)
+    check("mark_seen/mark_unseen take no flag argument (uid only, flag is hardcoded)",
+          list(inspect.signature(MarvinFolderOnly.mark_seen).parameters) == ["self", "uid"] and
+          list(inspect.signature(MarvinFolderOnly.mark_unseen).parameters) == ["self", "uid"])
+    check(r"mark_seen/mark_unseen only ever touch \Seen",
+          r"\Seen" in mark_seen_src and r"\Seen" in mark_unseen_src)
+
+    class_src = inspect.getsource(MarvinFolderOnly)
+    check("no delete/expunge/move/copy exposed anywhere in the class",
+          not any(bad in class_src for bad in ["\\Deleted", "expunge", "COPY", "MOVE"]))
 
     check("ALLOWED_FOLDER is a hardcoded class constant",
           MarvinFolderOnly.ALLOWED_FOLDER == "Marvin")

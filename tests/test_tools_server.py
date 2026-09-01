@@ -156,3 +156,93 @@ class TestTaskboardUpdate:
         assert "error" in result
         assert "taskboard" not in result["error"] or "bogus" in result["error"]
         assert "bogus" in result["error"]
+
+
+class TestTaskboardEmailIntakeMarkRead:
+    """Completing a task created by read_marvin_folder.py's email-intake
+    (source="email-intake", email_uid=<uid>) must flip that message's
+    \\Seen flag via mark_email_read.py — added 2026-09-01 so 'make sure
+    emails get addressed, not just noticed' has a closing half, not just
+    the task-creation half."""
+
+    def _add_task(self, tools_server, **extra):
+        (tools_server.WORKSPACE / "data").mkdir(parents=True, exist_ok=True)
+        result = tools_server.handle_core_tool("taskboard", {"action": "add", "title": "t"})
+        task_id = result["task"]["id"]
+        if extra:
+            tasks_file = tools_server.WORKSPACE / "data" / "taskboard.json"
+            data = json.loads(tasks_file.read_text())
+            for task in data["tasks"]:
+                if task["id"] == task_id:
+                    task.update(extra)
+            tasks_file.write_text(json.dumps(data))
+        return task_id
+
+    def _capture_subprocess(self, tools_server, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append({"cmd": cmd, "env": kwargs.get("env", {}), "cwd": kwargs.get("cwd")})
+            class Result:
+                returncode = 0
+                stdout = "{}"
+                stderr = ""
+            return Result()
+
+        monkeypatch.setattr(tools_server.subprocess, "run", fake_run)
+        return calls
+
+    def test_complete_on_email_intake_task_marks_it_read(self, tools_server, monkeypatch):
+        calls = self._capture_subprocess(tools_server, monkeypatch)
+        task_id = self._add_task(tools_server, source="email-intake", email_uid=42)
+
+        result = tools_server.handle_core_tool("taskboard", {"action": "complete", "id": task_id})
+
+        assert result["task"]["status"] == "done"
+        assert len(calls) == 1
+        assert calls[0]["cmd"][-1].endswith("mark_email_read.py")
+        sent_args = json.loads(calls[0]["env"]["TOOL_ARGS"])
+        assert sent_args == {"uid": 42, "read": True}
+
+    def test_update_to_done_on_email_intake_task_marks_it_read(self, tools_server, monkeypatch):
+        calls = self._capture_subprocess(tools_server, monkeypatch)
+        task_id = self._add_task(tools_server, source="email-intake", email_uid=7)
+
+        tools_server.handle_core_tool(
+            "taskboard", {"action": "update", "id": task_id, "status": "done"}
+        )
+
+        assert len(calls) == 1
+        assert json.loads(calls[0]["env"]["TOOL_ARGS"]) == {"uid": 7, "read": True}
+
+    def test_re_updating_an_already_done_email_task_does_not_re_fire(self, tools_server, monkeypatch):
+        """Guards against re-marking (and re-hitting the real IMAP call)
+        every time an already-completed task gets touched again."""
+        calls = self._capture_subprocess(tools_server, monkeypatch)
+        task_id = self._add_task(tools_server, source="email-intake", email_uid=7, status="done")
+
+        tools_server.handle_core_tool(
+            "taskboard", {"action": "update", "id": task_id, "status": "done"}
+        )
+
+        assert calls == []
+
+    def test_completing_a_non_email_task_does_not_touch_gmail(self, tools_server, monkeypatch):
+        calls = self._capture_subprocess(tools_server, monkeypatch)
+        task_id = self._add_task(tools_server)
+
+        tools_server.handle_core_tool("taskboard", {"action": "complete", "id": task_id})
+
+        assert calls == []
+
+    def test_mark_read_failure_does_not_block_task_completion(self, tools_server, monkeypatch):
+        def raising_run(*a, **k):
+            raise OSError("no such process")
+
+        monkeypatch.setattr(tools_server.subprocess, "run", raising_run)
+        task_id = self._add_task(tools_server, source="email-intake", email_uid=1)
+
+        result = tools_server.handle_core_tool("taskboard", {"action": "complete", "id": task_id})
+
+        assert result["task"]["status"] == "done"
+        assert "error" not in result

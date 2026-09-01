@@ -17,8 +17,14 @@ and docker-compose's env_file only loads at container creation.
 Hard safeguard, Ian's explicit instruction 2026-08-06: all IMAP access
 goes through gmail_guard.MarvinFolderOnly rather than calling imaplib
 directly. That wrapper hardcodes the folder (not a parameter, cannot be
-overridden), connects read-only, and doesn't expose anything beyond
-search/fetch — see gmail_guard.py for the full reasoning.
+overridden) and, as of 2026-09-01, also hardcodes the one flag
+(\\Seen) it's allowed to write — see gmail_guard.py for the full
+reasoning.
+
+Each genuinely-new message (i.e. every call that isn't include_seen)
+also spawns a taskboard entry via create_intake_tasks(), so new mail
+has to be explicitly closed out rather than just noted in passing —
+see that function's docstring for how it ties back to mark_email_read.
 """
 
 import email
@@ -28,6 +34,8 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from email.header import decode_header
 from pathlib import Path
 
@@ -36,6 +44,7 @@ from gmail_guard import MarvinFolderOnly
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 ENV_PATH = WORKSPACE_ROOT / "config" / ".env"
 STATE_PATH = WORKSPACE_ROOT / "data" / "gmail-marvin-state.json"
+TASKS_PATH = WORKSPACE_ROOT / "data" / "taskboard.json"
 FOLDER = MarvinFolderOnly.ALLOWED_FOLDER
 MAX_BODY_CHARS = 4000  # keep responses reasonable; this is a summary tool, not a full mail client
 
@@ -63,6 +72,48 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state))
+
+
+def create_intake_tasks(messages: list) -> None:
+    """One taskboard entry per genuinely-new message, so a new email has
+    to be explicitly closed out rather than just riding along in whatever
+    heartbeat context happened to mention it and then quietly falling out
+    of the window. Added 2026-09-01 per Ian: "make sure emails get
+    addressed when they come in, not just noticed."
+
+    Each task carries source="email-intake" and the message's uid — when
+    that task gets marked done, tools-server.py's taskboard handler uses
+    those two fields to flip the message's own \\Seen flag via
+    mark_email_read.py, so Gmail's read state ends up as the record of
+    what's actually been dealt with.
+
+    Same non-atomic read-modify-write as tools-server.py's own taskboard
+    handler (data/taskboard.json has no lock file) — this script and a
+    live agent turn both touching it in close succession is an existing,
+    accepted risk, not a new one introduced here.
+    """
+    if not messages:
+        return
+    tasks = []
+    if TASKS_PATH.exists():
+        try:
+            tasks = json.loads(TASKS_PATH.read_text()).get("tasks", [])
+        except Exception:
+            tasks = []
+
+    now = datetime.now(timezone.utc).isoformat()
+    for msg in messages:
+        tasks.append({
+            "id": f"task-{int(time.time())}-email{msg['uid']}",
+            "title": f"Email: \"{msg['subject']}\" from {msg['from']}",
+            "status": "pending",
+            "created_at": now,
+            "source": "email-intake",
+            "email_uid": msg["uid"],
+        })
+
+    TASKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TASKS_PATH.write_text(json.dumps({"tasks": tasks}, indent=2))
 
 
 def decode_mime_str(value: str) -> str:
@@ -150,6 +201,7 @@ def main():
         if not include_seen:
             state["last_uid"] = highest_uid
             save_state(state)
+            create_intake_tasks(messages)
 
         print(json.dumps({
             "folder": FOLDER,
