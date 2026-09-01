@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import aiosqlite
@@ -1147,6 +1148,23 @@ def is_rate_limit_paused(agent: str) -> bool:
         return True
     return (info.get("utilization") or 0) >= RATE_LIMIT_UTILIZATION_PAUSE_THRESHOLD
 
+_PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+
+def format_reset_time(epoch: float) -> str:
+    """Render a rate-limit reset timestamp as UTC with LA local time
+    alongside it, e.g. '00:00 UTC / 17:00 PT (Aug 31)' — added 2026-09-01
+    per Ian: the bare UTC-only stamp in the pause/queued-ack notices
+    forces a manual conversion every time. %Z gives PST/PDT correctly
+    across the DST boundary rather than hardcoding PT. Only date-suffixes
+    the local side when it falls on a different calendar day than UTC,
+    since that's the actual ambiguity a same-day stamp doesn't have."""
+    utc_dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    local_dt = utc_dt.astimezone(_PACIFIC_TZ)
+    local_str = local_dt.strftime("%H:%M %Z")
+    if local_dt.date() != utc_dt.date():
+        local_str += local_dt.strftime(" (%b %d)")
+    return f"{utc_dt.strftime('%H:%M')} UTC / {local_str}"
+
 async def _notify_rate_limit_pause(agent: str, paused: bool) -> None:
     """Best-effort #signals notice on entering/leaving a rate-limit
     pause. Fire-and-forget from process_agent_queue (never awaited
@@ -1159,7 +1177,7 @@ async def _notify_rate_limit_pause(agent: str, paused: bool) -> None:
         if paused:
             resets = agent_rate_limits.get(agent, {}).get("resetsAt")
             resets_str = (
-                datetime.fromtimestamp(resets).strftime("%H:%M UTC")
+                format_reset_time(resets)
                 if isinstance(resets, (int, float)) else "an unknown time"
             )
             info = agent_rate_limits.get(agent, {})
@@ -2774,7 +2792,7 @@ async def check_queued_acks():
             if is_rate_limit_paused(agent):
                 resets_at = agent_rate_limits.get(agent, {}).get("resetsAt")
                 if resets_at:
-                    reset_str = datetime.utcfromtimestamp(resets_at).strftime("%H:%M UTC")
+                    reset_str = format_reset_time(resets_at)
                     reason = f"paused — five-hour rate limit window in the warning zone, resumes ~{reset_str}"
                 else:
                     reason = "paused — five-hour rate limit window in the warning zone"
