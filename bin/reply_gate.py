@@ -66,6 +66,11 @@ class GateMessage:
     # their own sides same night. Caller resolves which role IDs count as
     # "self" from config; this field is just the pre-resolved bool.
     mentions_role: bool = False
+    # A direct mention of another peer bot or user where Marvin is NOT
+    # mentioned. Added 2026-09-02 to prevent targeted peer traffic (e.g.
+    # '@Zero ...' or '@Amos ...') from falling through to Tier 2 scoring
+    # and waking Marvin into an unaddressed turn.
+    mentions_other: bool = False
 
 
 def is_content_free(content: str) -> bool:
@@ -157,6 +162,15 @@ class ReplyGate:
             )
             return Decision(
                 True, "tier1", reason,
+                named=named, channel_id=msg.channel_id,
+            )
+
+        # An explicit mention of another party when self is not mentioned is
+        # targeted traffic, not unaddressed ambient chatter. Drop immediately
+        # in Tier 1 — never invoke the Tier 2 scorer on a peer's turn.
+        if msg.mentions_other:
+            return Decision(
+                False, "tier1-peer", "directed to other recipient, scorer skipped",
                 named=named, channel_id=msg.channel_id,
             )
 
@@ -348,6 +362,15 @@ def _selftest() -> int:
           g.evaluate(M(content="really?")).needs_score, True)
     check("two ordinary words still go to the scorer",
           g.evaluate(M(content="thanks Marvin")).needs_score, True)
+
+    # -- 2026-09-02: mentions_other drops in Tier 1, skipping scorer and wake --
+    t["now"] += 301
+    d_peer = g.evaluate(M(content="hey @Zero check this out", mentions_other=True))
+    check("mentioning another entity stays quiet in tier 1", d_peer.wake, False)
+    check("mentioning another entity tier is tier1-peer", d_peer.tier, "tier1-peer")
+    check("mentioning another entity skips scorer", d_peer.needs_score, False)
+    check("mentioning both self and other still wakes",
+          g.evaluate(M(content="hey @me and @Zero", mentions_self=True, mentions_other=True)).wake, True)
 
     print("PASS  the gate declines when it should" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0
