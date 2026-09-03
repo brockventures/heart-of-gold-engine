@@ -1477,15 +1477,23 @@ class DiscordAdapter(discord.Client):
                 )
             else:
                 robots_role_id = channels_config.get("robots_role_id")
+                mentions_self = self.user in message.mentions
+                mentions_role = bool(
+                    robots_role_id
+                    and any(str(r.id) == str(robots_role_id) for r in message.role_mentions)
+                )
+                mentions_other = (
+                    any(m.bot and m.id != self.user.id for m in message.mentions)
+                    and not mentions_self
+                )
+
                 gate_msg = GateMessage(
                     channel_id=str(message.channel.id),
                     author_id=str(message.author.id),
                     content=message.content or "",
-                    mentions_self=self.user in message.mentions,
-                    mentions_role=bool(
-                        robots_role_id
-                        and any(str(r.id) == str(robots_role_id) for r in message.role_mentions)
-                    ),
+                    mentions_self=mentions_self,
+                    mentions_role=mentions_role,
+                    mentions_other=mentions_other,
                     is_reply_to_self=await self._is_reply_to_self(message),
                     author_is_bot=message.author.bot,
                 )
@@ -1585,11 +1593,26 @@ class DiscordAdapter(discord.Client):
             return False
 
     async def _recent_context(self, channel, limit: int = 12) -> str:
-        """Recent channel history, oldest-first, for the Tier 2 scorer prompt."""
+        """Recent channel history, oldest-first, for the Tier 2 scorer prompt.
+        Pre-resolves Discord snowflakes (<@id>, <@&id>, <#id>) to usernames/display
+        names so the cheap model doesn't hallucinate that a message addressed
+        to a peer bot snowflake or role is meant for Marvin."""
         history = [m async for m in channel.history(limit=limit)]
-        return "\n".join(
-            f"{m.author.display_name}: {m.content}" for m in reversed(history)
-        )
+        lines = []
+        for m in reversed(history):
+            content = m.content or ""
+            if "<@" in content and hasattr(m, "mentions"):
+                for mention in m.mentions:
+                    content = content.replace(f"<@{mention.id}>", f"@{mention.display_name}")
+                    content = content.replace(f"<@!{mention.id}>", f"@{mention.display_name}")
+            if "<@&" in content and hasattr(m, "role_mentions"):
+                for role in m.role_mentions:
+                    content = content.replace(f"<@&{role.id}>", f"@{role.name}")
+            if "<#" in content and hasattr(m, "channel_mentions"):
+                for ch in m.channel_mentions:
+                    content = content.replace(f"<#{ch.id}>", f"#{ch.name}")
+            lines.append(f"{m.author.display_name}: {content}")
+        return "\n".join(lines)
 
     async def score_with_cheap_model(self, context: str, author: str) -> Optional[float]:
         """Tier 2 scorer: one-shot Haiku call, no session state.

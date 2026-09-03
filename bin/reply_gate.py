@@ -66,6 +66,11 @@ class GateMessage:
     # their own sides same night. Caller resolves which role IDs count as
     # "self" from config; this field is just the pre-resolved bool.
     mentions_role: bool = False
+    # A direct mention of another peer bot or user where Marvin is NOT
+    # mentioned. Added 2026-09-02 to prevent targeted peer traffic (e.g.
+    # '@Zero ...' or '@Amos ...') from falling through to Tier 2 scoring
+    # and waking Marvin into an unaddressed turn.
+    mentions_other: bool = False
 
 
 def is_content_free(content: str) -> bool:
@@ -160,9 +165,29 @@ class ReplyGate:
                 named=named, channel_id=msg.channel_id,
             )
 
-        last = self._last_tier2_wake.get(msg.channel_id, 0.0)
-        remaining = self.cooldown_sec - (self._clock() - last)
-        if remaining > 0:
+        # An explicit mention of another party when self is not mentioned or named
+        # is targeted traffic, not unaddressed ambient chatter. Drop immediately
+        # in Tier 1 — never invoke the Tier 2 scorer on a peer's turn.
+        # If self is named in prose (e.g. '@Ryan — Marvin, thoughts?'), allow
+        # fall-through to the scorer rather than silently dropping.
+        if msg.mentions_other and not named:
+            return Decision(
+                False, "tier1-peer", "directed to other recipient, scorer skipped",
+                named=named, channel_id=msg.channel_id,
+            )
+
+        # `None`, not 0.0, for "never woken in this channel". The old sentinel
+        # was 0.0 measured against time.monotonic(), whose epoch is arbitrary —
+        # uptime on Linux. On a long-lived box monotonic() is large, so
+        # `cooldown - (huge - 0)` is deeply negative and the sentinel appeared
+        # to work; on a fresh CI runner monotonic() can be under a minute, and
+        # a brand-new gate that has never woken reports itself still in
+        # cooldown. Found 2026-09-03 by Marvin on this PR's CI: a gate with an
+        # empty wake map returned `cooldown, 237s left` on a runner 63 seconds
+        # into its life. Local runs passed for exactly the wrong reason.
+        last = self._last_tier2_wake.get(msg.channel_id)
+        remaining = 0.0 if last is None else self.cooldown_sec - (self._clock() - last)
+        if last is not None and remaining > 0:
             return Decision(
                 False, "cooldown", f"{int(remaining)}s left",
                 named=named, channel_id=msg.channel_id,
@@ -318,6 +343,10 @@ def _selftest() -> int:
     t["now"] += 301
     check("cooldown expires", g.evaluate(M(content="later today")).needs_score, True)
 
+    g_fresh = ReplyGate(self_id="me", names=("marvin",), cooldown_sec=300, clock=lambda: 10.0)
+    check("fresh gate with low uptime does not trigger false cooldown",
+          g_fresh.evaluate(M(content="hello world")).needs_score, True)
+
     # -- 2026-08-09: scorer-failure fallback must not collapse to 0.0 --
     d5 = g.evaluate(M(content="scorer will fail on this one"))
     r5 = g.resolve(d5, None, fallback=True)
@@ -348,6 +377,15 @@ def _selftest() -> int:
           g.evaluate(M(content="really?")).needs_score, True)
     check("two ordinary words still go to the scorer",
           g.evaluate(M(content="thanks Marvin")).needs_score, True)
+
+    # -- 2026-09-02: mentions_other drops in Tier 1, skipping scorer and wake --
+    t["now"] += 301
+    d_peer = g.evaluate(M(content="hey @Zero check this out", mentions_other=True))
+    check("mentioning another entity stays quiet in tier 1", d_peer.wake, False)
+    check("mentioning another entity tier is tier1-peer", d_peer.tier, "tier1-peer")
+    check("mentioning another entity skips scorer", d_peer.needs_score, False)
+    check("mentioning both self and other still wakes",
+          g.evaluate(M(content="hey @me and @Zero", mentions_self=True, mentions_other=True)).wake, True)
 
     print("PASS  the gate declines when it should" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0
