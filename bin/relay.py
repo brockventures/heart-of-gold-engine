@@ -1464,12 +1464,18 @@ class DiscordAdapter(discord.Client):
             # escalation or a guaranteed drop.
             misdirected = required_but_misdirected(envelope, self.user.name)
             if misdirected:
-                log.info(
-                    f"[gate] {channel_name} handoff: reply=required but "
-                    f"reply_from={envelope.reply_from!r} names someone else -- "
-                    f"declining turn (quiet)"
-                )
-                return
+                if envelope and envelope.floor == "open":
+                    log.info(
+                        f"[gate] {channel_name} handoff: reply=required for {envelope.reply_from!r} "
+                        f"with floor=open -- declining free pass, falling through to normal gate"
+                    )
+                else:
+                    log.info(
+                        f"[gate] {channel_name} handoff: reply=required but "
+                        f"reply_from={envelope.reply_from!r} names someone else -- "
+                        f"declining turn (quiet)"
+                    )
+                    return
 
             if envelope and envelope.reply == "required" and not misdirected:
                 decision = Decision(
@@ -1483,7 +1489,10 @@ class DiscordAdapter(discord.Client):
                     robots_role_id
                     and any(str(r.id) == str(robots_role_id) for r in message.role_mentions)
                 )
-                mentions_other = any(m.id != self.user.id for m in message.mentions) and not mentions_self
+                mentions_other = (
+                    any(m.bot and m.id != self.user.id for m in message.mentions)
+                    and not mentions_self
+                )
 
                 gate_msg = GateMessage(
                     channel_id=str(message.channel.id),
@@ -1592,9 +1601,9 @@ class DiscordAdapter(discord.Client):
 
     async def _recent_context(self, channel, limit: int = 12) -> str:
         """Recent channel history, oldest-first, for the Tier 2 scorer prompt.
-        Pre-resolves Discord snowflake mentions (<@id>) to usernames/display
+        Pre-resolves Discord snowflakes (<@id>, <@&id>, <#id>) to usernames/display
         names so the cheap model doesn't hallucinate that a message addressed
-        to a peer bot snowflake is meant for Marvin."""
+        to a peer bot snowflake or role is meant for Marvin."""
         history = [m async for m in channel.history(limit=limit)]
         lines = []
         for m in reversed(history):
@@ -1603,6 +1612,12 @@ class DiscordAdapter(discord.Client):
                 for mention in m.mentions:
                     content = content.replace(f"<@{mention.id}>", f"@{mention.display_name}")
                     content = content.replace(f"<@!{mention.id}>", f"@{mention.display_name}")
+            if "<@&" in content and hasattr(m, "role_mentions"):
+                for role in m.role_mentions:
+                    content = content.replace(f"<@&{role.id}>", f"@{role.name}")
+            if "<#" in content and hasattr(m, "channel_mentions"):
+                for ch in m.channel_mentions:
+                    content = content.replace(f"<#{ch.id}>", f"#{ch.name}")
             lines.append(f"{m.author.display_name}: {content}")
         return "\n".join(lines)
 

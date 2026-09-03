@@ -165,10 +165,12 @@ class ReplyGate:
                 named=named, channel_id=msg.channel_id,
             )
 
-        # An explicit mention of another party when self is not mentioned is
-        # targeted traffic, not unaddressed ambient chatter. Drop immediately
+        # An explicit mention of another party when self is not mentioned or named
+        # is targeted traffic, not unaddressed ambient chatter. Drop immediately
         # in Tier 1 — never invoke the Tier 2 scorer on a peer's turn.
-        if msg.mentions_other:
+        # If self is named in prose (e.g. '@Ryan — Marvin, thoughts?'), allow
+        # fall-through to the scorer rather than silently dropping.
+        if msg.mentions_other and not named:
             return Decision(
                 False, "tier1-peer", "directed to other recipient, scorer skipped",
                 named=named, channel_id=msg.channel_id,

@@ -60,6 +60,36 @@ def test_role_mention_with_peer_mention_wakes_marvin():
     assert decision.tier == "tier1"
 
 
+def test_reply_to_self_with_peer_mention_wakes_marvin():
+    gate = ReplyGate(self_id="marvin_bot_id", names=("marvin",), cooldown_sec=300)
+    msg = GateMessage(
+        channel_id="c_agent_chat",
+        author_id="user_ryan",
+        content="also cc @Zero",
+        mentions_self=False,
+        mentions_other=True,
+        is_reply_to_self=True,
+    )
+    decision = gate.evaluate(msg)
+    assert decision.wake, "Must wake when message is a reply to Marvin, even if tagging a peer"
+    assert decision.tier == "tier1"
+    assert decision.reason == "reply to you"
+
+
+def test_peer_mention_with_marvin_named_in_prose_falls_through_to_scorer():
+    gate = ReplyGate(self_id="marvin_bot_id", names=("marvin",), cooldown_sec=300)
+    msg = GateMessage(
+        channel_id="c_agent_chat",
+        author_id="user_ryan",
+        content="@Zero check X. Marvin, what do you think?",
+        mentions_self=False,
+        mentions_other=True,
+    )
+    decision = gate.evaluate(msg)
+    assert decision.needs_score, "Must fall through to scorer when Marvin is named in prose"
+    assert decision.named is True
+
+
 def test_misdirected_required_handoff_declines_cleanly():
     env = Envelope(v=1, 
         kind="question",
@@ -75,5 +105,7 @@ if __name__ == "__main__":
     test_peer_mention_drops_immediately_without_scoring()
     test_dual_mention_wakes_marvin()
     test_role_mention_with_peer_mention_wakes_marvin()
+    test_reply_to_self_with_peer_mention_wakes_marvin()
+    test_peer_mention_with_marvin_named_in_prose_falls_through_to_scorer()
     test_misdirected_required_handoff_declines_cleanly()
     print("All peer filtering tests passed!")
