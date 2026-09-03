@@ -13,7 +13,7 @@ if bin_dir not in sys.path:
     sys.path.insert(0, bin_dir)
 
 from reply_gate import Decision, GateMessage, ReplyGate
-from handoff import Envelope, required_but_misdirected
+from handoff import Envelope, parse_handoff, required_but_misdirected
 
 
 def test_peer_mention_drops_immediately_without_scoring():
@@ -101,6 +101,28 @@ def test_misdirected_required_handoff_declines_cleanly():
     assert required_but_misdirected(env, "Amos") is False
 
 
+def test_handoff_envelope_floor_attribute():
+    content_with_floor = """```handoff
+{
+  "v": 1,
+  "kind": "status",
+  "reply": "required",
+  "reply_from": "Amos",
+  "floor": "open",
+  "subject": "floor-test"
+}
+```"""
+    env = parse_handoff(content_with_floor)
+    assert env is not None
+    assert env.floor == "open", f"Expected floor == 'open', got {env.floor!r}"
+    assert required_but_misdirected(env, "Marvin") is True
+
+    # Floor attribute access on Envelope with default None
+    env_plain = Envelope(v=1, kind="status", reply="optional")
+    assert env_plain.floor is None
+    assert getattr(env_plain, "floor", None) is None
+
+
 if __name__ == "__main__":
     test_peer_mention_drops_immediately_without_scoring()
     test_dual_mention_wakes_marvin()
@@ -108,4 +130,5 @@ if __name__ == "__main__":
     test_reply_to_self_with_peer_mention_wakes_marvin()
     test_peer_mention_with_marvin_named_in_prose_falls_through_to_scorer()
     test_misdirected_required_handoff_declines_cleanly()
+    test_handoff_envelope_floor_attribute()
     print("All peer filtering tests passed!")

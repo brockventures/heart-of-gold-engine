@@ -254,6 +254,7 @@ VALID_CONTEXT_STATE = {"active", "blocked", "waiting-human", "resolved"}
 # hand-sync problem for a load-order dependency this module doesn't
 # otherwise have.
 VALID_MIRROR_CHANNELS = {"general", "signals", "staff-comms", "agent-chat", "lounge"}
+VALID_FLOOR = {"open", "closed"}
 
 
 @dataclass(frozen=True)
@@ -274,6 +275,7 @@ class Envelope:
     v: int
     kind: str
     reply: str  # "required" | "optional" | "none" — validated on parse
+    floor: Optional[str] = None  # "open" | "closed"
     subject: str = ""
     evidence: List[Any] = field(default_factory=list)
     supersedes: Optional[Supersedes] = None
@@ -419,8 +421,18 @@ def parse_handoff(content: str) -> Optional[Envelope]:
     if mirror_to not in VALID_MIRROR_CHANNELS:
         mirror_to = None
 
+    # floor: v1 session governance field ("open" | "closed").
+    # Degrades to None if absent or unrecognized, preserving backwards-compatibility.
+    floor = data.get("floor")
+    if isinstance(floor, str):
+        floor = floor.lower().strip()
+        if floor not in VALID_FLOOR:
+            floor = None
+    else:
+        floor = None
+
     return Envelope(
-        v=v, kind=kind, reply=reply, subject=subject,
+        v=v, kind=kind, reply=reply, floor=floor, subject=subject,
         evidence=evidence, supersedes=supersedes,
         confidence=confidence, stale_after=stale_after, id=env_id,
         context_box=context_box,
@@ -697,6 +709,21 @@ def _selftest() -> int:
               '```handoff\n{"v":0,"kind":"correction","reply":"none","mirror_to":"signals"}\n```'
           ).mirror_to,
           "signals")
+
+    # -- 2026-09-03 additive field: floor --
+    check("floor=open accepted",
+          parse_handoff('```handoff\n{"v":1,"kind":"status","reply":"none","floor":"open"}\n```').floor,
+          "open")
+    check("floor=closed accepted",
+          parse_handoff('```handoff\n{"v":1,"kind":"status","reply":"none","floor":"closed"}\n```').floor,
+          "closed")
+    check("missing floor defaults to None", e3.floor, None)
+    check("unrecognized floor degrades to None",
+          parse_handoff('```handoff\n{"v":1,"kind":"status","reply":"none","floor":"unknown"}\n```').floor,
+          None)
+    check("non-string floor degrades to None",
+          parse_handoff('```handoff\n{"v":1,"kind":"status","reply":"none","floor":123}\n```').floor,
+          None)
 
     print("PASS  fails open on every malformed case" if not fails else f"FAIL  {fails} case(s)")
     return 1 if fails else 0
