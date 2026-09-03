@@ -1464,19 +1464,11 @@ class DiscordAdapter(discord.Client):
             # escalation or a guaranteed drop.
             misdirected = required_but_misdirected(envelope, self.user.name)
             if misdirected:
-                floor_val = getattr(envelope, "floor", None) or (envelope.raw.get("floor") if envelope else None)
-                if floor_val == "open":
-                    log.info(
-                        f"[gate] {channel_name} handoff: reply=required for {envelope.reply_from!r} "
-                        f"with floor=open -- declining free pass, falling through to normal gate"
-                    )
-                else:
-                    log.info(
-                        f"[gate] {channel_name} handoff: reply=required but "
-                        f"reply_from={envelope.reply_from!r} names someone else -- "
-                        f"declining turn (quiet)"
-                    )
-                    return
+                log.info(
+                    f"[gate] {channel_name} handoff: reply=required but "
+                    f"reply_from={envelope.reply_from!r} names someone else -- "
+                    f"declining the free pass, falling through to normal gate"
+                )
 
             if envelope and envelope.reply == "required" and not misdirected:
                 decision = Decision(
