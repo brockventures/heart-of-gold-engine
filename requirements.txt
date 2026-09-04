@@ -53,4 +53,13 @@ PyYAML==6.0.2
 # the last two bumps: package upgrade only picks up on the next
 # agent-server.py restart (Ian/Mike's call, not self-triggerable) since
 # it's imported once at process start via speaking_banana.py.
-banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@0e802c5
+#
+# 2026-09-04: swapped the 0e802c5 commit pin for the real v0.5.1 tag
+# (now that upstream published one) at commit d549f3e. Verified via
+# GitHub compare API before touching this file: d549f3e is exactly one
+# commit ahead of 0e802c5 (PR #10, `banana/__init__.py` __version__
+# string aligned to 0.5.1 — the cosmetic drift I'd flagged earlier is
+# closed), no other diff. Confirmed the tag itself resolves to that SHA
+# via the GitHub releases API, not just Zero's word for it. Same
+# restart-required caveat as above.
+banana-protocol @ git+https://github.com/brockventures/banana-protocol.git@v0.5.1
